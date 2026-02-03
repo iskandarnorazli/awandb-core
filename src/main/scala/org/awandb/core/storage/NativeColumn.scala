@@ -4,8 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * * http://www.apache.org/licenses/LICENSE-2.0
 
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,7 +16,6 @@
 package org.awandb.core.storage
 
 import scala.collection.mutable.ArrayBuffer
-import org.awandb.core.jni.NativeBridge
 
 class NativeColumn(val name: String) {
   
@@ -30,6 +28,16 @@ class NativeColumn(val name: String) {
    */
   def insert(value: Int): Unit = {
     deltaBuffer.append(value)
+  }
+
+  /**
+   * [WRITE FUSION]
+   * Efficiently appends an entire array of values.
+   * Under the hood, this uses System.arraycopy (memcpy), which is 
+   * orders of magnitude faster than looping append().
+   */
+  def insertBatch(values: Array[Int]): Unit = {
+    deltaBuffer ++= values
   }
 
   /**

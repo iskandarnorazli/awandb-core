@@ -14,3 +14,6 @@ connectInput in run := true
 
 // Dependencies
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.17" % Test
+
+// ... inside your project settings ...
+parallelExecution in Test := false

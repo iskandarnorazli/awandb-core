@@ -4,8 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * * http://www.apache.org/licenses/LICENSE-2.0
 
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +16,7 @@
 package org.awandb.core.storage
 
 import java.io.{BufferedOutputStream, DataOutputStream, File, FileOutputStream, FileInputStream, DataInputStream}
+import java.nio.ByteBuffer
 
 class Wal(directory: String) {
   
@@ -40,6 +40,31 @@ class Wal(directory: String) {
     // OpCode 1 = INSERT
     dataOutput.writeByte(1) 
     dataOutput.writeInt(value)
+  }
+
+  /**
+   * [WRITE FUSION]
+   * Writes a batch of integers as a single binary block.
+   * This reduces overhead by making 1 IO call instead of N calls.
+   * * Format matches logInsert: [OpCode][Val][OpCode][Val]...
+   * This ensures the existing 'recover()' method works without changes.
+   */
+  def logBatch(values: Array[Int]): Unit = {
+    if (values.isEmpty) return
+
+    // 1 Byte (OpCode) + 4 Bytes (Int) = 5 Bytes per row
+    val totalBytes = values.length * 5
+    val buffer = ByteBuffer.allocate(totalBytes)
+
+    var i = 0
+    while (i < values.length) {
+      buffer.put(1.toByte)      // OpCode
+      buffer.putInt(values(i))  // Value
+      i += 1
+    }
+
+    // Write the entire block to the stream in one go
+    dataOutput.write(buffer.array())
   }
 
   /**

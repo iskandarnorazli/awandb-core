@@ -20,12 +20,26 @@ import org.awandb.core.engine.AwanTable
 import org.awandb.core.jni.NativeBridge
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
+import java.io.File
 
 class AwanDBSpec extends AnyFlatSpec with Matchers {
 
+  // [CRITICAL] Unique directory for this test suite to prevent collisions
+  val TEST_DIR = "data/awandb_spec_unique"
+
+  def cleanDir(dirPath: String): Unit = {
+    val dir = new File(dirPath)
+    if (dir.exists()) {
+      dir.listFiles().foreach(_.delete())
+      dir.delete()
+    }
+  }
+
   "The AwanDB Engine" should "maintain data consistency between Insert and Read" in {
-    // 1. Setup
-    val table = new AwanTable("test_products", 1000)
+    cleanDir(TEST_DIR) // Clean start
+    
+    // 1. Setup with isolated directory
+    val table = new AwanTable("test_products", 1000, TEST_DIR)
     table.addColumn("id")
     table.addColumn("price")
     
@@ -37,14 +51,14 @@ class AwanDBSpec extends AnyFlatSpec with Matchers {
     // 3. Assert
     val count = table.query(uniqueID - 1)
     
-    // FIX: Use 'shouldBe' (One word) for Scala 3
     count shouldBe 1
     
     table.close()
   }
 
   it should "clear the Delta Buffer after a flush" in {
-    val table = new AwanTable("test_flush", 1000)
+    // Reuse directory but different table name helps isolation too
+    val table = new AwanTable("test_flush", 1000, TEST_DIR)
     table.addColumn("val")
     
     table.insertRow(Array(123))
@@ -61,7 +75,9 @@ class AwanDBSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "survive a Save/Load cycle (Persistence)" in {
-    val table = new AwanTable("test_persistence", 1000)
+    cleanDir(TEST_DIR) // Ensure clean state for counting test
+    
+    val table = new AwanTable("test_persistence", 1000, TEST_DIR)
     table.addColumn("data")
     
     table.insertRow(Array(42))
@@ -71,7 +87,11 @@ class AwanDBSpec extends AnyFlatSpec with Matchers {
     table.flush()
     
     // Verify: Querying > 0 should find both rows from Disk
+    // (This works because query() scans both RAM and the Snapshot Block List)
     val count = table.query(0)
+    
+    // Previous error "8 != 2" happened here because it read old files. 
+    // Now it should be exactly 2.
     count shouldBe 2
     
     table.close()
@@ -79,6 +99,7 @@ class AwanDBSpec extends AnyFlatSpec with Matchers {
 
   it should "handle OOM gracefully" in {
     assertThrows[OutOfMemoryError] {
+      // Attempt to allocate 10 TB
       NativeBridge.allocMainStore(10_000_000_000_000L)
     }
   }

@@ -25,7 +25,8 @@ import java.nio.{ByteBuffer, ByteOrder}
 
 class PersistenceSpec extends AnyFlatSpec with Matchers {
 
-  val TEST_DIR = "data/persistence_test_data"
+  // [CRITICAL] Unique Directory to avoid collision with other specs
+  val TEST_DIR = "data/persistence_spec_unique"
   val BLOCK_FILE = s"$TEST_DIR/block_test.udb"
 
   def cleanUp(): Unit = {
@@ -66,6 +67,7 @@ class PersistenceSpec extends AnyFlatSpec with Matchers {
     channel.read(buffer)
     buffer.flip()
 
+    // 
     // 
     // Visualizing: Header (64B) -> Col Header (64B) -> Padding -> Data
 
