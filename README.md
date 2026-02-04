@@ -3,15 +3,37 @@
 
 **A High-Performance, Hybrid Columnar Database Engine.**
 
-AwanDB Core is the open-source storage and compute engine powering the AwanDB platform. It combines the safety and concurrency of **Scala** with the raw throughput of **C++ AVX-512 Intrinsics**.
+AwanDB Core is the open-source storage and compute engine powering the AwanDB platform. It combines the safety and concurrency of **Scala** with the raw throughput of **C++ AVX-512 Intrinsics** to deliver analytics and vector search at memory-bandwidth speeds.
 
 ## 🚀 Key Features
 
 * **Hybrid Architecture:** Scala Control Plane (Netty/Akka style async loop) + C++ Data Plane (JNI).
-* **SIMD-Accelerated Scans:** Uses AVX2/AVX-512 instructions to scan data at memory bandwidth speeds (>40 GB/s L3, >17 GB/s RAM).
+* **Multi-Model Storage:**
+    * **Integers:** Bit-packed, SIMD-scanned at >40 GB/s.
+    * **German Strings:** 16-byte fixed layout with inline prefix filtering (~31 GB/s).
+    * **Vector Embeddings:** Native `Vecf32` support with AVX2 FMA Cosine Similarity (~17 GB/s).
 * **Query Fusion (Shared Scans):** Automatically fuses multiple concurrent queries into a single scan pass, allowing query throughput to scale *with* load.
 * **Unified Memory:** Custom memory allocator that aligns data on 64-byte boundaries for zero-copy access between Java and C++.
-* **Pluggable Governance:** Hooks for rate limiting and tenancy (used by the Enterprise Edition).
+* **Pluggable Governance:** Hooks for rate limiting and tenancy.
+
+## 🗺️ OSS Roadmap
+
+We are building AwanDB in strictly prioritized phases. We are currently transitioning from **Phase 4** to **Phase 5**.
+
+| Phase | Module | Feature | Status | Impact |
+| :--- | :--- | :--- | :--- | :--- |
+| **0–3** | **Core Engine** | **AVX-512 Integers** | ✅ **DONE** | Foundation. 43 GB/s Int Scans. |
+| **0–3** | **Storage** | **Block I/O & WAL** | ✅ **DONE** | Persistence and Durability. |
+| **0–3** | **Compute** | **Shared Scans** | ✅ **DONE** | 11x Speedup on concurrent loads. |
+| **4** | **Types** | **German Strings** | ✅ **DONE** | "Zuckerberg" Search. Text filtering at int speed. |
+| **4** | **Types** | **Vector Embeddings** | ✅ **DONE** | AI-Native. Zero-Cost Cosine Similarity. |
+| **4** | **Compute** | **Hardware Hashing** | ✅ **DONE** | CRC32 primitives for Aggregations. |
+| **5** | **Arch** | **Morsel Parallelism** | 🚧 **In Progress** | Load Balancing. Threads pull small tasks from pool. |
+| **5** | **Query** | **Operator DAG** | 📅 Planned | Execution Graph (Scan -> Filter -> Join). |
+| **5** | **Compute** | **Vectorized Hash Agg** | 📅 Planned | High-speed `GROUP BY`. |
+| **5** | **Compute** | **Radix Sort** | 📅 Planned | O(N) Integer Sorting. |
+| **6** | **Network** | **Arrow Flight** | 📅 Planned | Zero-Serde network transport. |
+| **6** | **Hardware** | **Unified Compute** | 📅 Planned | GPU Offload (HIP/SYCL). |
 
 ## 🛠️ Architecture
 
@@ -23,9 +45,9 @@ AwanDB uses a **Single-Writer, Multi-Reader** architecture managed by an asynchr
     * Inserts data into the **Off-Heap MemTable (RAM)**.
 3.  **Persistence:** Periodically flushes RAM buffers to immutable **Columnar Blocks (.udb)** on disk.
 4.  **Native Compute Layer (C++):**
-    * Accesses RAM via direct JNI Pointers (Zero-Copy).
-    * Accesses Disk via Memory Mapping (mmap).
-    * Executes hyper-optimized **AVX-512 Kernels** for filtering and aggregation.
+    * **Zero-Copy:** Accesses RAM via direct JNI Pointers.
+    * **Memory Mapping:** Accesses Disk via `mmap`.
+    * **Kernels:** Executes hyper-optimized AVX-512/AVX2 kernels for Filtering, Similarity, and Aggregation.
 
 ## 📦 Prerequisites
 
@@ -78,44 +100,30 @@ sbt test
 
 ```
 
-You should see output indicating the Native Engine loaded successfully:
-
-```text
-[NativeBridge] [SUCCESS] Loaded High-Performance C++ Engine.
-[EngineManager] Started Event Loop
-...
-[info] All tests passed.
-
-```
-
 ## 💻 Usage Example
 
-AwanDB Core provides a low-level `AwanTable` API for building custom data platforms.
+AwanDB Core provides a low-level `NativeBridge` API for building custom data engines.
 
 ```scala
-import org.awandb.core.engine.AwanTable
+import org.awandb.core.jni.NativeBridge
 
-// 1. Initialize Table (Stored in ./data)
-val table = new AwanTable("iot_sensors", capacity = 1_000_000, dataDir = "./data")
-table.addColumn("temperature")
+// 1. Setup: Allocate a Block for 1 Million Vectors (128-dim)
+val rows = 1_000_000
+val dim = 128
+val blockPtr = NativeBridge.createBlock(rows * dim, 1)
 
-// 2. High-Speed Ingestion (Async)
-// The EngineManager batches these automatically.
-table.engineManager.submitInsert(25)
-table.engineManager.submitInsert(30)
-table.engineManager.submitInsert(22)
+// 2. Ingest: Load Normalized Vector Data (Zero-Copy)
+// 'data' is a standard Heap Float Array
+NativeBridge.loadVectorData(blockPtr, 0, dataArray, dim)
 
-// 3. Query (Counts items > threshold)
-// Returns Future[Int]
-val countFuture = table.engineManager.submitQuery("temperature", 24)
+// 3. Query: Cosine Similarity Search
+// Find rows with similarity > 0.95
+val count = NativeBridge.avxScanVectorCosine(blockPtr, 0, queryVector, 0.95f)
 
-countFuture.foreach { result =>
-  println(s"Sensors above 24°C: $result") // Output: 2
-}
+println(s"Found $count matches in ${rows/1e6}M vectors.")
 
-// 4. Persistence
-table.engineManager.submitFlush() // Writes immutable block to disk
-table.close()
+// 4. Cleanup
+NativeBridge.freeMainStore(blockPtr)
 
 ```
 
@@ -123,12 +131,12 @@ table.close()
 
 *Hardware: Ryzen 9 5900X, DDR4 RAM (Single Channel).*
 
-| Workload | Throughput | Bandwidth | Notes |
-| --- | --- | --- | --- |
-| **Seq Write (WAL + RAM)** | **~70 Million Ops/sec** | ~270 MB/s | Batch Fused |
-| **Scan (L3 Cache)** | **~11.5 Billion Rows/sec** | ~43 GB/s | AVX-512 (8x Unroll) |
-| **Scan (Main RAM)** | **~4.6 Billion Rows/sec** | ~17.6 GB/s | RAM Bandwidth Limited |
-| **Shared Scan** | **23x Speedup** | N/A | 100 Queries in 1 Pass |
+| Workload | Type | Throughput | Bandwidth | Notes |
+| --- | --- | --- | --- | --- |
+| **Integer Scan** | `int32` | **~11.5 Billion Rows/s** | **43 GB/s** | AVX-512 (L3 Cache) |
+| **String Scan** | `GermanStr` | **~1.0 Billion Rows/s** | **31 GB/s** | Prefix Filter Optimization |
+| **Vector Search** | `Vecf32` | **~18 Million Rows/s** | **17.7 GB/s** | Cosine Similarity (128-dim) |
+| **Shared Scan** | `int32` | **23x Speedup** | N/A | 100 Concurrent Queries |
 
 ## 📂 Project Structure
 
@@ -141,6 +149,8 @@ table.close()
 * `src/main/resources/native`: The raw compute engine.
 * `engine.cpp`: JNI implementation and AVX kernels.
 * `block.h`: Memory layout definitions.
+* `german_string.h`: 16-byte String Layout.
+* `cuckoo.h`: Fast Set Membership.
 
 
 
