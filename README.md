@@ -3,51 +3,94 @@
 
 **A High-Performance, Hybrid Columnar Database Engine.**
 
-AwanDB Core is the open-source storage and compute engine powering the AwanDB platform. It combines the safety and concurrency of **Scala** with the raw throughput of **C++ AVX-512 Intrinsics** to deliver analytics and vector search at memory-bandwidth speeds.
+AwanDB Core is the open-source storage and compute engine powering the AwanDB platform. It combines the safety and concurrency of **Scala** with the raw throughput of **C++ AVX-512 Intrinsics**. 
+
+> **Project Goal:** AwanDB is designed to evolve from a high-speed storage engine into a **full-fledged, standalone analytical database**. While currently available as an embedded core, the roadmap targets a complete server architecture with network interfaces (Arrow Flight) and distributed capabilities.
 
 ## 🚀 Key Features
 
 * **Hybrid Architecture:** Scala Control Plane (Netty/Akka style async loop) + C++ Data Plane (JNI).
-* **Multi-Model Storage:**
-    * **Integers:** Bit-packed, SIMD-scanned at >40 GB/s.
-    * **German Strings:** 16-byte fixed layout with inline prefix filtering (~31 GB/s).
-    * **Vector Embeddings:** Native `Vecf32` support with AVX2 FMA Cosine Similarity (~17 GB/s).
-* **Query Fusion (Shared Scans):** Automatically fuses multiple concurrent queries into a single scan pass, allowing query throughput to scale *with* load.
-* **Unified Memory:** Custom memory allocator that aligns data on 64-byte boundaries for zero-copy access between Java and C++.
-* **Pluggable Governance:** Hooks for rate limiting and tenancy.
+* **Multi-Model Support:** Native storage for Integers, Floats, **German Strings**, and **Vector Embeddings**.
+* **SIMD-Accelerated Scans:** Uses AVX2/AVX-512 instructions to scan data at memory bandwidth speeds (>40 GB/s L3).
+* **Query Fusion (Shared Scans):** Automatically fuses multiple concurrent queries into a single scan pass.
+* **Zero-Copy Memory:** Custom allocator aligning data on 64-byte boundaries for direct JNI access.
+* **Morsel-Driven Parallelism:** (Upcoming) Dynamic task scheduling for perfect core utilization.
 
-## 🗺️ OSS Roadmap
+## 🗺️ OSS Roadmap (v2026.02)
 
-We are building AwanDB in strictly prioritized phases. We are currently transitioning from **Phase 4** to **Phase 5**.
+We are transitioning AwanDB from a "Fast Storage Engine" to a "High-Performance Analytical Database." The current focus is on the **Type System (Phase 4)** and the **Query Execution Engine (Phase 5)**.
 
-| Phase | Module | Feature | Status | Impact |
-| :--- | :--- | :--- | :--- | :--- |
-| **0–3** | **Core Engine** | **AVX-512 Integers** | ✅ **DONE** | Foundation. 43 GB/s Int Scans. |
-| **0–3** | **Storage** | **Block I/O & WAL** | ✅ **DONE** | Persistence and Durability. |
-| **0–3** | **Compute** | **Shared Scans** | ✅ **DONE** | 11x Speedup on concurrent loads. |
-| **4** | **Types** | **German Strings** | ✅ **DONE** | "Zuckerberg" Search. Text filtering at int speed. |
-| **4** | **Types** | **Vector Embeddings** | ✅ **DONE** | AI-Native. Zero-Cost Cosine Similarity. |
-| **4** | **Compute** | **Hardware Hashing** | ✅ **DONE** | CRC32 primitives for Aggregations. |
-| **5** | **Arch** | **Morsel Parallelism** | 🚧 **In Progress** | Load Balancing. Threads pull small tasks from pool. |
-| **5** | **Query** | **Operator DAG** | 📅 Planned | Execution Graph (Scan -> Filter -> Join). |
-| **5** | **Compute** | **Vectorized Hash Agg** | 📅 Planned | High-speed `GROUP BY`. |
-| **5** | **Compute** | **Radix Sort** | 📅 Planned | O(N) Integer Sorting. |
-| **6** | **Network** | **Arrow Flight** | 📅 Planned | Zero-Serde network transport. |
-| **6** | **Hardware** | **Unified Compute** | 📅 Planned | GPU Offload (HIP/SYCL). |
+### **Phase 0–3: The Core Engine (Completed)**
+*Foundation, Storage, and Raw Compute Speed.*
+
+| Phase | Priority | Module | Feature | License | Status | Why / Commercial Impact |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **0** | P0 | Memory | **Aligned Allocator** | OSS | ✅ DONE | Foundation for Zero-Copy Wasm & AVX alignment. |
+| **0** | P0 | Storage | **Arrow Block Layout** | OSS | ✅ DONE | Standard format allows "Zero-Serde" network transfer. |
+| **1** | P1 | Transact | **WAL (Durability)** | OSS | ✅ DONE | Required for SLA guarantees. |
+| **1** | P1 | Safety | **Overflow Guard** | ENT | ✅ DONE | Prevents one tenant from crashing the node. |
+| **2** | P1 | Storage | **Block I/O (LSM)** | OSS | ✅ DONE | Data persists to immutable blocks on disk. |
+| **2** | P1 | Storage | **Block Manager** | OSS | ✅ DONE | Tracks loaded blocks (Atomic Snapshots). |
+| **3** | P1 | Arch | **Manager Thread** | OSS | ✅ DONE | Central point for concurrency. |
+| **3** | P1 | Compute | **Shared Scan** | OSS | ✅ DONE | **23x Speedup**. One AVX pass answers 100+ concurrent queries. |
+| **3** | P1 | Query | **Zone Map Skipping** | OSS | ✅ DONE | Predicate Pushdown. C++ skips blocks via Header check. |
+| **3** | P1 | Transact | **Write Fusion** | OSS | ✅ DONE | **5x Speedup**. Single Lock/Syscall for batch inserts. |
+| **3** | P2 | Index | **Cuckoo Filters** | OSS | ✅ DONE | Point Lookup. O(1) check if ID exists. |
+| **3** | P2 | Compute | **Aggressive Unrolling** | OSS | ✅ DONE | **Memory Bandwidth Saturation**. 8x AVX unroll fills RAM bus. |
+
+### **Phase 4: The Type System (Current Focus)**
+*Handling Complex Data (Strings, Vectors) without losing Integer speed.*
+
+| Phase | Priority | Module | Feature | License | Status | Why / Commercial Impact |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **4** | P2 | Types | **German String Layout** | OSS | 🚧 In Prog | **"Zuckerberg" Search**. Inline 4-byte prefix for AVX filtering. |
+| **4** | P2 | Types | **Vector Embeddings** | OSS | 📅 New | **AI Native**. Vecf32 support for RAG / Similarity Search. |
+| **4** | P3 | Compute | **Vector Hashing** | OSS | 📅 New | Analytics. Prerequisite for GROUP BY on non-int types. |
+| **4** | P3 | Ops | **Usage Metering** | ENT | 📅 Pending | Billing feed for Governor (Row scans/sec). |
+| **4** | P3 | Security | **Data Masking** | ENT | 📅 New | Compliance (PII Redaction at storage level). |
+
+### **Phase 5: The Query Execution Engine (New)**
+*Transforming from "Fast Scan" to "Complex Analytics" (Joins, Aggs, Sorting).*
+
+| Phase | Priority | Module | Feature | License | Status | Why / Commercial Impact |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **5** | **P1** | Arch | **Morsel-Driven Parallelism**| OSS | 📅 **New** | **Load Balancing**. Threads pull small tasks ("morsels") from a shared pool. |
+| **5** | **P1** | Query | **Operator DAG Scheduler** | OSS | 📅 **New** | **Complex Queries**. Dependency graph for Join Build/Probe phases. |
+| **5** | **P1** | Compute | **Shared Filter (SIP)** | OSS | 📅 **New** | **Fast Joins**. Pass Cuckoo Filters from Build side to Probe scanner. |
+| **5** | **P2** | Compute | **Vectorized Hash Agg** | OSS | 📅 **New** | **GROUP BY**. High-speed hash map for integer aggregation. |
+| **5** | **P2** | Compute | **Radix Sort** | OSS | 📅 **New** | **ORDER BY**. O(N) sorting for integers (much faster than std::sort). |
+| **5** | P4 | Types | **Dictionary Encoding** | OSS | 📅 **New** | **Compression**. Turns Strings into Ints for 4x faster scans/grouping. |
+| **5** | P4 | Storage | **Bit-Packing / RLE** | OSS | 📅 **New** | Integer Compression. Reduces RAM usage by 50-80%. |
+| **5** | P4 | Query | **Late Materialization** | OSS | 📅 **New** | Efficiency. Only fetch Strings/Blobs at the very end of query. |
+
+### **Phase 6: The Platform (Scale & Distribution)**
+*Networking, Graph, and Hardware Awareness.*
+
+| Phase | Priority | Module | Feature | License | Status | Why / Commercial Impact |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **6** | P3 | Ingest | **JSON Shredder** | OSS | 📅 New | Usability. SIMD JSON parser to flatten data on ingest. |
+| **6** | P3 | Network | **Arrow Flight (Tier C)** | OSS | 📅 Pending | **Standard User**. Network Bridge for Cheap Client CPUs. |
+| **6** | P4 | Graph | **Adjacency Index** | OSS | 📅 New | Graph Native. Optimized Edge storage for fast traversal. |
+| **6** | P4 | Graph | **Recursive Traversal** | OSS | 📅 New | **Graph Queries**. BFS / Recursive CTEs. |
+| **6** | P5 | Compute | **Wasm Runtime (Tier B)** | ENT | 📅 Pending | Safe User. Sandboxed SQL Logic (UDFs). |
+| **6** | P5 | Compute | **DMA Bridge (Tier A)** | ENT | 📅 New | **Power User**. Zero-Copy Pointer Handoff (GPU Direct). |
+| **6** | P5 | Arch | **Topology Discovery** | ENT | 📅 New | Hardware Aware (NUMA / Core pinning). |
+| **6** | P5 | Storage | **Disk Sharding** | ENT | 📅 New | IO Locality. Striping data across multiple NVMe drives. |
+| **6** | P6 | Hardware | **Unified Compute** | ENT | 📅 New | **AI Scale**. Porting AVX kernels to GPU (HIP/SYCL). |
 
 ## 🛠️ Architecture
 
 AwanDB uses a **Single-Writer, Multi-Reader** architecture managed by an asynchronous `EngineManager`.
 
-1.  **User API:** Submits asynchronous requests (Insert/Query) to the **Engine Manager (Scala)**.
+1.  **User API / Network Layer:** Submits asynchronous requests (Insert/Query) to the **Engine Manager (Scala)**.
 2.  **Engine Manager:**
     * Batches writes into the **Write Ahead Log (WAL)** for durability.
     * Inserts data into the **Off-Heap MemTable (RAM)**.
 3.  **Persistence:** Periodically flushes RAM buffers to immutable **Columnar Blocks (.udb)** on disk.
 4.  **Native Compute Layer (C++):**
-    * **Zero-Copy:** Accesses RAM via direct JNI Pointers.
-    * **Memory Mapping:** Accesses Disk via `mmap`.
-    * **Kernels:** Executes hyper-optimized AVX-512/AVX2 kernels for Filtering, Similarity, and Aggregation.
+    * Accesses RAM via direct JNI Pointers (Zero-Copy).
+    * Accesses Disk via Memory Mapping (mmap).
+    * Executes hyper-optimized **AVX-512 Kernels** for filtering and aggregation.
 
 ## 📦 Prerequisites
 
@@ -100,30 +143,34 @@ sbt test
 
 ```
 
-## 💻 Usage Example
+## 💻 Usage Example (Core API)
 
-AwanDB Core provides a low-level `NativeBridge` API for building custom data engines.
+*Note: This demonstrates the low-level Core API. A network server (Arrow Flight) interface is planned for Phase 6.*
 
 ```scala
-import org.awandb.core.jni.NativeBridge
+import org.awandb.core.engine.AwanTable
 
-// 1. Setup: Allocate a Block for 1 Million Vectors (128-dim)
-val rows = 1_000_000
-val dim = 128
-val blockPtr = NativeBridge.createBlock(rows * dim, 1)
+// 1. Initialize Table (Stored in ./data)
+val table = new AwanTable("iot_sensors", capacity = 1_000_000, dataDir = "./data")
+table.addColumn("temperature")
 
-// 2. Ingest: Load Normalized Vector Data (Zero-Copy)
-// 'data' is a standard Heap Float Array
-NativeBridge.loadVectorData(blockPtr, 0, dataArray, dim)
+// 2. High-Speed Ingestion (Async)
+// The EngineManager batches these automatically.
+table.engineManager.submitInsert(25)
+table.engineManager.submitInsert(30)
+table.engineManager.submitInsert(22)
 
-// 3. Query: Cosine Similarity Search
-// Find rows with similarity > 0.95
-val count = NativeBridge.avxScanVectorCosine(blockPtr, 0, queryVector, 0.95f)
+// 3. Query (Counts items > threshold)
+// Returns Future[Int]
+val countFuture = table.engineManager.submitQuery("temperature", 24)
 
-println(s"Found $count matches in ${rows/1e6}M vectors.")
+countFuture.foreach { result =>
+  println(s"Sensors above 24°C: $result") // Output: 2
+}
 
-// 4. Cleanup
-NativeBridge.freeMainStore(blockPtr)
+// 4. Persistence
+table.engineManager.submitFlush() // Writes immutable block to disk
+table.close()
 
 ```
 
@@ -131,12 +178,12 @@ NativeBridge.freeMainStore(blockPtr)
 
 *Hardware: Ryzen 9 5900X, DDR4 RAM (Single Channel).*
 
-| Workload | Type | Throughput | Bandwidth | Notes |
-| --- | --- | --- | --- | --- |
-| **Integer Scan** | `int32` | **~11.5 Billion Rows/s** | **43 GB/s** | AVX-512 (L3 Cache) |
-| **String Scan** | `GermanStr` | **~1.0 Billion Rows/s** | **31 GB/s** | Prefix Filter Optimization |
-| **Vector Search** | `Vecf32` | **~18 Million Rows/s** | **17.7 GB/s** | Cosine Similarity (128-dim) |
-| **Shared Scan** | `int32` | **23x Speedup** | N/A | 100 Concurrent Queries |
+| Workload | Throughput | Bandwidth | Notes |
+| --- | --- | --- | --- |
+| **Seq Write (WAL + RAM)** | **~70 Million Ops/sec** | ~270 MB/s | Batch Fused |
+| **Scan (L3 Cache)** | **~11.5 Billion Rows/sec** | ~43 GB/s | AVX-512 (8x Unroll) |
+| **Scan (Main RAM)** | **~4.6 Billion Rows/sec** | ~17.6 GB/s | RAM Bandwidth Limited |
+| **Shared Scan** | **23x Speedup** | N/A | 100 Queries in 1 Pass |
 
 ## 📂 Project Structure
 
@@ -149,8 +196,6 @@ NativeBridge.freeMainStore(blockPtr)
 * `src/main/resources/native`: The raw compute engine.
 * `engine.cpp`: JNI implementation and AVX kernels.
 * `block.h`: Memory layout definitions.
-* `german_string.h`: 16-byte String Layout.
-* `cuckoo.h`: Fast Set Membership.
 
 
 
