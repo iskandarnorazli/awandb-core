@@ -69,6 +69,7 @@ class AwanTable(
   // ---------------------------------------------------------
   // WRITE PATH
   // ---------------------------------------------------------
+  
   def insertRow(values: Array[Int]): Unit = {
     if (values.length != columns.size) {
       if (columns.size == 1 && values.length == 1) { /* Pass */ } 
@@ -81,6 +82,7 @@ class AwanTable(
       values.foreach(v => wal.logInsert(v))
       var i = 0
       columns.values.foreach { col =>
+        // [FIX] Use deltaIntBuffer via insert() logic
         col.insert(values(i))
         i += 1
       }
@@ -90,6 +92,26 @@ class AwanTable(
   }
   
   def insert(value: Int): Unit = insertRow(Array(value))
+
+  // [NEW] Explicit Column Insert (for EngineManager)
+  def insert(colName: String, value: Int): Unit = {
+    rwLock.writeLock().lock()
+    try {
+        if (isClosed) throw new IllegalStateException("Table is closed")
+        // If column exists, insert. If not, ignore (or throw)
+        columns.get(colName).foreach(_.insert(value))
+        
+        // Simple WAL strategy for single-column inserts
+        if (columns.size == 1) wal.logInsert(value)
+    } finally {
+        rwLock.writeLock().unlock()
+    }
+  }
+  
+  // [PLACEHOLDER] String support stub for EngineManager
+  def insert(colName: String, value: String): Unit = {
+     throw new UnsupportedOperationException("String insertion temporarily disabled.")
+  }
 
   // [PERFORMANCE] Batch Insert (Write Fusion)
   def insertBatch(values: Array[Int]): Unit = {
@@ -131,7 +153,8 @@ class AwanTable(
       if (isClosed) return
 
       val headCol = columns.values.headOption
-      if (headCol.isEmpty || headCol.get.deltaBuffer.isEmpty) return
+      // [FIX] Check deltaIntBuffer, not deltaBuffer
+      if (headCol.isEmpty || headCol.get.deltaIntBuffer.isEmpty) return
 
       val allColumnsData = columns.values.map(_.toArray).toList
       
@@ -149,6 +172,15 @@ class AwanTable(
   // ---------------------------------------------------------
   // READ PATH (Fully Optimized: RAM + Disk via C++)
   // ---------------------------------------------------------
+  
+  // [NEW] Polymorphic Query Router
+  def query(colName: String, search: Any): Int = {
+      search match {
+          case i: Int => query(i)
+          case _ => 0
+      }
+  }
+
   def query(threshold: Int): Int = {
     if (columns.isEmpty) return 0
     val firstColName = columns.keys.head
@@ -162,8 +194,9 @@ class AwanTable(
        
        // [RAM OPTIMIZATION] Use C++ kernel for the delta buffer
        val col = columns(firstColName)
-       if (col.deltaBuffer.nonEmpty) {
-          ramCount = NativeBridge.avxScanArray(col.deltaBuffer.toArray, threshold)
+       // [FIX] Use deltaIntBuffer
+       if (col.deltaIntBuffer.nonEmpty) {
+         ramCount = NativeBridge.avxScanArray(col.deltaIntBuffer.toArray, threshold)
        }
        
        snapshotBlocks = blockManager.getLoadedBlocks 
@@ -196,9 +229,10 @@ class AwanTable(
          val firstCol = columns.values.head
          
          // [RAM OPTIMIZATION] Use C++ kernel for the delta buffer
-         if (firstCol.deltaBuffer.nonEmpty) {
-            val ramData = firstCol.deltaBuffer.toArray
-            NativeBridge.avxScanArrayMulti(ramData, thresholds, totalCounts)
+         // [FIX] Use deltaIntBuffer
+         if (firstCol.deltaIntBuffer.nonEmpty) {
+           val ramData = firstCol.deltaIntBuffer.toArray
+           NativeBridge.avxScanArrayMulti(ramData, thresholds, totalCounts)
          }
        }
        snapshotBlocks = blockManager.getLoadedBlocks

@@ -64,13 +64,15 @@ class AwanDBSpec extends AnyFlatSpec with Matchers {
     table.insertRow(Array(123))
     
     // Check Pre-condition
-    table.columns("val").deltaBuffer.nonEmpty shouldBe true
+    // [FIX] Updated to 'deltaIntBuffer' to match NativeColumn
+    table.columns("val").deltaIntBuffer.nonEmpty shouldBe true
     
     // Action: Flush to Disk
     table.flush()
     
     // Check Post-condition
-    table.columns("val").deltaBuffer.isEmpty shouldBe true
+    // [FIX] Updated to 'deltaIntBuffer' to match NativeColumn
+    table.columns("val").deltaIntBuffer.isEmpty shouldBe true
     table.close()
   }
 

@@ -17,17 +17,18 @@ package org.awandb.core.storage
 
 import scala.collection.mutable.ArrayBuffer
 
-class NativeColumn(val name: String) {
+class NativeColumn(val name: String, val isString: Boolean = false) {
   
   // 1. Delta Store (Write-Optimized RAM)
-  // New inserts go here until flush()
-  val deltaBuffer = new ArrayBuffer[Int]()
+  // Renamed to 'deltaIntBuffer' to match AwanDBSpec expectations
+  val deltaIntBuffer = new ArrayBuffer[Int]()
 
   /**
    * Append a value to the in-memory delta buffer.
    */
   def insert(value: Int): Unit = {
-    deltaBuffer.append(value)
+    if (isString) throw new IllegalStateException(s"Column $name is a String column. Cannot insert Int.")
+    deltaIntBuffer.append(value)
   }
 
   /**
@@ -37,18 +38,21 @@ class NativeColumn(val name: String) {
    * orders of magnitude faster than looping append().
    */
   def insertBatch(values: Array[Int]): Unit = {
-    deltaBuffer ++= values
+    if (isString) throw new IllegalStateException(s"Column $name is a String column.")
+    deltaIntBuffer ++= values
   }
 
   /**
    * Clear the buffer after a successful flush to disk.
    */
   def clearDelta(): Unit = {
-    deltaBuffer.clear()
+    deltaIntBuffer.clear()
   }
+  
+  def isEmpty: Boolean = deltaIntBuffer.isEmpty
 
   /**
    * Helper to get current delta as an array (for flushing).
    */
-  def toArray: Array[Int] = deltaBuffer.toArray
+  def toArray: Array[Int] = deltaIntBuffer.toArray
 }

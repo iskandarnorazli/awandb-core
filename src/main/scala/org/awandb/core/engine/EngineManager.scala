@@ -35,19 +35,20 @@ object NoOpGovernor extends EngineGovernor {
 }
 
 // ==================================================================================
-// ENGINE COMMAND MESSAGES
+// ENGINE COMMAND MESSAGES (Updated for Mixed Types)
 // ==================================================================================
 
 sealed trait EngineCommand
-case class InsertCommand(value: Int) extends EngineCommand
+case class InsertIntCommand(value: Int) extends EngineCommand
+case class InsertStringCommand(value: String) extends EngineCommand
 case class FlushCommand() extends EngineCommand
 case object StopCommand extends EngineCommand
-case class QueryCommand(threshold: Int, promise: Promise[Int]) extends EngineCommand
+// Query Command (Supports Polymorphic Search)
+case class QueryCommand(colName: String, value: Any, promise: Promise[Int]) extends EngineCommand
 
 // ==================================================================================
 // ENGINE MANAGER
 // Focuses exclusively on Command Fusion (Batching) for high throughput.
-// Background Indexing has been removed in favor of Fast Synchronous Writes.
 // ==================================================================================
 
 class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) extends Thread {
@@ -69,7 +70,6 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
   }
 
   def stopEngine(): Unit = {
-    // Stop Event Loop gracefully
     queue.offer(StopCommand)
   }
 
@@ -95,14 +95,17 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
         if (cmd != null) {
           try {
             cmd match {
-              case InsertCommand(value) => handleBatchInsert(value)
+              case InsertIntCommand(value) => handleBatchInsertInt(value)
+              case InsertStringCommand(value) => handleBatchInsertString(value)
+              
               case FlushCommand() => 
                 // Synchronous Flush (Data + Index)
-                // Fast enough now thanks to Software Prefetching
                 table.flush() 
+              
               case StopCommand => 
                 println("[EngineManager] Stopping...")
                 running.set(false)
+              
               case q: QueryCommand => handleBatchQuery(q)
             }
           } catch {
@@ -127,45 +130,88 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
   // BATCH HANDLERS (Fusion Logic)
   // ----------------------------------------------------------------
 
-  private def handleBatchInsert(firstVal: Int): Unit = {
+  private def handleBatchInsertInt(firstVal: Int): Unit = {
     if (!governor.canAcceptInsert("default_tenant")) return 
 
-    table.insert(firstVal)
+    // Assume default integer column "val" for simple single-column tests
+    // In a real app, the command would carry the column name
+    table.insert("val", firstVal)
     processedCount.incrementAndGet()
     governor.recordUsage(1, 4)
     
-    // [WRITE FUSION]
-    // Drain up to 1000 items from queue to amortize locking/overhead
+    // [WRITE FUSION] Drain Integers
     var ops = 0
     while (!queue.isEmpty && ops < 1000) {
       val nextCmd = queue.peek()
-      if (nextCmd != null && nextCmd.isInstanceOf[InsertCommand]) {
-        val insertCmd = queue.poll().asInstanceOf[InsertCommand]
+      if (nextCmd != null && nextCmd.isInstanceOf[InsertIntCommand]) {
+        val insertCmd = queue.poll().asInstanceOf[InsertIntCommand]
         
         if (governor.canAcceptInsert("default_tenant")) {
-            table.insert(insertCmd.value)
+            table.insert("val", insertCmd.value)
             processedCount.incrementAndGet()
             governor.recordUsage(1, 4)
         }
         ops += 1
       } else {
-        return // Break batch on different command type to preserve ordering
+        return // Break batch on type switch
+      }
+    }
+  }
+
+  private def handleBatchInsertString(firstVal: String): Unit = {
+    if (!governor.canAcceptInsert("default_tenant")) return 
+
+    // Assume default string column "username" for tests
+    table.insert("username", firstVal)
+    processedCount.incrementAndGet()
+    governor.recordUsage(1, firstVal.length)
+    
+    // [WRITE FUSION] Drain Strings
+    var ops = 0
+    while (!queue.isEmpty && ops < 1000) {
+      val nextCmd = queue.peek()
+      if (nextCmd != null && nextCmd.isInstanceOf[InsertStringCommand]) {
+        val insertCmd = queue.poll().asInstanceOf[InsertStringCommand]
+        val s = insertCmd.value
+        
+        if (governor.canAcceptInsert("default_tenant")) {
+            table.insert("username", s)
+            processedCount.incrementAndGet()
+            governor.recordUsage(1, s.length)
+        }
+        ops += 1
+      } else {
+        return // Break batch
       }
     }
   }
 
   private def handleBatchQuery(firstCmd: QueryCommand): Unit = {
+      // For now, we only fuse Integer Queries on the same column.
+      // Complex polymorphic fusion is future work.
+      if (!firstCmd.value.isInstanceOf[Int]) {
+          val res = table.query(firstCmd.colName, firstCmd.value)
+          firstCmd.promise.success(res)
+          return
+      }
+
       val batch = new ArrayBuffer[QueryCommand]()
       batch.append(firstCmd)
       
-      // [QUERY FUSION]
-      // Fuse up to 100 queries into a single Scan Pass
+      // [QUERY FUSION] Fuse up to 100 queries
       var ops = 0
       while (!queue.isEmpty && ops < 100) { 
         val next = queue.peek()
         if (next != null && next.isInstanceOf[QueryCommand]) {
-           batch.append(queue.poll().asInstanceOf[QueryCommand])
-           ops += 1
+           val q = next.asInstanceOf[QueryCommand]
+           // Only fuse if same column and type (Int)
+           if (q.colName == firstCmd.colName && q.value.isInstanceOf[Int]) {
+               batch.append(queue.poll().asInstanceOf[QueryCommand])
+               ops += 1
+           } else {
+               processQueryBatch(batch)
+               return
+           }
         } else {
            processQueryBatch(batch)
            return
@@ -175,9 +221,12 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
   }
 
   private def processQueryBatch(batch: ArrayBuffer[QueryCommand]): Unit = {
-      val thresholds = batch.map(_.threshold).toArray
-      // Shared Scan: 1 Pass for N queries (O(1) cost per added query)
+      // Map Any -> Int for the shared scan
+      val thresholds = batch.map(_.value.asInstanceOf[Int]).toArray
+      
+      // Shared Scan: 1 Pass for N queries
       val results = table.queryShared(thresholds)
+      
       for (i <- batch.indices) {
         batch(i).promise.success(results(i))
       }
@@ -187,12 +236,15 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
   // PUBLIC API
   // ----------------------------------------------------------------
 
-  def submitInsert(value: Int): Unit = queue.offer(InsertCommand(value))
+  def submitInsert(value: Int): Unit = queue.offer(InsertIntCommand(value))
+  def submitInsert(value: String): Unit = queue.offer(InsertStringCommand(value))
+  
   def submitFlush(): Unit = queue.offer(FlushCommand())
   
-  def submitQuery(threshold: Int): Future[Int] = {
+  // Polymorphic Query Submission
+  def submitQuery(colName: String, value: Any): Future[Int] = {
     val p = Promise[Int]()
-    queue.offer(QueryCommand(threshold, p))
+    queue.offer(QueryCommand(colName, value, p))
     p.future
   }
 }

@@ -17,25 +17,46 @@ package org.awandb.core.index
 
 import org.awandb.core.jni.NativeBridge
 
-class CuckooFilter(val capacity: Int) extends AutoCloseable {
+class CuckooFilter(val capacity: Int, existingPointer: Long = 0) extends AutoCloseable {
   
-  private var pointer: Long = NativeBridge.cuckooCreate(capacity)
+  // If an existing pointer is provided (e.g., loaded from disk), use it.
+  // Otherwise, create a new one.
+  private var pointer: Long = if (existingPointer != 0) existingPointer else NativeBridge.cuckooCreate(capacity)
   
   if (pointer == 0) throw new OutOfMemoryError("Failed to allocate Cuckoo Filter")
 
+  /**
+   * Insert a single key. Returns true if successful, false if full (and kicking failed).
+   */
   def insert(key: Int): Boolean = {
     if (pointer == 0) throw new IllegalStateException("Filter closed")
     NativeBridge.cuckooInsert(pointer, key)
   }
 
+  /**
+   * Batch insertion (High Performance).
+   * Uses software prefetching in C++ to hide RAM latency.
+   */
+  def insertBatch(data: Array[Int]): Unit = {
+    if (pointer == 0) throw new IllegalStateException("Filter closed")
+    NativeBridge.cuckooBuildBatch(pointer, data)
+  }
+
+  /**
+   * Check if a key exists. 
+   * False Positive Rate: ~3% (with current bucket size 4 / fingerprint 16-bit).
+   */
   def contains(key: Int): Boolean = {
     if (pointer == 0) return false
     NativeBridge.cuckooContains(pointer, key)
   }
   
-  def load(data: Array[Int]): Unit = {
+  /**
+   * Persist the filter state to disk.
+   */
+  def save(path: String): Boolean = {
     if (pointer == 0) throw new IllegalStateException("Filter closed")
-    NativeBridge.cuckooBuildBatch(pointer, data)
+    NativeBridge.cuckooSave(pointer, path)
   }
 
   override def close(): Unit = {
@@ -43,5 +64,19 @@ class CuckooFilter(val capacity: Int) extends AutoCloseable {
       NativeBridge.cuckooDestroy(pointer)
       pointer = 0
     }
+  }
+}
+
+/**
+ * Factory for loading Filters from disk.
+ */
+object CuckooFilter {
+  def load(path: String): CuckooFilter = {
+    val ptr = NativeBridge.cuckooLoad(path)
+    if (ptr == 0) throw new RuntimeException(s"Failed to load CuckooFilter from $path")
+    
+    // Capacity is embedded in the file, so we pass 0 as a dummy capacity
+    // The C++ side handles the reconstruction.
+    new CuckooFilter(0, ptr)
   }
 }

@@ -13,6 +13,10 @@
  * limitations under the License.
 */
 
+/*
+ * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
+ */
+
 package org.awandb.core.storage
 
 import java.io.File
@@ -74,24 +78,24 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     for (file <- sortedFiles) {
       val ptr = NativeBridge.loadBlockFromFile(file.getAbsolutePath)
       if (ptr != 0) {
-         loadedBlocks.add(ptr)
-         val blockIdx = loadedBlocks.size() - 1
-         
-         val name = file.getName
-         val idPart = name.stripPrefix("block_").stripSuffix(".udb")
-         val id = scala.util.Try(idPart.toInt).getOrElse(0)
-         if (id > maxId) maxId = id
-         
-         if (enableIndex) {
-             val filterPath = router.getPathForFilter(id)
-             if (new File(filterPath).exists()) {
-                 val filterPtr = NativeBridge.cuckooLoad(filterPath)
-                 if (filterPtr != 0) loadedFilters.put(blockIdx, filterPtr)
-             } else {
-                 // Index missing -> Queue for background build
-                 pendingIndexes.offer(blockIdx)
-             }
-         }
+          loadedBlocks.add(ptr)
+          val blockIdx = loadedBlocks.size() - 1
+          
+          val name = file.getName
+          val idPart = name.stripPrefix("block_").stripSuffix(".udb")
+          val id = scala.util.Try(idPart.toInt).getOrElse(0)
+          if (id > maxId) maxId = id
+          
+          if (enableIndex) {
+              val filterPath = router.getPathForFilter(id)
+              if (new File(filterPath).exists()) {
+                  val filterPtr = NativeBridge.cuckooLoad(filterPath)
+                  if (filterPtr != 0) loadedFilters.put(blockIdx, filterPtr)
+              } else {
+                  // Index missing -> Queue for background build
+                  pendingIndexes.offer(blockIdx)
+              }
+          }
       }
     }
     blockCounter.set(maxId + 1)
@@ -102,6 +106,7 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
    * [FAST PATH] Create and Persist Block Data ONLY.
    * Does NOT build the Cuckoo filter immediately.
    * Returns fast, queues work for later.
+   * * [DENSE ENGINE] Accepts raw Int arrays (Reverted from NativeColumn for stability)
    */
   def createAndPersistBlock(columnsData: Seq[Array[Int]]): Unit = {
     if (columnsData.isEmpty) return
@@ -110,7 +115,7 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     val colCount = columnsData.length
     val currentId = blockCounter.getAndIncrement()
     
-    // 1. Create Data Block
+    // 1. Create Data Block (Dense Integer Layout)
     val blockPtr = NativeBridge.createBlock(rowCount, colCount)
     for (colIdx <- 0 until colCount) {
       val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
@@ -164,6 +169,7 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     NativeBridge.cuckooBuildBatch(filterPtr, data)
     
     // 3. Save
+    // NOTE: This assumes blockId == listIndex (Valid for append-only)
     val path = router.getPathForFilter(blockIdx) 
     NativeBridge.cuckooSave(filterPtr, path)
     

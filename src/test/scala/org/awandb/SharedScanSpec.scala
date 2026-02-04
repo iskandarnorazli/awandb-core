@@ -32,39 +32,42 @@ class SharedScanSpec extends AnyFlatSpec with Matchers {
   "AwanDB Query Engine" should "execute multiple queries in a single fused batch" in {
     // Cleanup
     val dir = new File(TEST_DIR)
-    if (dir.exists()) { dir.listFiles().foreach(_.delete()); dir.delete() }
+    if (dir.exists()) { 
+        dir.listFiles().foreach(_.delete())
+        dir.delete() 
+    }
     new File(TEST_DIR).mkdirs()
 
-    // FIX: Added name "shared_scan" to constructor
+    // 1. Initialize Table
     val table = new AwanTable("shared_scan", 10000, TEST_DIR)
-    
-    // FIX: Must define schema before inserting
     table.addColumn("val")
 
-    // 1. Insert Data (0 to 999)
+    // 2. Insert Data (0 to 999)
+    // We use the async submitInsert to simulate high-throughput ingestion
+    println("[Test] Ingesting 1000 rows...")
     for (i <- 0 until 1000) {
-      // FIX: Use engineManager.submitInsert for async ingestion
       table.engineManager.submitInsert(i)
     }
     
-    // Wait for data to be ingested (1 sec is plenty for 1000 rows)
+    // Wait for the async engine to process the insert queue
     Thread.sleep(1000) 
 
     println("\n--- Testing Shared Scan (Query Fusion) ---")
     
-    // 2. Simulate 3 Concurrent Users with DIFFERENT queries
+    // 3. Simulate 3 Concurrent Users with DIFFERENT queries
     // The EngineManager will fuse these into one AVX scan pass if they arrive close together.
+    // [FIX] Updated to match new signature: submitQuery(colName, value)
     
     // User A: > 800  (Expect 801..999 = 199 items)
-    val f1 = table.engineManager.submitQuery(800)
+    val f1 = table.engineManager.submitQuery("val", 800)
     
     // User B: > 500  (Expect 501..999 = 499 items)
-    val f2 = table.engineManager.submitQuery(500)
+    val f2 = table.engineManager.submitQuery("val", 500)
     
     // User C: > 100  (Expect 101..999 = 899 items)
-    val f3 = table.engineManager.submitQuery(100)
+    val f3 = table.engineManager.submitQuery("val", 100)
 
-    // 3. Wait for results
+    // 4. Wait for results
     val results = Await.result(Future.sequence(Seq(f1, f2, f3)), 5.seconds)
     
     val countA = results(0)
@@ -75,7 +78,7 @@ class SharedScanSpec extends AnyFlatSpec with Matchers {
     println(f"Query B (>500): $countB match")
     println(f"Query C (>100): $countC match")
 
-    // 4. Verification
+    // 5. Verification
     countA shouldBe 199
     countB shouldBe 499
     countC shouldBe 899

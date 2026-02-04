@@ -1,3 +1,4 @@
+```markdown
 # ☁️ AwanDB Core (OSS)
 
 **A High-Performance, Hybrid Columnar Database Engine.**
@@ -7,7 +8,7 @@ AwanDB Core is the open-source storage and compute engine powering the AwanDB pl
 ## 🚀 Key Features
 
 * **Hybrid Architecture:** Scala Control Plane (Netty/Akka style async loop) + C++ Data Plane (JNI).
-* **SIMD-Accelerated Scans:** Uses AVX2/AVX-512 instructions to scan data at memory bandwidth speeds (>20 GB/s).
+* **SIMD-Accelerated Scans:** Uses AVX2/AVX-512 instructions to scan data at memory bandwidth speeds (>40 GB/s L3, >17 GB/s RAM).
 * **Query Fusion (Shared Scans):** Automatically fuses multiple concurrent queries into a single scan pass, allowing query throughput to scale *with* load.
 * **Unified Memory:** Custom memory allocator that aligns data on 64-byte boundaries for zero-copy access between Java and C++.
 * **Pluggable Governance:** Hooks for rate limiting and tenancy (used by the Enterprise Edition).
@@ -16,19 +17,15 @@ AwanDB Core is the open-source storage and compute engine powering the AwanDB pl
 
 AwanDB uses a **Single-Writer, Multi-Reader** architecture managed by an asynchronous `EngineManager`.
 
-```mermaid
-graph TD
-    User[User API] -->|Async Submit| EM[Engine Manager (Scala)]
-    EM -->|Batch Write| WAL[Write Ahead Log]
-    EM -->|Insert| RAM[MemTable (Off-Heap)]
-    EM -->|Flush| Disk[Columnar Blocks (.udb)]
-    
-    subgraph "Native Compute Layer (C++)"
-    RAM -.->|JNI Pointer| AVX[AVX-512 Kernels]
-    Disk -.->|mmap| AVX
-    end
-
-```
+1.  **User API:** Submits asynchronous requests (Insert/Query) to the **Engine Manager (Scala)**.
+2.  **Engine Manager:**
+    * Batches writes into the **Write Ahead Log (WAL)** for durability.
+    * Inserts data into the **Off-Heap MemTable (RAM)**.
+3.  **Persistence:** Periodically flushes RAM buffers to immutable **Columnar Blocks (.udb)** on disk.
+4.  **Native Compute Layer (C++):**
+    * Accesses RAM via direct JNI Pointers (Zero-Copy).
+    * Accesses Disk via Memory Mapping (mmap).
+    * Executes hyper-optimized **AVX-512 Kernels** for filtering and aggregation.
 
 ## 📦 Prerequisites
 
@@ -36,10 +33,8 @@ graph TD
 * **Scala:** 2.13 or 3.3.
 * **Build Tool:** `sbt`.
 * **C++ Compiler:**
-* **Windows:** Visual Studio 2022 (MSVC).
-* **Linux/Mac:** GCC 9+ or Clang (with AVX2 support).
-
-
+    * **Windows:** Visual Studio 2022 (MSVC).
+    * **Linux/Mac:** GCC 9+ or Clang (with AVX2 support).
 * **CMake:** 3.10+.
 
 ## ⚙️ Build Instructions
@@ -50,7 +45,7 @@ This is a hybrid project. You must build the C++ native engine before running th
 
 ```bash
 # Navigate to the C++ source
-cd awandb-core/src/main/cpp
+cd awandb-core/src/main/resources/native
 
 # Create build directory
 mkdir build && cd build
@@ -68,7 +63,7 @@ cmake --build . --config Release
 **Post-Build Step:**
 Copy the generated shared library (`awan_engine_core.dll` or `libawan_engine_core.so`) to the Scala library path:
 
-* **From:** `awandb-core/src/main/cpp/build/Release/`
+* **From:** `awandb-core/src/main/resources/native/build/Release/`
 * **To:** `awandb-core/lib/Release/`
 
 *(Note: If using VS Code, the provided `tasks.json` handles this automatically via the "Copy DLL to Core" task).*
@@ -112,7 +107,7 @@ table.engineManager.submitInsert(22)
 
 // 3. Query (Counts items > threshold)
 // Returns Future[Int]
-val countFuture = table.engineManager.submitQuery(24)
+val countFuture = table.engineManager.submitQuery("temperature", 24)
 
 countFuture.foreach { result =>
   println(s"Sensors above 24°C: $result") // Output: 2
@@ -126,13 +121,14 @@ table.close()
 
 ## 📊 Performance Benchmarks
 
-*Hardware: Ryzen 9 5900X, DDR4 RAM.*
+*Hardware: Ryzen 9 5900X, DDR4 RAM (Single Channel).*
 
-| Workload | Throughput | Notes |
-| --- | --- | --- |
-| **Ingest (WAL + RAM)** | ~8.5 Million Ops/sec | Single-threaded writer |
-| **Scan (Warm Cache)** | ~320 Million Rows/sec | AVX-512 Filter |
-| **Shared Scan (100 Qs)** | 0.9x Latency Penalty | Effectively free concurrency |
+| Workload | Throughput | Bandwidth | Notes |
+| --- | --- | --- | --- |
+| **Seq Write (WAL + RAM)** | **~70 Million Ops/sec** | ~270 MB/s | Batch Fused |
+| **Scan (L3 Cache)** | **~11.5 Billion Rows/sec** | ~43 GB/s | AVX-512 (8x Unroll) |
+| **Scan (Main RAM)** | **~4.6 Billion Rows/sec** | ~17.6 GB/s | RAM Bandwidth Limited |
+| **Shared Scan** | **23x Speedup** | N/A | 100 Queries in 1 Pass |
 
 ## 📂 Project Structure
 
@@ -142,7 +138,7 @@ table.close()
 * `jni/`: `NativeBridge` (The JNI connector).
 
 
-* `src/main/cpp`: The raw compute engine.
+* `src/main/resources/native`: The raw compute engine.
 * `engine.cpp`: JNI implementation and AVX kernels.
 * `block.h`: Memory layout definitions.
 
@@ -152,3 +148,7 @@ table.close()
 
 Copyright (c) 2026 Iskandar & Contributors.
 This project is licensed under the Apache 2.0 License.
+
+```
+
+```

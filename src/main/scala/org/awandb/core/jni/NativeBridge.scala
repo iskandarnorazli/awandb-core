@@ -29,6 +29,9 @@ class NativeBridge {
   // --- IO / DATA TRANSFER ---
   @native def loadDataNative(ptr: Long, data: Array[Int]): Unit
   @native def copyToScalaNative(srcPtr: Long, dstArray: Array[Int], len: Int): Unit
+  
+  // [NEW] String Ingestion Native Definition
+  @native def loadStringDataNative(blockPtr: Long, colIdx: Int, data: Array[String]): Unit
 
   // --- COMPUTE ENGINES (Legacy/Direct Pointers) ---
   @native def batchRead(colPtr: Long, indicesPtr: Long, count: Int, outDataPtr: Long): Unit
@@ -38,6 +41,9 @@ class NativeBridge {
   // --- SMART ENGINES (Predicate Pushdown) ---
   @native def avxScanBlockNative(blockPtr: Long, colIdx: Int, threshold: Int, outIndicesPtr: Long): Int
   @native def avxScanMultiBlockNative(blockPtr: Long, colIdx: Int, thresholds: Array[Int], outCounts: Array[Int]): Unit
+  
+  // [NEW] German String Native Definition
+  @native def avxScanStringNative(blockPtr: Long, colIdx: Int, search: String, outIndicesPtr: Long): Int
 
   // --- RAM ENGINES (Direct Array Access) ---
   @native def avxScanArrayNative(data: Array[Int], threshold: Int): Int
@@ -56,6 +62,7 @@ class NativeBridge {
 
   // --- BLOCK MANAGEMENT ---
   @native def createBlockNative(rowCount: Int, colCount: Int): Long
+  
   @native def getColumnPtr(blockPtr: Long, colIdx: Int): Long
   @native def getBlockSize(blockPtr: Long): Long
   @native def getRowCount(blockPtr: Long): Int
@@ -69,6 +76,10 @@ class NativeBridge {
 
   @native def cuckooSaveNative(ptr: Long, path: String): Boolean
   @native def cuckooLoadNative(path: String): Long
+
+  // --- Vector ---
+  @native def loadVectorDataNative(blockPtr: Long, colIdx: Int, data: Array[Float], dim: Int): Unit
+  @native def avxScanVectorCosineNative(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float, outIndicesPtr: Long): Int
 }
 
 // -----------------------------------------------------------
@@ -128,6 +139,11 @@ object NativeBridge {
   def loadData(ptr: Long, data: Array[Int]): Unit = instance.loadDataNative(ptr, data)
   def copyToScala(srcPtr: Long, dst: Array[Int], len: Int): Unit = instance.copyToScalaNative(srcPtr, dst, len)
   
+  // [NEW] String Public Wrapper (Fixes error)
+  def loadStringData(blockPtr: Long, colIdx: Int, data: Array[String]): Unit = {
+      instance.loadStringDataNative(blockPtr, colIdx, data)
+  }
+
   // --- Legacy Compute ---
   def batchRead(colPtr: Long, idx: Long, count: Int, out: Long): Unit = instance.batchRead(colPtr, idx, count, out)
   def avxScanIndices(colPtr: Long, size: Long, thresh: Int, out: Long): Int = instance.avxScanIndicesNative(colPtr, size.toInt, thresh, out) 
@@ -136,6 +152,11 @@ object NativeBridge {
   // --- Smart Engines (Disk) ---
   def avxScanBlock(blockPtr: Long, colIdx: Int, threshold: Int, outIndicesPtr: Long): Int = instance.avxScanBlockNative(blockPtr, colIdx, threshold, outIndicesPtr)
   def avxScanMultiBlock(blockPtr: Long, colIdx: Int, thresholds: Array[Int], outCounts: Array[Int]): Unit = instance.avxScanMultiBlockNative(blockPtr, colIdx, thresholds, outCounts)
+
+  // [NEW] String Search Public Wrapper (Fixes error)
+  def avxScanString(blockPtr: Long, colIdx: Int, search: String): Int = {
+      instance.avxScanStringNative(blockPtr, colIdx, search, 0)
+  }
 
   // --- RAM Engines ---
   def avxScanArray(data: Array[Int], threshold: Int): Int = instance.avxScanArrayNative(data, threshold)
@@ -151,11 +172,13 @@ object NativeBridge {
   // --- Persistence & Blocks ---
   def saveColumn(ptr: Long, size: Long, path: String): Boolean = instance.saveColumn(ptr, size, path)
   def loadColumn(ptr: Long, size: Long, path: String): Boolean = instance.loadColumn(ptr, size, path)
+  
   def createBlock(rowCount: Int, colCount: Int): Long = {
     val ptr = instance.createBlockNative(rowCount, colCount)
     if (ptr == 0) throw new OutOfMemoryError("Native Block Alloc Failed")
     ptr
   }
+  
   def getColumnPtr(blockPtr: Long, colIdx: Int): Long = instance.getColumnPtr(blockPtr, colIdx)
   def getBlockSize(blockPtr: Long): Long = instance.getBlockSize(blockPtr)
   def getRowCount(blockPtr: Long): Int = instance.getRowCount(blockPtr)
@@ -171,7 +194,23 @@ object NativeBridge {
     instance.getZoneMapNative(blockPtr, colIdx, stats)
     (stats(0), stats(1))
   }
-
+  
+  // --- Cuckoo Persistence ---
   def cuckooSave(ptr: Long, path: String): Boolean = instance.cuckooSaveNative(ptr, path)
   def cuckooLoad(path: String): Long = instance.cuckooLoadNative(path)
+
+  // --- Vector ---
+  def loadVectorData(blockPtr: Long, colIdx: Int, data: Array[Float], dim: Int): Unit = {
+    instance.loadVectorDataNative(blockPtr, colIdx, data, dim)
+  }
+
+  def avxScanVectorCosine(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float): Int = {
+    // Pass 0 for outIndicesPtr to just count (or implement retrieval logic later)
+    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, 0)
+  }
+  
+  // Overload to get results
+  def avxScanVectorCosine(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float, outIndicesPtr: Long): Int = {
+    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, outIndicesPtr)
+  }
 }

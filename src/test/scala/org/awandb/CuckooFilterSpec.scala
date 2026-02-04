@@ -47,7 +47,10 @@ class CuckooFilterSpec extends AnyFlatSpec with Matchers {
     val filter = new CuckooFilter((count * 1.1).toInt)
     
     val start = System.nanoTime()
-    filter.load(data)
+    
+    // [FIX] Updated method name from 'load' to 'insertBatch'
+    filter.insertBatch(data)
+    
     val dur = (System.nanoTime() - start) / 1e6
     println(f"Cuckoo Build Time ($count items): $dur%.2f ms")
     
@@ -81,6 +84,7 @@ class CuckooFilterSpec extends AnyFlatSpec with Matchers {
     println(f"False Positive Rate: ${rate * 100}%.4f%%")
     
     // With 16-bit fingerprints, expected FPR is ~0.02%
+    // We set a safe upper bound for the test
     rate should be < 0.01 
     
     filter.close()
