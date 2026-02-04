@@ -15,6 +15,7 @@
 
 #include <jni.h>
 #include <immintrin.h> // AVX Intrinsics
+#include <nmmintrin.h> // For _mm_crc32_u64
 #include <vector>
 #include <cstdio>      // For fopen, fwrite, fread
 #include <cstring>     // For memcpy
@@ -889,6 +890,66 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
 
         env->ReleaseFloatArrayElements(jQuery, query, 0);
         return matchCount;
+    }
+
+    // ------------------------------------------------------------------------
+    // HASHING ENGINE (Hardware CRC32)
+    // Converts Vectors/Strings -> uint64_t for GROUP BY / JOIN
+    // ------------------------------------------------------------------------
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxHashVectorNative(
+        JNIEnv* env, jobject obj, 
+        jlong blockPtr, jint colIdx, jlong outHashPtr
+    ) {
+        if (blockPtr == 0 || outHashPtr == 0) return;
+        
+        uint8_t* rawPtr = (uint8_t*)blockPtr;
+        ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
+        
+        // We can hash ANY fixed-width column (Int, Float, Vector)
+        // Stride tells us how many bytes per row.
+        int stride = ch->stride;
+        int rows = (int)(ch->data_length / stride);
+        
+        uint8_t* data = (uint8_t*)(rawPtr + ch->data_offset);
+        int64_t* out = (int64_t*)outHashPtr; // Java Long is 64-bit signed
+        
+        // --- HASHING LOOP ---
+        for (int i = 0; i < rows; i++) {
+            uint8_t* item = data + (i * stride);
+            uint64_t hash = 0;
+            
+            // Hash the item in 64-bit chunks (8 bytes)
+            int len = stride;
+            uint64_t* ptr64 = (uint64_t*)item;
+            
+            while (len >= 8) {
+                // Hardware instruction: Accumulate CRC32
+                hash = _mm_crc32_u64(hash, *ptr64++);
+                len -= 8;
+            }
+            
+            // Handle remaining bytes (for odd-sized structures)
+            if (len > 0) {
+                uint8_t* ptr8 = (uint8_t*)ptr64;
+                while (len > 0) {
+                    hash = _mm_crc32_u8((uint32_t)hash, *ptr8++);
+                    len--;
+                }
+            }
+            
+            // Store result (cast to signed long for Java)
+            out[i] = (int64_t)hash;
+        }
+    }
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaLongNative(
+        JNIEnv* env, jobject obj, jlong srcPtr, jlongArray dstArray, jint len
+    ) {
+        if (srcPtr == 0) return;
+        jlong* scalaData = env->GetLongArrayElements(dstArray, nullptr);
+        memcpy(scalaData, (void*)srcPtr, len * sizeof(int64_t));
+        env->ReleaseLongArrayElements(dstArray, scalaData, 0);
     }
     
     // ------------------------------------------------------------------------
