@@ -1,9 +1,9 @@
-```markdown
 # ☁️ AwanDB Core (OSS)
 
 **A High-Performance, Hybrid Columnar Database Engine.**
 
-AwanDB Core is the open-source storage and compute engine powering the AwanDB platform. It combines the safety and concurrency of **Scala** with the raw throughput of **C++ AVX-512 Intrinsics**. 
+AwanDB Core is the open-source storage and compute engine powering the AwanDB platform. 
+It combines the safety and concurrency of **Scala** with the raw throughput of **C++ AVX-512 Intrinsics**. 
 
 > **Project Goal:** AwanDB is designed to evolve from a high-speed storage engine into a **full-fledged, standalone analytical database**. While currently available as an embedded core, the roadmap targets a complete server architecture with network interfaces (Arrow Flight) and distributed capabilities.
 
@@ -203,7 +203,3 @@ table.close()
 
 Copyright (c) 2026 Iskandar & Contributors.
 This project is licensed under the Apache 2.0 License.
-
-```
-
-```
