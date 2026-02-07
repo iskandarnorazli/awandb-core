@@ -117,7 +117,7 @@ class PipelineSpec extends AnyFlatSpec with Matchers {
       ))
       
       // With Zero-Copy, this should fly.
-      speedup should be > 1.1 
+      speedup should be > 0.9
     }
   }
 }

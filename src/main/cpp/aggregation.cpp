@@ -104,6 +104,21 @@ struct NativeHashMap {
             }
         }
     }
+
+    // [NEW] EXPORT FUNCTION (Flatten Map to Arrays)
+    // Copies valid entries to the provided output buffers.
+    // Returns number of rows exported.
+    int32_t export_to_arrays(int* outKeys, int64_t* outValues) {
+        int32_t count = 0;
+        for (size_t i = 0; i < capacity; i++) {
+            if (occupied[i]) {
+                outKeys[count] = keys[i];
+                outValues[count] = values[i];
+                count++;
+            }
+        }
+        return count;
+    }
 };
 
 extern "C" {
@@ -124,6 +139,16 @@ extern "C" {
         map->aggregate_batch(keys, vals, (size_t)count);
 
         return (jlong)map;
+    }
+
+    // [NEW] JNI Wrapper for Export (Map -> Arrays)
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateExportNative(
+        JNIEnv* env, jobject obj, jlong mapPtr, jlong outKeysPtr, jlong outValsPtr
+    ) {
+        if (mapPtr == 0 || outKeysPtr == 0 || outValsPtr == 0) return 0;
+        
+        NativeHashMap* map = (NativeHashMap*)mapPtr;
+        return map->export_to_arrays((int*)outKeysPtr, (int64_t*)outValsPtr);
     }
 
     // JNI Wrapper: Cleanup

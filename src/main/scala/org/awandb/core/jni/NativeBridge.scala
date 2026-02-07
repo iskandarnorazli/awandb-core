@@ -104,6 +104,10 @@ class NativeBridge {
   @native def dictionaryEncodeNative(ptr: Long, str: String): Int
   @native def dictionaryDecodeNative(ptr: Long, id: Int): String
   @native def dictionaryEncodeBatchNative(ptr: Long, strings: Array[String], outIdsPtr: Long): Unit
+
+  // --- Operator ---
+  @native def aggregateExportNative(mapPtr: Long, outKeysPtr: Long, outValsPtr: Long): Int
+  @native def memcpyNative(src: Long, dst: Long, bytes: Long): Unit
 }
 
 // -----------------------------------------------------------
@@ -308,4 +312,9 @@ object NativeBridge {
   
   def dictionaryEncodeBatch(ptr: Long, strings: Array[String], outIdsPtr: Long): Unit = 
       instance.dictionaryEncodeBatchNative(ptr, strings, outIdsPtr)
+
+  // --- Operator ---
+  def aggregateExport(mapPtr: Long, outKeysPtr: Long, outValsPtr: Long): Int = 
+      instance.aggregateExportNative(mapPtr, outKeysPtr, outValsPtr)
+  def memcpy(src: Long, dst: Long, bytes: Long): Unit = instance.memcpyNative(src, dst, bytes)
 }

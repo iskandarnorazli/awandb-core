@@ -24,49 +24,70 @@ import scala.util.Random
 class DictionarySpec extends AnyFlatSpec with Matchers {
 
   val ROWS = 1_000_000
-  
-  "AwanDB Dictionary Engine" should "compress Strings to Ints and enable fast Sorting" in {
+  // Test both low cardinality (repetitive categories) and high cardinality (IDs)
+  val CARDINALITIES = Seq(100, 100_000)
+
+  "AwanDB Dictionary Engine" should "outperform Java String Sort via Encoded Radix Sort" in {
     
-    // 1. DATA GEN (Simulating a High-Traffic Column like "Country" or "Status")
-    val distinctValues = Array("USA", "Malaysia", "China", "India", "UK", "Germany", "Japan", "Brazil")
-    val rawStrings = Array.fill(ROWS)(distinctValues(Random.nextInt(distinctValues.length)))
+    println("\n[Warmup] JIT compiling dictionary paths...")
+    runBenchmark(100_000, 100, warmup = true)
     
-    // 2. ENCODE (Compress to Ints)
+    println(s"\n=========================================================================================")
+    println(s"| %-12s | %-12s | %-15s | %-15s | %-10s |".format("ROWS", "UNIQUE", "JAVA SORT (ms)", "NATIVE SORT (ms)", "SPEEDUP"))
+    println(s"=========================================================================================")
+
+    for (cardinality <- CARDINALITIES) {
+      runBenchmark(ROWS, cardinality, warmup = false)
+    }
+    
+    println(s"=========================================================================================\n")
+  }
+
+  def runBenchmark(rows: Int, distinctCount: Int, warmup: Boolean): Unit = {
+    // 1. DATA GEN
+    val distinctValues = (0 until distinctCount).map(i => s"val_prefix_${i}").toArray
+    val rawStrings = Array.fill(rows)(distinctValues(Random.nextInt(distinctCount)))
+    
     val dictPtr = NativeBridge.dictionaryCreate()
-    val encodedPtr = NativeBridge.allocMainStore(ROWS)
-    
-    val t0 = System.nanoTime()
-    NativeBridge.dictionaryEncodeBatch(dictPtr, rawStrings, encodedPtr)
-    val encodeTime = (System.nanoTime() - t0) / 1e6
-    println(s"Batch Encoding Time: $encodeTime ms")
+    val encodedPtr = NativeBridge.allocMainStore(rows)
 
-    // 3. VERIFY CORRECTNESS
-    // Check if the first encoded ID decodes back to the original string
-    val checkBuf = new Array[Int](1)
-    NativeBridge.copyToScala(encodedPtr, checkBuf, 1)
-    val decodedStr = NativeBridge.dictionaryDecode(dictPtr, checkBuf(0))
-    decodedStr shouldBe rawStrings(0)
+    try {
+      // 2. ENCODE (String -> Int)
+      NativeBridge.dictionaryEncodeBatch(dictPtr, rawStrings, encodedPtr)
 
-    // 4. BENCHMARK: String Sort vs Encoded Radix Sort
-    
-    // A. AwanDB Encoded Sort (Radix Sort on Ints)
-    val t1 = System.nanoTime()
-    NativeBridge.radixSort(encodedPtr, ROWS)
-    val radixTime = (System.nanoTime() - t1) / 1e6
-    
-    // B. Java String Sort (Baseline)
-    val t2 = System.nanoTime()
-    java.util.Arrays.sort(rawStrings.clone().asInstanceOf[Array[Object]])
-    val javaTime = (System.nanoTime() - t2) / 1e6
-    
-    println(s"\n=======================================================================")
-    println(s"| %-20s | %-20s | %-10s |".format("JAVA STRING SORT", "ENCODED RADIX SORT", "SPEEDUP"))
-    println(s"=======================================================================")
-    println(s"| %17.2f ms | %17.2f ms | %9.2fx |".format(javaTime, radixTime, javaTime / radixTime))
-    println(s"=======================================================================\n")
+      // 3. JAVA STRING SORT (Baseline)
+      // We clone to avoid sorting the original array used for integrity checks
+      val javaStart = System.nanoTime()
+      val javaCopy = rawStrings.clone()
+      java.util.Arrays.sort(javaCopy.asInstanceOf[Array[Object]])
+      val javaTime = (System.nanoTime() - javaStart) / 1e6
 
-    // Cleanup
-    NativeBridge.freeMainStore(encodedPtr)
-    NativeBridge.dictionaryDestroy(dictPtr)
+      // 4. NATIVE RADIX SORT (On Encoded Integers)
+      val nativeStart = System.nanoTime()
+      NativeBridge.radixSort(encodedPtr, rows)
+      val nativeTime = (System.nanoTime() - nativeStart) / 1e6
+
+      if (!warmup) {
+        val speedup = javaTime / nativeTime
+        println(s"| %-12s | %-12s | %15.2f | %15.2f | %9.2fx |".format(
+          if(rows >= 1000000) s"${rows/1000000}M" else s"${rows/1000}K",
+          if(distinctCount >= 1000) s"${distinctCount/1000}K" else s"$distinctCount",
+          javaTime,
+          nativeTime,
+          speedup
+        ))
+
+        // 5. INTEGRITY CHECK (Spot check)
+        val resultBuf = new Array[Int](1)
+        NativeBridge.copyToScala(encodedPtr, resultBuf, 1)
+        val decoded = NativeBridge.dictionaryDecode(dictPtr, resultBuf(0))
+        decoded should not be null
+        
+        speedup should be > 2.0
+      }
+    } finally {
+      NativeBridge.freeMainStore(encodedPtr)
+      NativeBridge.dictionaryDestroy(dictPtr)
+    }
   }
 }

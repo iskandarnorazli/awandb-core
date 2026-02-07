@@ -15,7 +15,7 @@
 */
 
 #include "common.h"
-#include "cuckoo.h" // Ensure this is included
+#include "cuckoo.h"
 
 extern "C" {
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooCreateNative(JNIEnv* env, jobject obj, jint capacity) {
@@ -55,15 +55,23 @@ extern "C" {
         env->ReleasePrimitiveArrayCritical(jData, data, 0);
     }
 
-    // [ADDED MISSING FUNCTION] For Vectorized Pipeline
+    // [CRITICAL FIX] 
+    // Java expects int[] (4 bytes per element), but C++ was writing bytes (1 byte).
+    // We must cast the output pointer to int32_t* and write 32-bit integers.
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooProbeBatchNative(
         JNIEnv* env, jobject obj, jlong ptr, jlong keysPtr, jint count, jlong outPtr
     ) {
         if (ptr == 0 || keysPtr == 0 || outPtr == 0) return;
+        
         CuckooFilter* filter = (CuckooFilter*)ptr;
         int32_t* keys = (int32_t*)keysPtr;
-        uint8_t* out = (uint8_t*)outPtr; 
+        int32_t* out = (int32_t*)outPtr; // Treat output as INT array (4 bytes stride)
         
-        filter->contains_batch(keys, (size_t)count, out);
+        // We cannot use the default 'contains_batch' if it writes bytes.
+        // We run the loop here to ensure 32-bit writes.
+        // (Compiler will vectorize this loop automatically via AVX2)
+        for(int i=0; i<count; i++) {
+            out[i] = filter->contains(keys[i]) ? 1 : 0;
+        }
     }
 }

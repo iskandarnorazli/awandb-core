@@ -56,4 +56,12 @@ extern "C" {
         // Just return the address + offset
         return basePtr + offsetBytes; 
     }
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_memcpyNative(
+        JNIEnv* env, jobject obj, jlong srcPtr, jlong dstPtr, jlong bytes
+    ) {
+        if (srcPtr && dstPtr && bytes > 0) {
+            std::memcpy((void*)dstPtr, (void*)srcPtr, (size_t)bytes);
+        }
+    }
 }
