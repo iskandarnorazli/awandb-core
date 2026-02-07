@@ -85,6 +85,16 @@ class NativeBridge {
 
   // --- Hardware Topology---
   @native def getSystemTopologyNative(): Array[Long]
+
+  // --- Sorting ---
+  @native def radixSortNative(ptr: Long, count: Int): Unit
+  // [NEW] Single-Threaded Sort for Benchmarking
+  @native def radixSortSingleNative(ptr: Long, count: Int): Unit
+
+  // --- AGGREGATION ---
+
+  @native def aggregateSumNative(keysPtr: Long, valsPtr: Long, count: Int): Long
+  @native def freeAggregationResultNative(ptr: Long): Unit
 }
 
 // -----------------------------------------------------------
@@ -252,6 +262,16 @@ object NativeBridge {
     instance.copyToScalaLongNative(hashPtr, arr, count)
     arr
   }
+
+  // --- Sorting ---
+
+  def radixSort(ptr: Long, count: Int): Unit = instance.radixSortNative(ptr, count)
+  def radixSortSingle(ptr: Long, count: Int): Unit = instance.radixSortSingleNative(ptr, count)
+
+  // --- AGGREGATION ---
+
+  def aggregateSum(keysPtr: Long, valsPtr: Long, count: Int): Long = instance.aggregateSumNative(keysPtr, valsPtr, count)
+  def freeAggregationResult(ptr: Long): Unit = instance.freeAggregationResultNative(ptr)
 
   // Hardware Discovery Wrapper
   def getHardwareInfo(): (Int, Long) = {

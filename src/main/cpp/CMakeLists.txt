@@ -41,19 +41,26 @@ else()
     include_directories(${JNI_INCLUDE_DIRS})
 endif()
 
-# 4. Source Files 
-# (engine.cpp is now in the same folder as CMakeLists.txt)
-set(SOURCES engine.cpp)
+# 4. Source Files (Modularized Engine)
+# engine.cpp has been split into these components:
+set(SOURCES 
+    common.cpp
+    storage.cpp
+    compute.cpp
+    sort.cpp
+    hardware.cpp
+    cuckoo_jni.cpp
+    aggregation.cpp
+)
 
 # 5. Create Shared Library
 add_library(awan_engine_core SHARED ${SOURCES})
 
-# 6. Include Directories (for block.h)
+# 6. Include Directories (for common.h, block.h, etc.)
 target_include_directories(awan_engine_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # 7. Output Directory 
 # We output to the build folder so VS Code can find it.
-# The Task "3. Copy DLL to Core" will handle moving it to the lib folder.
 set_target_properties(awan_engine_core PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
