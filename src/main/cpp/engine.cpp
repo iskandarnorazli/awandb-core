@@ -4,7 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- *   http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,6 +12,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
 */
+
+// [CRITICAL WINDOWS FIXES]
+// Must be defined BEFORE any includes
+#define _CRT_SECURE_NO_WARNINGS  // Fixes "fopen may be unsafe"
+#define NOMINMAX                 // Fixes "std::max/min" macro conflicts
 
 #include <jni.h>
 #include <immintrin.h> // AVX Intrinsics
@@ -22,6 +27,16 @@
 #include <cstdlib>     // For malloc/free
 #include <new>         // For std::bad_alloc
 #include <limits>      // For std::numeric_limits
+#include <thread>
+
+// [CROSS-PLATFORM HEADER GUARD]
+#ifdef _WIN32
+    #include <windows.h>
+    #include <malloc.h>
+#else
+    #include <unistd.h>
+#endif
+
 #include "block.h"     
 #include "cuckoo.h"    
 
@@ -33,7 +48,9 @@ void* alloc_aligned(size_t size) {
 #ifdef _WIN32
     return _aligned_malloc(size, alignment);
 #else
-    return std::aligned_alloc(alignment, size);
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) return nullptr;
+    return ptr;
 #endif
 }
 
@@ -42,7 +59,7 @@ void free_aligned(void* ptr) {
 #ifdef _WIN32
     _aligned_free(ptr);
 #else
-    std::free(ptr);
+    free(ptr);
 #endif
 }
 
@@ -67,8 +84,8 @@ extern "C" {
         size_t dataStartOffset = metaDataSize + padding;
         
         // [DENSE LAYOUT] 4 bytes per row
-        size_t columnSizeBytes = rowCount * sizeof(int);
-        size_t totalDataSize = colCount * columnSizeBytes;
+        size_t columnSizeBytes = (size_t)rowCount * sizeof(int);
+        size_t totalDataSize = (size_t)colCount * columnSizeBytes;
         
         // Total allocation
         size_t totalBlockSize = dataStartOffset + totalDataSize;
@@ -140,11 +157,10 @@ extern "C" {
         // [CRITICAL FIX] 
         // We assume 'ch->data_length' currently holds the TOTAL allocated capacity (from createBlock).
         // We place the String Pool immediately after the rows we are about to write.
-        size_t structBytes = len * 16;
+        size_t structBytes = (size_t)len * 16;
         char* poolBase = (char*)fixedData + structBytes;
         
         // Calculate remaining space for the pool
-        // (Assuming data_length is the total capacity allocated)
         uint64_t poolLimit = 0;
         if (ch->data_length > structBytes) {
             poolLimit = ch->data_length - structBytes;
@@ -182,14 +198,13 @@ extern "C" {
         }
         
         // [CRITICAL FIX] Update Header Metadata
-        // 1. Point pool offset to where we actually started the pool
         ch->string_pool_offset = (uint64_t)((uint8_t*)poolBase - rawPtr);
         ch->string_pool_length = currentOffset;
         
-        // 2. Shrink 'data_length' to match the actual valid structs.
-        // This ensures the AVX Scanner stops at 'len' and doesn't read the Heap as garbage structs.
+        // Shrink 'data_length' to match the actual valid structs.
         ch->data_length = structBytes;
     }
+
     // ------------------------------------------------------------------------
     // GERMAN STRING SCANNER (AVX2)
     // ------------------------------------------------------------------------
@@ -205,7 +220,6 @@ extern "C" {
         int* out = (int*)outIndicesPtr;
         int matchCount = 0;
         
-        // GermanString is 16 bytes. Stride is 16.
         int rows = (int)(ch->data_length / 16); 
 
         const char* cstr = env->GetStringUTFChars(search, nullptr);
@@ -217,12 +231,10 @@ extern "C" {
         int i = 0;
         int limit = rows - 4;
         
-        // Required mask: 0xFFFF (Short match all) or 0x00FF (Long match prefix only)
         int requiredMask = (sLen <= 12) ? 0xFFFF : 0x00FF;
 
-        // [CRITICAL FIX] Split loop to handle Null Output Pointer safely
         if (outIndicesPtr == 0) {
-            // --- COUNT ONLY PATH (No Writes to 'out') ---
+            // --- COUNT ONLY PATH ---
             for (; i <= limit; i += 4) {
                 __m128i v0 = _mm_loadu_si128((__m128i*)&data[i]);
                 __m128i v1 = _mm_loadu_si128((__m128i*)&data[i+1]);
@@ -240,7 +252,7 @@ extern "C" {
                 if ((m3 & requiredMask) == requiredMask) { if (data[i+3].equals(target)) matchCount++; }
             }
         } else {
-            // --- EXTRACTION PATH (Writes to 'out') ---
+            // --- EXTRACTION PATH ---
             for (; i <= limit; i += 4) {
                 __m128i v0 = _mm_loadu_si128((__m128i*)&data[i]);
                 __m128i v1 = _mm_loadu_si128((__m128i*)&data[i+1]);
@@ -259,7 +271,6 @@ extern "C" {
             }
         }
         
-        // Tail Cleanup
         for (; i < rows; i++) {
             if (data[i].equals(target)) {
                 if (outIndicesPtr != 0) out[matchCount] = i;
@@ -312,18 +323,18 @@ extern "C" {
              return 0;
         }
 
-        void* ptr = alloc_aligned(fileSize);
+        void* ptr = alloc_aligned((size_t)fileSize);
         if (!ptr) {
             fclose(file);
             env->ReleaseStringUTFChars(path, filename);
             return 0;
         }
 
-        size_t readBytes = fread(ptr, 1, fileSize, file);
+        size_t readBytes = fread(ptr, 1, (size_t)fileSize, file);
         fclose(file);
         env->ReleaseStringUTFChars(path, filename);
         
-        if (readBytes != fileSize) {
+        if (readBytes != (size_t)fileSize) {
             free_aligned(ptr);
             return 0;
         }
@@ -336,7 +347,7 @@ extern "C" {
     // ------------------------------------------------------------------------
 
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_allocMainStoreNative(JNIEnv* env, jobject obj, jlong num_elements) {
-        size_t bytes = num_elements * sizeof(int);
+        size_t bytes = (size_t)num_elements * sizeof(int);
         void* ptr = alloc_aligned(bytes);
         if (ptr) std::memset(ptr, 0, bytes);
         return (jlong)ptr;
@@ -350,8 +361,7 @@ extern "C" {
         if (ptr == 0) return;
         jint* scalaData = env->GetIntArrayElements(jData, nullptr);
         jsize length = env->GetArrayLength(jData);
-        // [DENSE FIX] Fast Memcpy is back. Stride is 4 bytes.
-        memcpy((void*)ptr, scalaData, length * sizeof(int));
+        memcpy((void*)ptr, scalaData, (size_t)length * sizeof(int));
         env->ReleaseIntArrayElements(jData, scalaData, 0);
     }
 
@@ -359,7 +369,7 @@ extern "C" {
         if (srcPtr == 0) return;
         int* cppData = (int*)srcPtr;
         jint* scalaData = env->GetIntArrayElements(dstArray, nullptr);
-        memcpy(scalaData, cppData, len * sizeof(int));
+        memcpy(scalaData, cppData, (size_t)len * sizeof(int));
         env->ReleaseIntArrayElements(dstArray, scalaData, 0);
     }
 
@@ -385,7 +395,6 @@ extern "C" {
         ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
         
         for (uint32_t i = 0; i < blkHeader->column_count; i++) {
-            // Only calc min/max for INT columns
             if (colHeaders[i].type == TYPE_INT) {
                 int* data = (int*)(rawPtr + colHeaders[i].data_offset);
                 size_t count = blkHeader->row_count; 
@@ -412,7 +421,7 @@ extern "C" {
             return false; 
         }
         
-        fwrite((void*)ptr, 1, size, file);
+        fwrite((void*)ptr, 1, (size_t)size, file);
         
         fclose(file);
         env->ReleaseStringUTFChars(path, filename);
@@ -423,7 +432,7 @@ extern "C" {
         const char* filename = env->GetStringUTFChars(path, nullptr);
         FILE* file = fopen(filename, "rb");
         if (!file) { env->ReleaseStringUTFChars(path, filename); return false; }
-        fread((void*)ptr, 1, size, file);
+        fread((void*)ptr, 1, (size_t)size, file);
         fclose(file);
         env->ReleaseStringUTFChars(path, filename);
         return true;
@@ -487,15 +496,10 @@ extern "C" {
         
         __m256i vThresh = _mm256_set1_epi32(threshold);
         
-        // =================================================================================
-        // PATH A: COUNT ONLY (High Speed - 8x Unroll)
-        // =================================================================================
         if (outIndicesPtr == 0) {
-            // Process 64 integers (256 bytes) per iteration
-            size_t limit = rows - 64; 
+            size_t limit = (size_t)rows - 64; 
 
             for (; i <= limit; i += 64) {
-                // [ALIGNED LOAD] Faster than loadu
                 __m256i v0 = _mm256_load_si256((__m256i*)&data[i]);
                 __m256i v1 = _mm256_load_si256((__m256i*)&data[i+8]);
                 __m256i v2 = _mm256_load_si256((__m256i*)&data[i+16]);
@@ -505,7 +509,6 @@ extern "C" {
                 __m256i v6 = _mm256_load_si256((__m256i*)&data[i+48]);
                 __m256i v7 = _mm256_load_si256((__m256i*)&data[i+56]);
 
-                // [COMPARE]
                 __m256i m0 = _mm256_cmpgt_epi32(v0, vThresh);
                 __m256i m1 = _mm256_cmpgt_epi32(v1, vThresh);
                 __m256i m2 = _mm256_cmpgt_epi32(v2, vThresh);
@@ -515,7 +518,6 @@ extern "C" {
                 __m256i m6 = _mm256_cmpgt_epi32(v6, vThresh);
                 __m256i m7 = _mm256_cmpgt_epi32(v7, vThresh);
 
-                // [ACCUMULATE]
                 matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m0)));
                 matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m1)));
                 matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m2)));
@@ -525,14 +527,9 @@ extern "C" {
                 matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m6)));
                 matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m7)));
             }
-        } 
-        // =================================================================================
-        // PATH B: INDEX EXTRACTION (Keep 4x to manage register pressure)
-        // =================================================================================
-        else {
-            size_t limit = rows - 32;
+        } else {
+            size_t limit = (size_t)rows - 32;
             for (; i <= limit; i += 32) {
-                // Keep prefetch here as this path is branchy
                 _mm_prefetch((const char*)&data[i + 32], _MM_HINT_T0);
                 
                 __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
@@ -545,24 +542,24 @@ extern "C" {
                 int mask2 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v2, vThresh)));
                 int mask3 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v3, vThresh)));
 
-                if (mask0) { for(int k=0; k<8; k++) if((mask0>>k)&1) out[matchCount++] = i+k; }
-                if (mask1) { for(int k=0; k<8; k++) if((mask1>>k)&1) out[matchCount++] = i+8+k; }
-                if (mask2) { for(int k=0; k<8; k++) if((mask2>>k)&1) out[matchCount++] = i+16+k; }
-                if (mask3) { for(int k=0; k<8; k++) if((mask3>>k)&1) out[matchCount++] = i+24+k; }
+                if (mask0) { for(int k=0; k<8; k++) if((mask0>>k)&1) out[matchCount++] = (int)(i+k); }
+                if (mask1) { for(int k=0; k<8; k++) if((mask1>>k)&1) out[matchCount++] = (int)(i+8+k); }
+                if (mask2) { for(int k=0; k<8; k++) if((mask2>>k)&1) out[matchCount++] = (int)(i+16+k); }
+                if (mask3) { for(int k=0; k<8; k++) if((mask3>>k)&1) out[matchCount++] = (int)(i+24+k); }
             }
         }
 
         // Cleanup Tail
-        for (; i < rows; i++) {
+        for (; i < (size_t)rows; i++) {
             if (data[i] > threshold) {
-                if (outIndicesPtr != 0) out[matchCount] = i;
+                if (outIndicesPtr != 0) out[matchCount] = (int)i;
                 matchCount++;
             }
         }
         return matchCount;
     }
 
-JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNative(
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNative(
         JNIEnv* env, jobject obj, 
         jlong blockPtr, jint colIdx, 
         jintArray jThresholds, jintArray jCounts
@@ -581,7 +578,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         jint* counts = (jint*)env->GetPrimitiveArrayCritical(jCounts, nullptr);
         jsize numQueries = env->GetArrayLength(jThresholds);
 
-        // Zone Map Check
         int32_t minQuery = std::numeric_limits<int32_t>::max();
         int32_t maxQuery = std::numeric_limits<int32_t>::min();
         for (int q = 0; q < numQueries; q++) {
@@ -603,7 +599,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
 
         int* data = (int*)(rawPtr + colHeaders[colIdx].data_offset);
         size_t i = 0;
-        size_t limit = rows - 32;
+        size_t limit = (size_t)rows - 32;
 
         for (; i < limit; i += 32) {
             _mm_prefetch((const char*)&data[i + 32], _MM_HINT_T0);
@@ -618,7 +614,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
                 __m256i vThresh = _mm256_set1_epi32(thresholds[q]);
                 
                 int c = 0;
-                // [FIX] Fixed typo: m_256 -> _mm256
                 c += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v0, vThresh))));
                 c += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v1, vThresh))));
                 c += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v2, vThresh))));
@@ -628,7 +623,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
             }
         }
 
-        for (; i < rows; i++) {
+        for (; i < (size_t)rows; i++) {
             int val = data[i];
             for (int q = 0; q < numQueries; q++) {
                 if (val > thresholds[q]) counts[q]++;
@@ -661,7 +656,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
          jint* counts = (jint*)env->GetPrimitiveArrayCritical(jCounts, nullptr);
          jsize numQueries = env->GetArrayLength(jThresholds);
          
-         std::memset(counts, 0, numQueries * sizeof(int));
+         std::memset(counts, 0, (size_t)numQueries * sizeof(int));
          
          for (int i = 0; i < rows; i++) {
              int val = data[i];
@@ -687,7 +682,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         
         int matchCount = 0;
         size_t i = 0;
-        size_t alignedLimit = rows - (rows % 8);
+        size_t alignedLimit = (size_t)rows - (rows % 8);
         __m256i thresholdVec = _mm256_set1_epi32(threshold);
 
         for (; i < alignedLimit; i += 8) {
@@ -697,7 +692,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
             if (mask != 0) matchCount += _mm_popcnt_u32(mask);
         }
 
-        for (; i < rows; i++) {
+        for (; i < (size_t)rows; i++) {
             if (data[i] > threshold) matchCount++;
         }
         env->ReleasePrimitiveArrayCritical(jData, data, 0);
@@ -718,7 +713,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         jsize numQueries = env->GetArrayLength(jThresholds);
 
         size_t i = 0;
-        size_t alignedLimit = rows - (rows % 8);
+        size_t alignedLimit = (size_t)rows - (rows % 8);
 
         for (; i < alignedLimit; i += 8) {
             __m256i vecData = _mm256_loadu_si256((__m256i*)&data[i]);
@@ -730,7 +725,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
             }
         }
 
-        for (; i < rows; i++) {
+        for (; i < (size_t)rows; i++) {
             int val = data[i];
             for (int q = 0; q < numQueries; q++) {
                 if (val > thresholds[q]) counts[q]++;
@@ -789,7 +784,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         env->ReleasePrimitiveArrayCritical(jData, data, 0);
     }
 
-// ------------------------------------------------------------------------
+    // ------------------------------------------------------------------------
     // VECTOR INGESTION
     // ------------------------------------------------------------------------
     
@@ -813,10 +808,10 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         
         // Copy Data to Block
         float* dstData = (float*)(rawPtr + ch->data_offset);
-        std::memcpy(dstData, srcData, count * sizeof(float));
+        std::memcpy(dstData, srcData, (size_t)count * sizeof(float));
         
         // Update metadata
-        ch->data_length = count * sizeof(float);
+        ch->data_length = (size_t)count * sizeof(float);
         
         env->ReleaseFloatArrayElements(jData, srcData, 0);
     }
@@ -839,7 +834,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         if (ch->type != TYPE_VECTOR) return 0;
 
         int dim = (int)ch->vector_dim;
-        int rows = (int)ch->data_length / ch->stride; // row_count might be unreliable if we just loaded partial? Use calc.
+        int rows = (int)(ch->data_length / ch->stride); 
         
         float* data = (float*)(rawPtr + ch->data_offset);
         int* out = (int*)outIndicesPtr;
@@ -848,8 +843,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         jfloat* query = env->GetFloatArrayElements(jQuery, nullptr);
         
         // --- PREPARE ---
-        // Typically dims are 128, 256, 384, 768 (multiples of 8 floats / 32 bytes)
-        // We assume dim % 8 == 0 for the hot loop.
         int dimLimit = dim - (dim % 8); 
 
         for (int i = 0; i < rows; i++) {
@@ -868,7 +861,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
             }
             
             // Horizontal Sum (Reduce 8 floats to 1 float)
-            // 1. Permute and Add
             __m256 shuf = _mm256_permute2f128_ps(sum, sum, 1); // Swap low/high 128
             sum = _mm256_add_ps(sum, shuf);
             sum = _mm256_hadd_ps(sum, sum); // Horizontal add adjacent pairs
@@ -894,7 +886,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
 
     // ------------------------------------------------------------------------
     // HASHING ENGINE (Hardware CRC32)
-    // Converts Vectors/Strings -> uint64_t for GROUP BY / JOIN
     // ------------------------------------------------------------------------
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxHashVectorNative(
@@ -906,8 +897,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
         
-        // We can hash ANY fixed-width column (Int, Float, Vector)
-        // Stride tells us how many bytes per row.
         int stride = ch->stride;
         int rows = (int)(ch->data_length / stride);
         
@@ -919,7 +908,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
             uint8_t* item = data + (i * stride);
             uint64_t hash = 0;
             
-            // Hash the item in 64-bit chunks (8 bytes)
             int len = stride;
             uint64_t* ptr64 = (uint64_t*)item;
             
@@ -929,7 +917,7 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
                 len -= 8;
             }
             
-            // Handle remaining bytes (for odd-sized structures)
+            // Handle remaining bytes
             if (len > 0) {
                 uint8_t* ptr8 = (uint8_t*)ptr64;
                 while (len > 0) {
@@ -938,7 +926,6 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
                 }
             }
             
-            // Store result (cast to signed long for Java)
             out[i] = (int64_t)hash;
         }
     }
@@ -948,8 +935,56 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNa
     ) {
         if (srcPtr == 0) return;
         jlong* scalaData = env->GetLongArrayElements(dstArray, nullptr);
-        memcpy(scalaData, (void*)srcPtr, len * sizeof(int64_t));
+        memcpy(scalaData, (void*)srcPtr, (size_t)len * sizeof(int64_t));
         env->ReleaseLongArrayElements(dstArray, scalaData, 0);
+    }
+
+// ------------------------------------------------------------------------
+// HARDWARE TOPOLOGY DISCOVERY (Morsel Sizing)
+// ------------------------------------------------------------------------
+
+    JNIEXPORT jlongArray JNICALL Java_org_awandb_core_jni_NativeBridge_getSystemTopologyNative(JNIEnv* env, jobject obj) {
+        jlong info[2];
+        
+        // 1. Detect Logical Cores
+        unsigned int cores = std::thread::hardware_concurrency();
+        info[0] = (cores == 0) ? 4 : cores; // Fallback to 4 if detection fails
+
+        // 2. Detect L3 Cache Size (Cross Platform)
+        long l3_size = -1;
+
+#ifdef _WIN32
+        // Windows Implementation
+        DWORD bufferSize = 0;
+        GetLogicalProcessorInformation(nullptr, &bufferSize);
+        
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION* buffer = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION*)malloc(bufferSize);
+        
+        if (GetLogicalProcessorInformation(buffer, &bufferSize)) {
+            DWORD count = bufferSize / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+            for (DWORD i = 0; i < count; i++) {
+                if (buffer[i].Relationship == RelationCache && buffer[i].Cache.Level == 3) {
+                    l3_size = buffer[i].Cache.Size;
+                    break;
+                }
+            }
+        }
+        free(buffer);
+#else
+        // POSIX Implementation
+    #ifdef _SC_LEVEL3_CACHE_SIZE
+        l3_size = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    #endif
+#endif
+
+        if (l3_size <= 0) {
+            l3_size = 12 * 1024 * 1024; // 12MB Safe Default
+        }
+        info[1] = l3_size;
+
+        jlongArray result = env->NewLongArray(2);
+        env->SetLongArrayRegion(result, 0, 2, info);
+        return result;
     }
     
     // ------------------------------------------------------------------------

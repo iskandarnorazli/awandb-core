@@ -1,6 +1,6 @@
 name := "AwanDB"
 version := "0.1"
-scalaVersion := "3.3.1"
+scalaVersion := "3.3.5"
 
 // Enable forking (Required for JVM options to work)
 fork := true

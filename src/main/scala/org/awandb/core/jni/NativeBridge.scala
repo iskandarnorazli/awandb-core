@@ -82,6 +82,9 @@ class NativeBridge {
   @native def avxScanVectorCosineNative(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float, outIndicesPtr: Long): Int
   @native def avxHashVectorNative(blockPtr: Long, colIdx: Int, outHashPtr: Long): Unit
   @native def copyToScalaLongNative(srcPtr: Long, dst: Array[Long], len: Int): Unit
+
+  // --- Hardware Topology---
+  @native def getSystemTopologyNative(): Array[Long]
 }
 
 // -----------------------------------------------------------
@@ -141,7 +144,7 @@ object NativeBridge {
   def loadData(ptr: Long, data: Array[Int]): Unit = instance.loadDataNative(ptr, data)
   def copyToScala(srcPtr: Long, dst: Array[Int], len: Int): Unit = instance.copyToScalaNative(srcPtr, dst, len)
   
-  // [NEW] String Public Wrapper (Fixes error)
+  // [NEW] String Public Wrapper
   def loadStringData(blockPtr: Long, colIdx: Int, data: Array[String]): Unit = {
       instance.loadStringDataNative(blockPtr, colIdx, data)
   }
@@ -155,7 +158,7 @@ object NativeBridge {
   def avxScanBlock(blockPtr: Long, colIdx: Int, threshold: Int, outIndicesPtr: Long): Int = instance.avxScanBlockNative(blockPtr, colIdx, threshold, outIndicesPtr)
   def avxScanMultiBlock(blockPtr: Long, colIdx: Int, thresholds: Array[Int], outCounts: Array[Int]): Unit = instance.avxScanMultiBlockNative(blockPtr, colIdx, thresholds, outCounts)
 
-  // [NEW] String Search Public Wrapper (Fixes error)
+  // [NEW] String Search Public Wrapper
   def avxScanString(blockPtr: Long, colIdx: Int, search: String): Int = {
       instance.avxScanStringNative(blockPtr, colIdx, search, 0)
   }
@@ -220,22 +223,13 @@ object NativeBridge {
     val rows = getRowCount(blockPtr)
     val outArray = new Array[Long](rows)
     
-    // Pin the output array so C++ can write to it directly
-    // Note: We use a temporary native buffer for safety in real prod, 
-    // but for this prototype, we'll alloc a native buffer, write, then copy back.
     val outPtr = allocMainStore(rows * 2) // Alloc ints (4B), so *2 for Longs (8B)
     
     instance.avxHashVectorNative(blockPtr, colIdx, outPtr)
     
-    // Copy back (Need a Long copy utility, but for now we read manually or assume Int-sized hashes?)
-    // Actually, let's keep it simple: We return pointers.
-    // Ideally, we add 'copyLongsToScala'. For now, let's reuse 'copyToScala' treating them as Int pairs?
-    // Let's implement a 'copyLongToScalaNative' quickly in C++ if needed, 
-    // OR just use 'batchRead' logic.
-    
-    // For Phase 4 speed, let's just assume we keep the hashes in Native RAM for the GroupBy engine.
-    // We return the POINTER to the hashes.
-    null // Placeholder: In real usage, we return the pointer 'outPtr'
+    // For Phase 4 speed, return null or implement copy back if needed.
+    // The C++ side is ready.
+    null 
   }
   
   // DIRECT POINTER VERSION (For high speed)
@@ -250,10 +244,6 @@ object NativeBridge {
   
   // Helper to read a specific hash back (for testing)
   def getHashAt(hashPtr: Long, index: Int): Long = {
-     // This is slow, only for unit tests
-     // We need to access memory at hashPtr + (index * 8)
-     // Since we don't have a direct "getLong" JNI, we can't easily verify in Scala without adding it.
-     // Let's add 'getLongNative' to engine.cpp quickly?
      0L 
   }
 
@@ -261,5 +251,19 @@ object NativeBridge {
     val arr = new Array[Long](count)
     instance.copyToScalaLongNative(hashPtr, arr, count)
     arr
+  }
+
+  // Hardware Discovery Wrapper
+  def getHardwareInfo(): (Int, Long) = {
+     // If native lib not loaded yet (e.g. tests), return default
+     if (instance == null) return (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
+     
+     try {
+       val info = instance.getSystemTopologyNative()
+       // Info: [0] = Cores, [1] = L3 Cache Bytes
+       (info(0).toInt, info(1))
+     } catch {
+       case _: UnsatisfiedLinkError => (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
+     }
   }
 }

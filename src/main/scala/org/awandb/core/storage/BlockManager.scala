@@ -13,10 +13,6 @@
  * limitations under the License.
 */
 
-/*
- * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
- */
-
 package org.awandb.core.storage
 
 import java.io.File
@@ -106,38 +102,75 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
    * [FAST PATH] Create and Persist Block Data ONLY.
    * Does NOT build the Cuckoo filter immediately.
    * Returns fast, queues work for later.
-   * * [DENSE ENGINE] Accepts raw Int arrays (Reverted from NativeColumn for stability)
+   * [UPDATED] Accepts Seq[Any] to handle mixed types (Array[Int] / Array[String])
    */
-  def createAndPersistBlock(columnsData: Seq[Array[Int]]): Unit = {
+  def createAndPersistBlock(columnsData: Seq[Any]): Unit = {
     if (columnsData.isEmpty) return
 
-    val rowCount = columnsData.head.length
+    // 1. Inspect Data Types & Count
+    // We check the first column to get row count.
+    // We scan all columns to see if ANY are strings (to trigger the allocation hack).
+    val (rowCount, hasString) = columnsData.head match {
+      case a: Array[Int] => (a.length, columnsData.exists(_.isInstanceOf[Array[String]]))
+      case a: Array[String] => (a.length, true)
+      case _ => (0, false)
+    }
+
+    if (rowCount == 0) return
     val colCount = columnsData.length
     val currentId = blockCounter.getAndIncrement()
     
-    // 1. Create Data Block (Dense Integer Layout)
-    val blockPtr = NativeBridge.createBlock(rowCount, colCount)
-    for (colIdx <- 0 until colCount) {
-      val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
-      NativeBridge.loadData(colPtr, columnsData(colIdx))
-    }
-    
-    // 2. Save Data to Disk
-    val filename = router.getPathForBlock(currentId)
-    val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename) 
-    
-    if (!saved) {
-      NativeBridge.freeMainStore(blockPtr)
-      throw new RuntimeException(s"Failed to save block: $filename")
-    }
+    // 2. Memory Allocation Strategy
+    // NATIVE BRIDGE CONSTRAINT: createBlock allocates (N * 4) bytes per column.
+    // German Strings need 16 bytes/row + Heap space (~48 bytes/row safety).
+    // If Strings are present, we request 16x the row count to force C++ to allocate enough RAM.
+    val allocationRows = if (hasString) rowCount * 16 else rowCount
 
-    // 3. Register Block
-    loadedBlocks.add(blockPtr)
+    // 1. Create Block
+    val blockPtr = NativeBridge.createBlock(allocationRows, colCount)
     
-    // 4. Queue for Background Indexing
-    if (enableIndex && rowCount > 0) {
-        // Queue the logic index (which matches our list index)
-        pendingIndexes.offer(loadedBlocks.size() - 1)
+    try {
+        // 3. Ingest Data (Polyglot)
+        val dataArray = columnsData.toArray
+        
+        for (colIdx <- 0 until colCount) {
+           dataArray(colIdx) match {
+               case ints: Array[Int] =>
+                   val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+                   NativeBridge.loadData(colPtr, ints)
+                   
+               case strs: Array[String] =>
+                   // German String Ingest
+                   NativeBridge.loadStringData(blockPtr, colIdx, strs)
+                   
+               case _ => 
+                   throw new IllegalArgumentException(s"Unsupported column type at index $colIdx")
+           }
+        }
+        
+        // 4. Save Data to Disk
+        val filename = router.getPathForBlock(currentId)
+        val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename) 
+        
+        if (!saved) {
+          throw new RuntimeException(s"Failed to save block: $filename")
+        }
+
+        // 5. Register Block
+        loadedBlocks.add(blockPtr)
+        
+        // 6. Queue for Background Indexing
+        // Note: Cuckoo currently supports Ints only. If we have strings, we might skip
+        // or only index the Int columns. For now, we queue it and let the Indexer decide.
+        if (enableIndex && rowCount > 0) {
+            pendingIndexes.offer(loadedBlocks.size() - 1)
+        }
+
+    } catch {
+        case e: Throwable =>
+            // Leak protection
+            NativeBridge.freeMainStore(blockPtr)
+            throw e
     }
   }
 
@@ -161,6 +194,9 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
     // 1. Fetch Data (Assume Primary Key is Col 0)
     val colPtr = NativeBridge.getColumnPtr(blockPtr, 0)
+    
+    // We only support indexing Int PKs for now.
+    // Ideally, we check metadata here. For now, assume PK is Int.
     val data = new Array[Int](rowCount)
     NativeBridge.copyToScala(colPtr, data, rowCount)
 

@@ -20,19 +20,20 @@ import org.awandb.core.jni.NativeBridge
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.collection.mutable.LinkedHashMap
 import scala.collection.Seq 
+import org.awandb.core.engine.MorselExec
 
 class AwanTable(
     val name: String, 
     val capacity: Int, 
     val dataDir: String = "data",
     val governor: EngineGovernor = NoOpGovernor,
-    val enableIndex: Boolean = true // <--- [NEW] Control Lazy Indexing
+    val enableIndex: Boolean = true // Control Lazy Indexing
 ) {
   
   // COMPONENTS
   val wal = new Wal(dataDir)
   
-  // Pass the index flag to BlockManager (Threads start here)
+  // Pass the index flag to BlockManager
   val blockManager = new BlockManager(dataDir, enableIndex)
   
   val columns = new LinkedHashMap[String, NativeColumn]()
@@ -54,12 +55,14 @@ class AwanTable(
   // ---------------------------------------------------------
   // SCHEMA
   // ---------------------------------------------------------
-  def addColumn(colName: String): Unit = {
+  
+  // [UPDATED] Support defining String columns
+  def addColumn(colName: String, isString: Boolean = false): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) throw new IllegalStateException("Table is closed")
       if (!columns.contains(colName)) {
-        columns += (colName -> new NativeColumn(colName))
+        columns += (colName -> new NativeColumn(colName, isString))
       }
     } finally {
       rwLock.writeLock().unlock()
@@ -82,7 +85,6 @@ class AwanTable(
       values.foreach(v => wal.logInsert(v))
       var i = 0
       columns.values.foreach { col =>
-        // [FIX] Use deltaIntBuffer via insert() logic
         col.insert(values(i))
         i += 1
       }
@@ -93,12 +95,11 @@ class AwanTable(
   
   def insert(value: Int): Unit = insertRow(Array(value))
 
-  // [NEW] Explicit Column Insert (for EngineManager)
+  // [UPDATED] Explicit Column Insert (Integer)
   def insert(colName: String, value: Int): Unit = {
     rwLock.writeLock().lock()
     try {
         if (isClosed) throw new IllegalStateException("Table is closed")
-        // If column exists, insert. If not, ignore (or throw)
         columns.get(colName).foreach(_.insert(value))
         
         // Simple WAL strategy for single-column inserts
@@ -108,9 +109,23 @@ class AwanTable(
     }
   }
   
-  // [PLACEHOLDER] String support stub for EngineManager
+  // [IMPLEMENTED] String Insert Logic
   def insert(colName: String, value: String): Unit = {
-     throw new UnsupportedOperationException("String insertion temporarily disabled.")
+    rwLock.writeLock().lock()
+    try {
+        if (isClosed) throw new IllegalStateException("Table is closed")
+        
+        columns.get(colName) match {
+          case Some(col) => 
+            if (col.isString) col.insert(value)
+            else throw new IllegalArgumentException(s"Column '$colName' is not a String column.")
+          case None => 
+            throw new IllegalArgumentException(s"Column '$colName' not found.")
+        }
+        // Note: WAL for Strings is pending (Phase 4.1 in Roadmap)
+    } finally {
+        rwLock.writeLock().unlock()
+    }
   }
 
   // [PERFORMANCE] Batch Insert (Write Fusion)
@@ -120,12 +135,8 @@ class AwanTable(
       if (isClosed) throw new IllegalStateException("Table is closed")
       if (columns.nonEmpty) {
         val col = columns.values.head
-        
         // [WRITE FUSION]
-        // 1. Single IO call to write entire batch to WAL
         wal.logBatch(values)
-        
-        // 2. Single Memcpy to append to RAM buffer
         col.insertBatch(values)
       }
     } finally {
@@ -139,6 +150,7 @@ class AwanTable(
     try {
       if (isClosed) throw new IllegalStateException("Table is closed")
       // ZoneMaps are calculated automatically by C++ during persist
+      // Note: This helper only supports Ints for now.
       blockManager.createAndPersistBlock(List(data))
       columns.values.foreach(_.clearDelta())
       wal.clear()
@@ -153,14 +165,20 @@ class AwanTable(
       if (isClosed) return
 
       val headCol = columns.values.headOption
-      // [FIX] Check deltaIntBuffer, not deltaBuffer
-      if (headCol.isEmpty || headCol.get.deltaIntBuffer.isEmpty) return
+      if (headCol.isEmpty || headCol.get.isEmpty) return
 
-      val allColumnsData = columns.values.map(_.toArray).toList
+      // [UPDATED] Collect mixed types (Ints and Strings)
+      // Note: You must ensure BlockManager.createAndPersistBlock signature accepts generic Seq[Any] 
+      // or similar, then handles type checking internally.
+      val allColumnsData = columns.values.map { col =>
+        if (col.isString) col.toStringArray
+        else col.toIntArray
+      }.toList
       
       // Persist generates Zone Map metadata automatically
       // Now returns FAST (Disk Only), Indexing happens in background if enableIndex=true
-      blockManager.createAndPersistBlock(allColumnsData)
+      // CASTING: We assume BlockManager is updated to handle `Seq[Any]` or `Seq[Object]`
+      blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
 
       columns.values.foreach(_.clearDelta())
       wal.clear()
@@ -170,18 +188,58 @@ class AwanTable(
   }
 
   // ---------------------------------------------------------
-  // READ PATH (Fully Optimized: RAM + Disk via C++)
+  // READ PATH (Fully Optimized: RAM + Disk via Morsel Parallelism)
   // ---------------------------------------------------------
-  
+
   // [NEW] Polymorphic Query Router
   def query(colName: String, search: Any): Int = {
       search match {
-          case i: Int => query(i)
+          case i: Int => queryInt(i) // Legacy / Default Int Query
+          case s: String => queryString(colName, s)
           case _ => 0
       }
   }
 
-  def query(threshold: Int): Int = {
+  // [NEW] German String Query Engine (Parallelized)
+  private def queryString(colName: String, value: String): Int = {
+    var ramCount = 0
+    var snapshotBlocks: Seq[Long] = Seq.empty 
+    var colIdx = 0
+
+    rwLock.readLock().lock()
+    try {
+       if (isClosed) throw new IllegalStateException("Table is closed")
+       
+       columns.get(colName) match {
+         case Some(col) =>
+           // 1. RAM Optimization: Scan the Delta Buffer
+           // (Temporary: Scala scan until we bind `avxScanStringArray`)
+           if (col.deltaStringBuffer.nonEmpty) {
+             ramCount = col.deltaStringBuffer.count(_ == value)
+           }
+           // 2. Locate Column ID
+           colIdx = columns.keys.toList.indexOf(colName)
+           snapshotBlocks = blockManager.getLoadedBlocks
+           
+         case None => return 0
+       }
+    } finally {
+       rwLock.readLock().unlock()
+    }
+
+    // 3. Disk Scan (Morsel Parallelism)
+    // Distributes blocks across cores to saturate L3 Cache & RAM bandwidth
+    val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+       NativeBridge.avxScanString(blockPtr, colIdx, value)
+    })
+
+    ramCount + diskCount
+  }
+
+  // Legacy / Direct Int Query
+  def query(threshold: Int): Int = queryInt(threshold)
+
+  private def queryInt(threshold: Int): Int = {
     if (columns.isEmpty) return 0
     val firstColName = columns.keys.head
     
@@ -194,7 +252,6 @@ class AwanTable(
        
        // [RAM OPTIMIZATION] Use C++ kernel for the delta buffer
        val col = columns(firstColName)
-       // [FIX] Use deltaIntBuffer
        if (col.deltaIntBuffer.nonEmpty) {
          ramCount = NativeBridge.avxScanArray(col.deltaIntBuffer.toArray, threshold)
        }
@@ -204,20 +261,19 @@ class AwanTable(
        rwLock.readLock().unlock()
     }
 
-    var diskCount = 0
     val colIdx = 0
     
-    // We scan blocks by INDEX to potentially leverage filters in the future
-    // (Note: Cuckoo is for Equality, 'threshold' implies Range, so we stick to scan here)
-    for (blockPtr <- snapshotBlocks) {
-       // [PREDICATE PUSHDOWN]
-       // C++ handles Zone Map checks internally (Fast Reject / Fast Accept).
-       diskCount += NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
-    }
+    // [MORSEL PARALLELISM]
+    // Replaces sequential loop with ForkJoinPool execution
+    val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+        // Predicate Pushdown happens inside C++
+        NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
+    })
 
     ramCount + diskCount
   }
 
+  // [FUSION ENGINE] Parallel Shared Scan
   def queryShared(thresholds: Array[Int]): Array[Int] = {
      val totalCounts = new Array[Int](thresholds.length)
      var snapshotBlocks: Seq[Long] = Seq.empty
@@ -228,8 +284,7 @@ class AwanTable(
        if (columns.nonEmpty) {
          val firstCol = columns.values.head
          
-         // [RAM OPTIMIZATION] Use C++ kernel for the delta buffer
-         // [FIX] Use deltaIntBuffer
+         // [RAM OPTIMIZATION] Scan Delta Buffer
          if (firstCol.deltaIntBuffer.nonEmpty) {
            val ramData = firstCol.deltaIntBuffer.toArray
            NativeBridge.avxScanArrayMulti(ramData, thresholds, totalCounts)
@@ -240,12 +295,15 @@ class AwanTable(
        rwLock.readLock().unlock()
      }
 
-     val colIdx = 0
+     // [MORSEL PARALLELISM]
+     // Returns a separate array of counts from the parallel execution
+     val diskCounts = MorselExec.scanSharedParallel(snapshotBlocks, thresholds)
      
-     for (blockPtr <- snapshotBlocks) {
-        // [PREDICATE PUSHDOWN & ACCUMULATION]
-        // C++ handles Fast Reject / Fast Accept / AVX Fusion internally.
-        NativeBridge.avxScanMultiBlock(blockPtr, colIdx, thresholds, totalCounts)
+     // AGGREGATION: Combine RAM results + Disk results
+     var i = 0
+     while (i < totalCounts.length) {
+       totalCounts(i) += diskCounts(i)
+       i += 1
      }
      
      totalCounts
@@ -269,7 +327,6 @@ class AwanTable(
     } finally {
       rwLock.writeLock().unlock()
     }
-    // [FIX] Updated to use correct EngineManager API
     engineManager.joinThread() 
   }
 

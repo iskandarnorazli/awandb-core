@@ -20,11 +20,12 @@ import scala.collection.mutable.ArrayBuffer
 class NativeColumn(val name: String, val isString: Boolean = false) {
   
   // 1. Delta Store (Write-Optimized RAM)
-  // Renamed to 'deltaIntBuffer' to match AwanDBSpec expectations
+  // We maintain two separate buffers to avoid Boxing/Unboxing overhead.
   val deltaIntBuffer = new ArrayBuffer[Int]()
+  val deltaStringBuffer = new ArrayBuffer[String]()
 
   /**
-   * Append a value to the in-memory delta buffer.
+   * Append an Integer. Throws if this is a String column.
    */
   def insert(value: Int): Unit = {
     if (isString) throw new IllegalStateException(s"Column $name is a String column. Cannot insert Int.")
@@ -32,10 +33,15 @@ class NativeColumn(val name: String, val isString: Boolean = false) {
   }
 
   /**
-   * [WRITE FUSION]
-   * Efficiently appends an entire array of values.
-   * Under the hood, this uses System.arraycopy (memcpy), which is 
-   * orders of magnitude faster than looping append().
+   * [NEW] Append a String. Throws if this is an Integer column.
+   */
+  def insert(value: String): Unit = {
+    if (!isString) throw new IllegalStateException(s"Column $name is an Int column. Cannot insert String.")
+    deltaStringBuffer.append(value)
+  }
+
+  /**
+   * [WRITE FUSION] Integer Batch
    */
   def insertBatch(values: Array[Int]): Unit = {
     if (isString) throw new IllegalStateException(s"Column $name is a String column.")
@@ -43,16 +49,45 @@ class NativeColumn(val name: String, val isString: Boolean = false) {
   }
 
   /**
-   * Clear the buffer after a successful flush to disk.
+   * [NEW] [WRITE FUSION] String Batch
+   */
+  def insertBatch(values: Array[String]): Unit = {
+    if (!isString) throw new IllegalStateException(s"Column $name is an Int column.")
+    deltaStringBuffer ++= values
+  }
+
+  /**
+   * Clear buffers after a successful flush to disk.
    */
   def clearDelta(): Unit = {
     deltaIntBuffer.clear()
+    deltaStringBuffer.clear()
   }
   
-  def isEmpty: Boolean = deltaIntBuffer.isEmpty
+  /**
+   * Check if the active buffer is empty.
+   */
+  def isEmpty: Boolean = {
+    if (isString) deltaStringBuffer.isEmpty else deltaIntBuffer.isEmpty
+  }
+
+  // ==============================================================================
+  // HELPER FUNCTIONS (Critical for JNI Flush)
+  // ==============================================================================
 
   /**
-   * Helper to get current delta as an array (for flushing).
+   * Helper to get current delta as an Int array (for flushing to NativeBridge).
    */
-  def toArray: Array[Int] = deltaIntBuffer.toArray
+  def toIntArray: Array[Int] = deltaIntBuffer.toArray
+  
+  /**
+   * [NEW] Helper to get current delta as a String array.
+   * AwanTable calls this to pass data to NativeBridge.loadStringDataNative()
+   */
+  def toStringArray: Array[String] = deltaStringBuffer.toArray
+  
+  /**
+   * Legacy compatibility (optional, but good for existing tests).
+   */
+  def toArray: Array[Int] = toIntArray
 }
