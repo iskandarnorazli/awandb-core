@@ -44,7 +44,7 @@ set(SOURCES
     hardware.cpp     # Topology
     cuckoo_jni.cpp   # Cuckoo Filter (Updated)
     aggregation.cpp  # Hash Aggregation
-    # engine.cpp IS REMOVED
+    dictionary.cpp  # Dictionary Encoding
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})

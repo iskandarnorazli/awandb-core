@@ -97,6 +97,13 @@ class NativeBridge {
 
   @native def aggregateSumNative(keysPtr: Long, valsPtr: Long, count: Int): Long
   @native def freeAggregationResultNative(ptr: Long): Unit
+
+  // --- Dictionary Encoding ---
+  @native def dictionaryCreateNative(): Long
+  @native def dictionaryDestroyNative(ptr: Long): Unit
+  @native def dictionaryEncodeNative(ptr: Long, str: String): Int
+  @native def dictionaryDecodeNative(ptr: Long, id: Int): String
+  @native def dictionaryEncodeBatchNative(ptr: Long, strings: Array[String], outIdsPtr: Long): Unit
 }
 
 // -----------------------------------------------------------
@@ -292,4 +299,13 @@ object NativeBridge {
        case _: UnsatisfiedLinkError => (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
      }
   }
+
+  // --- Dictionary Encoding ---
+  def dictionaryCreate(): Long = instance.dictionaryCreateNative()
+  def dictionaryDestroy(ptr: Long): Unit = instance.dictionaryDestroyNative(ptr)
+  def dictionaryEncode(ptr: Long, str: String): Int = instance.dictionaryEncodeNative(ptr, str)
+  def dictionaryDecode(ptr: Long, id: Int): String = instance.dictionaryDecodeNative(ptr, id)
+  
+  def dictionaryEncodeBatch(ptr: Long, strings: Array[String], outIdsPtr: Long): Unit = 
+      instance.dictionaryEncodeBatchNative(ptr, strings, outIdsPtr)
 }
