@@ -15,6 +15,7 @@
 */
 
 #include "common.h"
+#include "cuckoo.h" // Ensure this is included
 
 extern "C" {
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooCreateNative(JNIEnv* env, jobject obj, jint capacity) {
@@ -52,5 +53,17 @@ extern "C" {
         jsize len = env->GetArrayLength(jData);
         filter->insert_batch((int32_t*)data, (size_t)len);
         env->ReleasePrimitiveArrayCritical(jData, data, 0);
+    }
+
+    // [ADDED MISSING FUNCTION] For Vectorized Pipeline
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooProbeBatchNative(
+        JNIEnv* env, jobject obj, jlong ptr, jlong keysPtr, jint count, jlong outPtr
+    ) {
+        if (ptr == 0 || keysPtr == 0 || outPtr == 0) return;
+        CuckooFilter* filter = (CuckooFilter*)ptr;
+        int32_t* keys = (int32_t*)keysPtr;
+        uint8_t* out = (uint8_t*)outPtr; 
+        
+        filter->contains_batch(keys, (size_t)count, out);
     }
 }

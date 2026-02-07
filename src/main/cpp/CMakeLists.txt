@@ -14,10 +14,8 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-# 1. Project Name (MUST match NativeBridge.scala: "awan_engine_core")
 project(awan_engine_core LANGUAGES CXX)
 
-# 2. Standard & Optimization
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -27,40 +25,32 @@ else()
     add_compile_options(-O3 -mavx2 -march=native -fPIC)
 endif()
 
-# 3. CRITICAL FIX: JNI Headers (Using your JDK-24 path)
+# JNI Path Logic (Keep your existing path logic here)
 set(JAVA_HOME_CUSTOM "C:/Program Files/Java/jdk-24") 
-
 if(EXISTS "${JAVA_HOME_CUSTOM}/include/jni.h")
-    message(STATUS "Forcing JNI Path: ${JAVA_HOME_CUSTOM}")
     include_directories("${JAVA_HOME_CUSTOM}/include")
     include_directories("${JAVA_HOME_CUSTOM}/include/win32")
-    link_directories("${JAVA_HOME_CUSTOM}/lib")
 else()
-    message(WARNING "Custom JDK 24 not found. Falling back to auto-discovery.")
     find_package(JNI REQUIRED)
     include_directories(${JNI_INCLUDE_DIRS})
 endif()
 
-# 4. Source Files (Modularized Engine)
-# engine.cpp has been split into these components:
+# SOURCE FILES (The Full Modular List)
 set(SOURCES 
     common.cpp
-    storage.cpp
-    compute.cpp
-    sort.cpp
-    hardware.cpp
-    cuckoo_jni.cpp
-    aggregation.cpp
+    storage.cpp      # Block, Data Loading, IO, Metadata
+    compute.cpp      # Scan, Strings, Vectors, Arrays
+    sort.cpp         # Radix Sort
+    hardware.cpp     # Topology
+    cuckoo_jni.cpp   # Cuckoo Filter (Updated)
+    aggregation.cpp  # Hash Aggregation
+    # engine.cpp IS REMOVED
 )
 
-# 5. Create Shared Library
 add_library(awan_engine_core SHARED ${SOURCES})
 
-# 6. Include Directories (for common.h, block.h, etc.)
 target_include_directories(awan_engine_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-# 7. Output Directory 
-# We output to the build folder so VS Code can find it.
 set_target_properties(awan_engine_core PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/Release"

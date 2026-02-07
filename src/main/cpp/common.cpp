@@ -48,4 +48,12 @@ extern "C" {
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_freeMainStoreNative(JNIEnv* env, jobject obj, jlong ptr) {
         if (ptr != 0) free_aligned((void*)ptr);
     }
+
+    // Allows Scala to get a pointer to an offset without copying data.
+    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getOffsetPointerNative(
+        JNIEnv* env, jobject obj, jlong basePtr, jlong offsetBytes
+    ) {
+        // Just return the address + offset
+        return basePtr + offsetBytes; 
+    }
 }

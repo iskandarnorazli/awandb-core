@@ -23,6 +23,7 @@ import java.io.File
 class NativeBridge {
   
   // --- MEMORY MANAGEMENT ---
+  @native def getOffsetPointerNative(basePtr: Long, offsetBytes: Long): Long
   @native def allocMainStoreNative(size: Long): Long
   @native def freeMainStoreNative(ptr: Long): Unit
 
@@ -55,6 +56,7 @@ class NativeBridge {
   @native def cuckooInsertNative(ptr: Long, key: Int): Boolean
   @native def cuckooContainsNative(ptr: Long, key: Int): Boolean
   @native def cuckooBuildBatchNative(ptr: Long, data: Array[Int]): Unit
+  @native def cuckooProbeBatchNative(ptr: Long, keysPtr: Long, count: Int, outPtr: Long): Unit
 
   // --- PERSISTENCE ---
   @native def saveColumn(ptr: Long, size: Long, path: String): Boolean
@@ -144,6 +146,8 @@ object NativeBridge {
   // =========================================================
 
   // --- Memory ---
+  def getOffsetPointer(basePtr: Long, offsetBytes: Long): Long = 
+      instance.getOffsetPointerNative(basePtr, offsetBytes)
   def allocMainStore(size: Long): Long = {
     val ptr = instance.allocMainStoreNative(size)
     if (ptr == 0) throw new OutOfMemoryError(s"Native Alloc Failed: $size ints")
@@ -183,6 +187,8 @@ object NativeBridge {
   def cuckooInsert(ptr: Long, key: Int): Boolean = instance.cuckooInsertNative(ptr, key)
   def cuckooContains(ptr: Long, key: Int): Boolean = instance.cuckooContainsNative(ptr, key)
   def cuckooBuildBatch(ptr: Long, data: Array[Int]): Unit = instance.cuckooBuildBatchNative(ptr, data)
+  def cuckooProbeBatch(ptr: Long, keysPtr: Long, count: Int, outPtr: Long): Unit = 
+      instance.cuckooProbeBatchNative(ptr, keysPtr, count, outPtr)
 
   // --- Persistence & Blocks ---
   def saveColumn(ptr: Long, size: Long, path: String): Boolean = instance.saveColumn(ptr, size, path)

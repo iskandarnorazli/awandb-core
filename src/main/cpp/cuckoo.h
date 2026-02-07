@@ -216,6 +216,15 @@ public:
         fclose(f);
         return filter;
     }
+
+    // Optimized for Vectorized Processing (Phase 5)
+    // Processes 'count' keys in a tight loop, writing 1 or 0 to 'outResults'
+    void contains_batch(int32_t* keys, size_t count, uint8_t* outResults) {
+        for (size_t i = 0; i < count; i++) {
+            // "this->contains" calls the existing single-key check
+            outResults[i] = this->contains(keys[i]) ? 1 : 0;
+        }
+    }
 };
 
 #endif
