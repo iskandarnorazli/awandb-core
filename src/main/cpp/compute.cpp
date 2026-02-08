@@ -17,7 +17,7 @@
 #include "common.h"
 
 extern "C" {
-
+    /*
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanBlockNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint threshold, jlong outIndicesPtr) {
         if (blockPtr == 0) return 0;
         uint8_t* rawPtr = (uint8_t*)blockPtr;
@@ -95,6 +95,7 @@ extern "C" {
         }
         return matchCount;
     }
+        */
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanMultiBlockNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jintArray jThresholds, jintArray jCounts) {
         if (blockPtr == 0) return;

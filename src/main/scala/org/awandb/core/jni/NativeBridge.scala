@@ -180,11 +180,22 @@ object NativeBridge {
   def avxScanIndicesMulti(colPtr: Long, size: Long, thresholds: Array[Int], outCounts: Array[Int]): Unit = instance.avxScanIndicesMultiNative(colPtr, size.toInt, thresholds, outCounts)
 
   // --- Smart Engines (Disk) ---
-  def avxScanBlock(blockPtr: Long, colIdx: Int, threshold: Int, outIndicesPtr: Long): Int = instance.avxScanBlockNative(blockPtr, colIdx, threshold, outIndicesPtr)
-  def avxScanMultiBlock(blockPtr: Long, colIdx: Int, thresholds: Array[Int], outCounts: Array[Int]): Unit = instance.avxScanMultiBlockNative(blockPtr, colIdx, thresholds, outCounts)
+  
+  // [CRITICAL FIX] Safe Wrapper - Prevents JVM Crash if blockPtr is null during recovery/test
+  def avxScanBlock(blockPtr: Long, colIdx: Int, threshold: Int, outIndicesPtr: Long): Int = {
+    if (blockPtr == 0) return 0 // Safety Check: Return 0 matches instead of crashing C++
+    instance.avxScanBlockNative(blockPtr, colIdx, threshold, outIndicesPtr)
+  }
+
+  def avxScanMultiBlock(blockPtr: Long, colIdx: Int, thresholds: Array[Int], outCounts: Array[Int]): Unit = {
+    if (blockPtr != 0) {
+       instance.avxScanMultiBlockNative(blockPtr, colIdx, thresholds, outCounts)
+    }
+  }
 
   // [NEW] String Search Public Wrapper
   def avxScanString(blockPtr: Long, colIdx: Int, search: String): Int = {
+      if (blockPtr == 0) return 0
       instance.avxScanStringNative(blockPtr, colIdx, search, 0)
   }
 

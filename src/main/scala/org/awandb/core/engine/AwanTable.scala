@@ -18,7 +18,7 @@ package org.awandb.core.engine
 import org.awandb.core.storage.{NativeColumn, BlockManager, Wal}
 import org.awandb.core.jni.NativeBridge
 import java.util.concurrent.locks.ReentrantReadWriteLock
-import scala.collection.mutable.LinkedHashMap
+import scala.collection.mutable.{LinkedHashMap, ListBuffer} // [FIX] Added ListBuffer
 import scala.collection.Seq 
 import org.awandb.core.engine.MorselExec
 
@@ -37,6 +37,9 @@ class AwanTable(
   val blockManager = new BlockManager(dataDir, enableIndex)
   
   val columns = new LinkedHashMap[String, NativeColumn]()
+
+  // [FIX] Explicitly track column order for Array-based inserts
+  private val columnOrder = new ListBuffer[String]()
   
   // [PERFORMANCE] Pre-allocated Buffer (Single-Threaded Speedup)
   val resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
@@ -63,6 +66,8 @@ class AwanTable(
       if (isClosed) throw new IllegalStateException("Table is closed")
       if (!columns.contains(colName)) {
         columns += (colName -> new NativeColumn(colName, isString))
+        // [FIX] Track the order so insertRow knows which index maps to this column
+        columnOrder += colName
       }
     } finally {
       rwLock.writeLock().unlock()
@@ -73,20 +78,31 @@ class AwanTable(
   // WRITE PATH
   // ---------------------------------------------------------
   
-  def insertRow(values: Array[Int]): Unit = {
+  def insertRow(values: Array[Any]): Unit = {
     if (values.length != columns.size) {
-      if (columns.size == 1 && values.length == 1) { /* Pass */ } 
-      else throw new IllegalArgumentException(s"Column mismatch")
+      throw new IllegalArgumentException(s"Column mismatch: Table has ${columns.size} columns, but row has ${values.length}")
     }
 
     rwLock.writeLock().lock()
     try {
       if (isClosed) throw new IllegalStateException("Cannot insert: Table is closed.")
-      values.foreach(v => wal.logInsert(v))
-      var i = 0
-      columns.values.foreach { col =>
-        col.insert(values(i))
-        i += 1
+      
+      // Use columnOrder to map values to columns
+      columnOrder.zipWithIndex.foreach { case (colName, i) =>
+        val col = columns(colName)
+        val value = values(i)
+        
+        value match {
+          case v: Int => 
+            wal.logInsert(v)
+            col.insert(v)
+            
+          case s: String => 
+            if (col.isString) col.insert(s)
+            else throw new IllegalArgumentException(s"Column '$colName' expects Int, but got String.")
+            
+          case _ => throw new UnsupportedOperationException(s"Type not supported: ${value.getClass}")
+        }
       }
     } finally {
       rwLock.writeLock().unlock()
@@ -168,8 +184,6 @@ class AwanTable(
       if (headCol.isEmpty || headCol.get.isEmpty) return
 
       // [UPDATED] Collect mixed types (Ints and Strings)
-      // Note: You must ensure BlockManager.createAndPersistBlock signature accepts generic Seq[Any] 
-      // or similar, then handles type checking internally.
       val allColumnsData = columns.values.map { col =>
         if (col.isString) col.toStringArray
         else col.toIntArray
@@ -177,7 +191,6 @@ class AwanTable(
       
       // Persist generates Zone Map metadata automatically
       // Now returns FAST (Disk Only), Indexing happens in background if enableIndex=true
-      // CASTING: We assume BlockManager is updated to handle `Seq[Any]` or `Seq[Object]`
       blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
 
       columns.values.foreach(_.clearDelta())
@@ -213,12 +226,11 @@ class AwanTable(
        columns.get(colName) match {
          case Some(col) =>
            // 1. RAM Optimization: Scan the Delta Buffer
-           // (Temporary: Scala scan until we bind `avxScanStringArray`)
            if (col.deltaStringBuffer.nonEmpty) {
              ramCount = col.deltaStringBuffer.count(_ == value)
            }
            // 2. Locate Column ID
-           colIdx = columns.keys.toList.indexOf(colName)
+           colIdx = columnOrder.indexOf(colName) // [FIX] Use columnOrder for index
            snapshotBlocks = blockManager.getLoadedBlocks
            
          case None => return 0
@@ -266,8 +278,8 @@ class AwanTable(
     // [MORSEL PARALLELISM]
     // Replaces sequential loop with ForkJoinPool execution
     val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-        // Predicate Pushdown happens inside C++
-        NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
+       // Predicate Pushdown happens inside C++
+       NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
     })
 
     ramCount + diskCount
@@ -316,18 +328,22 @@ class AwanTable(
     rwLock.writeLock().lock()
     try {
       if (isClosed) return
-      isClosed = true 
       
+      // 1. Stop engine first to drain tasks
       engineManager.stopEngine()
+      engineManager.joinThread()
+      
+      // 2. Close storage managers
       blockManager.close()
       wal.close()
       
+      // 3. Free manually allocated buffers
       NativeBridge.freeMainStore(resultIndexBuffer)
       
+      isClosed = true 
     } finally {
       rwLock.writeLock().unlock()
     }
-    engineManager.joinThread() 
   }
 
   def persist(dir: String): Unit = flush() 

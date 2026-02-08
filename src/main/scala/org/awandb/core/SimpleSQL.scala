@@ -46,7 +46,7 @@ class SimpleSQL(tables: Map[String, AwanTable]) {
         if (tables.contains(tableName)) {
           try {
             // Parse "10, 20, 30" -> Array(10, 20, 30)
-            val values = valuesStr.split(",").map(_.trim.toInt)
+            val values = valuesStr.split(",").map(_.trim.toInt.asInstanceOf[Any])
             tables(tableName).insertRow(values)
             println("   Status: Inserted row (Delta Store)")
           } catch {

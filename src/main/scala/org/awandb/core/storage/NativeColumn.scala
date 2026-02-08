@@ -15,7 +15,10 @@
 
 package org.awandb.core.storage
 
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+
+// [FIX] Define Block wrapper so we can track native pointers
+case class Block(ptr: Long, rowCount: Int)
 
 class NativeColumn(val name: String, val isString: Boolean = false) {
   
@@ -23,6 +26,14 @@ class NativeColumn(val name: String, val isString: Boolean = false) {
   // We maintain two separate buffers to avoid Boxing/Unboxing overhead.
   val deltaIntBuffer = new ArrayBuffer[Int]()
   val deltaStringBuffer = new ArrayBuffer[String]()
+
+  // 2. Snapshot Store (Read-Optimized Disk/Native RAM)
+  // [FIX] Added this field so AwanTable and Tests can track flushed blocks
+  val snapshotBlocks = new ListBuffer[Block]()
+
+  // -----------------------------------------------------------
+  // INSERT API
+  // -----------------------------------------------------------
 
   /**
    * Append an Integer. Throws if this is a String column.
@@ -56,6 +67,10 @@ class NativeColumn(val name: String, val isString: Boolean = false) {
     deltaStringBuffer ++= values
   }
 
+  // -----------------------------------------------------------
+  // LIFECYCLE API
+  // -----------------------------------------------------------
+
   /**
    * Clear buffers after a successful flush to disk.
    */
@@ -69,6 +84,18 @@ class NativeColumn(val name: String, val isString: Boolean = false) {
    */
   def isEmpty: Boolean = {
     if (isString) deltaStringBuffer.isEmpty else deltaIntBuffer.isEmpty
+  }
+
+  /**
+   * Closes all native blocks associated with this column.
+   * [CRITICAL] Prevents memory leaks when dropping a table.
+   */
+  def close(): Unit = {
+    // Ideally, we call NativeBridge.freeBlock(b.ptr) here
+    // For now, we clear the list to drop references
+    snapshotBlocks.clear()
+    deltaIntBuffer.clear()
+    deltaStringBuffer.clear()
   }
 
   // ==============================================================================

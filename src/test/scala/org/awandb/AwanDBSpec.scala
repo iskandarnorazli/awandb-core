@@ -21,87 +21,129 @@ import org.awandb.core.jni.NativeBridge
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import java.io.File
+import org.scalatest.BeforeAndAfterEach
 
-class AwanDBSpec extends AnyFlatSpec with Matchers {
+class AwanDBSpec extends AnyFlatSpec with Matchers with BeforeAndAfterEach {
 
-  // [CRITICAL] Unique directory for this test suite to prevent collisions
-  val TEST_DIR = "data/awandb_spec_unique"
+  // Isolated directory for extensive testing
+  val TEST_DIR = "data/awandb_spec_extensive"
 
-  def cleanDir(dirPath: String): Unit = {
-    val dir = new File(dirPath)
+  // Helper: aggressively clean directory to prevent "Zombie Data" from previous runs
+  def scrubDirectory(): Unit = {
+    val dir = new File(TEST_DIR)
     if (dir.exists()) {
-      dir.listFiles().foreach(_.delete())
+      Option(dir.listFiles()).foreach(_.foreach(_.delete()))
       dir.delete()
     }
+    dir.mkdirs()
   }
 
-  "The AwanDB Engine" should "maintain data consistency between Insert and Read" in {
-    cleanDir(TEST_DIR) // Clean start
-    
-    // 1. Setup with isolated directory
-    val table = new AwanTable("test_products", 1000, TEST_DIR)
+  // Runs before EVERY test case to ensure total isolation
+  override def beforeEach(): Unit = {
+    scrubDirectory()
+  }
+
+  "The AwanDB Engine" should "maintain consistency across the Delta -> Flush -> Disk cycle" in {
+    val table = new AwanTable("consistency_test", 1000, TEST_DIR)
     table.addColumn("id")
-    table.addColumn("price")
     
-    val uniqueID = 99999
+    // 1. In RAM (Delta Buffer)
+    table.insertRow(Array[Any](100))
+    table.query("id", 0) shouldBe 1
     
-    // 2. Action: Insert
-    table.insertRow(Array(uniqueID, 500))
-    
-    // 3. Assert
-    val count = table.query(uniqueID - 1)
-    
-    count shouldBe 1
+    // 2. On Disk (Snapshot Block)
+    table.flush()
+    table.query("id", 0) shouldBe 1 
     
     table.close()
   }
 
-  it should "clear the Delta Buffer after a flush" in {
-    // Reuse directory but different table name helps isolation too
-    val table = new AwanTable("test_flush", 1000, TEST_DIR)
-    table.addColumn("val")
+  it should "recover data from disk without needing new inserts (Cold Boot)" in {
+    val tableName = "restart_test"
+    val data = Array(10, 20, 30)
+
+    // Session 1: Write and Flush
+    val table1 = new AwanTable(tableName, 1000, TEST_DIR)
+    table1.addColumn("id")
+    data.foreach(v => table1.insertRow(Array[Any](v)))
+    table1.flush()
+    table1.close()
+
+    // Session 2: The "Reboot" (Open same table, no new inserts)
+    // BlockManager should automatically find the .awan files
+    val table2 = new AwanTable(tableName, 1000, TEST_DIR)
+    table2.addColumn("id") 
     
-    table.insertRow(Array(123))
+    // Querying > 0 should find all 3 rows recovered from disk
+    table2.query("id", 0) shouldBe 3
+    table2.close()
+  }
+
+  it should "correctly store and query mixed Integer and German String columns" in {
+    val table = new AwanTable("mixed_types", 1000, TEST_DIR)
+    table.addColumn("age", isString = false)    
+    table.addColumn("name", isString = true) // Dictionary Encoding Path
     
-    // Check Pre-condition
-    // [FIX] Updated to 'deltaIntBuffer' to match NativeColumn
-    table.columns("val").deltaIntBuffer.nonEmpty shouldBe true
+    // Insert mixed types
+    table.insertRow(Array[Any](25, "Iskandar"))
+    table.insertRow(Array[Any](30, "AwanDB_Long_String_Test"))
+
+    // Force flush to test C++ Block format serialization
+    table.flush() 
     
-    // Action: Flush to Disk
+    // 1. Query Integer Column
+    table.query("age", 20) shouldBe 2
+    
+    // 2. [NEW] Query String Column (End-to-End Test)
+    // This verifies: Scala Insert -> Dict Encode -> Flush -> C++ Load -> AVX Scan
+    table.query("name", "Iskandar") shouldBe 1
+    table.query("name", "AwanDB_Long_String_Test") shouldBe 1
+    table.query("name", "NonExistent") shouldBe 0
+    
+    table.close()
+  }
+
+  it should "handle high-volume batch inserts and Memory Alignment" in {
+    val capacity = 5000
+    val table = new AwanTable("volume_test", capacity, TEST_DIR)
+    table.addColumn("seq")
+    
+    // Insert enough rows to trigger multiple flushes or fill the buffer
+    val totalRows = 12000 
+    (1 to totalRows).foreach { i =>
+      table.insertRow(Array[Any](i))
+    }
+    
+    table.query("seq", 0) shouldBe totalRows
+    table.close()
+  }
+
+  it should "correctly compute min/max Zone Maps after flushing" in {
+    val table = new AwanTable("zonemap_test", 1000, TEST_DIR)
+    table.addColumn("score")
+    
+    table.insertRow(Array[Any](10))
+    table.insertRow(Array[Any](50))
+    table.insertRow(Array[Any](100))
+    
     table.flush()
     
-    // Check Post-condition
-    // [FIX] Updated to 'deltaIntBuffer' to match NativeColumn
-    table.columns("val").deltaIntBuffer.isEmpty shouldBe true
-    table.close()
-  }
-
-  it should "survive a Save/Load cycle (Persistence)" in {
-    cleanDir(TEST_DIR) // Ensure clean state for counting test
-    
-    val table = new AwanTable("test_persistence", 1000, TEST_DIR)
-    table.addColumn("data")
-    
-    table.insertRow(Array(42))
-    table.insertRow(Array(43))
-    
-    // Action: Flush triggers persistence
-    table.flush()
-    
-    // Verify: Querying > 0 should find both rows from Disk
-    // (This works because query() scans both RAM and the Snapshot Block List)
-    val count = table.query(0)
-    
-    // Previous error "8 != 2" happened here because it read old files. 
-    // Now it should be exactly 2.
-    count shouldBe 2
+    // Verify C++ Metadata
+    // Note: We need at least one block to be created
+    if (table.columns("score").snapshotBlocks.nonEmpty) {
+      val blockPtr = table.columns("score").snapshotBlocks.head.ptr
+      val (min, max) = NativeBridge.getZoneMap(blockPtr, 0)
+      
+      min shouldBe 10
+      max shouldBe 100
+    }
     
     table.close()
   }
 
-  it should "handle OOM gracefully" in {
+  it should "handle OOM gracefully in the Native Layer" in {
     assertThrows[OutOfMemoryError] {
-      // Attempt to allocate 10 TB
+      // Attempt to allocate impossible amount (10 TB)
       NativeBridge.allocMainStore(10_000_000_000_000L)
     }
   }

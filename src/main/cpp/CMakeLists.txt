@@ -45,6 +45,7 @@ set(SOURCES
     cuckoo_jni.cpp   # Cuckoo Filter (Updated)
     aggregation.cpp  # Hash Aggregation
     dictionary.cpp  # Dictionary Encoding
+    avx_scan.cpp     # AVX2 Scan Operations
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})
