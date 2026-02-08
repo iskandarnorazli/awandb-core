@@ -14,132 +14,135 @@
  * limitations under the License.
 */
 
-package org.awandb.core.engine
+package org.awandb
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import java.io.File
-import java.util.concurrent.{Executors, TimeUnit}
+import java.util.concurrent.{Executors}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import scala.util.Random
+import scala.concurrent.{Future, Await, ExecutionContext}
+import scala.concurrent.duration._
+
+// [CRITICAL] Import the engine from the core package
+import org.awandb.core.engine.AwanTable
 
 class ConcurrentWorkloadSpec extends AnyFlatSpec with Matchers {
 
-  val TEST_DIR = "data/bench_concurrent"
+  val TEST_DIR = "data/bench_concurrent_chaos"
   
   // CONFIGURATION
-  val WRITER_THREADS = 2
+  val WRITER_THREADS = 4
   val READER_THREADS = 4
-  val DURATION_SECONDS = 5
-  val BATCH_SIZE = 1000 // For the "Fused" test
+  val TOTAL_ITEMS = 500_000 // Total items to insert
+  val FLUSH_INTERVAL_MS = 200 // Force disk flushes frequently
+
+  implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(16))
 
   def clearData(): Unit = {
     val dir = new File(TEST_DIR)
     if (dir.exists()) {
-      dir.listFiles().foreach(_.delete())
+      Option(dir.listFiles()).foreach(_.foreach(_.delete()))
       dir.delete()
     }
+    new File(TEST_DIR).mkdirs()
   }
 
-  def runConcurrencyTest(testName: String, useBatching: Boolean): Unit = {
-    println(s"\n--- $testName (Writers: $WRITER_THREADS, Readers: $READER_THREADS) ---")
+  "AwanDB" should "maintain data integrity under heavy R/W + Flush contention" in {
     clearData()
-    
-    val table = new AwanTable("concurrent_table", 10000000, TEST_DIR)
-    table.addColumn("col1")
-    
-    // Counters
-    val totalInserts = new AtomicLong(0)
-    val totalQueries = new AtomicLong(0)
+    println(s"\n--- STARTING CHAOS TEST: $TOTAL_ITEMS rows ---")
+
+    val table = new AwanTable("chaos_table", TOTAL_ITEMS, TEST_DIR)
+    table.addColumn("id", isString = false)
+    table.addColumn("data", isString = true) // [NEW] Stresses Dictionary Locking
+
     val running = new AtomicBoolean(true)
+    val totalInserts = new AtomicLong(0)
     
-    val pool = Executors.newFixedThreadPool(WRITER_THREADS + READER_THREADS)
-
-    // -------------------------------------------------------
-    // 1. START WRITERS (The "Lock Hoggers")
-    // -------------------------------------------------------
-    for (i <- 1 to WRITER_THREADS) {
-      pool.submit(new Runnable {
-        override def run(): Unit = {
-          val batchData = Array.fill(BATCH_SIZE)(Random.nextInt())
-          while (running.get()) {
-            if (useBatching) {
-              // OPTIMIZED: 1 Lock per 1000 rows
-              table.insertBatch(batchData)
-              totalInserts.addAndGet(BATCH_SIZE)
-            } else {
-              // NAIVE: 1000 Locks per 1000 rows
-              // This simulates massive contention ("Death by 1000 cuts")
-              var j = 0
-              while (j < BATCH_SIZE) {
-                table.insert(batchData(j))
-                j += 1
-              }
-              totalInserts.addAndGet(BATCH_SIZE)
-            }
-            // Small sleep to prevent complete system freeze in naive mode
-            // (Simulates network latency)
-            Thread.sleep(1) 
-          }
+    // 1. CHAOS WRITERS
+    // Each thread takes a unique range to verify exact row presence later
+    val writers = (0 until WRITER_THREADS).map { threadId =>
+      Future {
+        val itemsPerThread = TOTAL_ITEMS / WRITER_THREADS
+        var i = 0
+        while (i < itemsPerThread) {
+          val uniqueId = (threadId * itemsPerThread) + i
+          
+          // Mixed Type Insert: Stresses both IntBuffer and String Pool
+          table.insertRow(Array[Any](uniqueId, s"val_$uniqueId"))
+          
+          i += 1
+          totalInserts.incrementAndGet()
         }
-      })
+        println(s"   -> Writer $threadId finished.")
+      }
     }
 
-    // -------------------------------------------------------
-    // 2. START READERS (The "Victims")
-    // -------------------------------------------------------
-    for (i <- 1 to READER_THREADS) {
-      pool.submit(new Runnable {
-        override def run(): Unit = {
-          while (running.get()) {
-            // Readers try to get the ReadLock. 
-            // If Writers hold the WriteLock too long, Readers starve.
-            table.query(Random.nextInt())
-            totalQueries.incrementAndGet()
+    // 2. CHAOS READERS (The Victims)
+    val readers = (0 until READER_THREADS).map { id =>
+      Future {
+        while (running.get()) {
+          // Query random ranges. If locking fails, this might segfault Native code.
+          val rnd = Random.nextInt(TOTAL_ITEMS)
+          try {
+            table.query("id", rnd)
+          } catch {
+            case e: Exception => 
+              println(s"   [READER ERROR] ${e.getMessage}")
+              throw e // Fail the test
           }
+          Thread.sleep(1) // Yield to allow writers in
         }
-      })
+      }
     }
 
-    // -------------------------------------------------------
-    // 3. MEASURE
-    // -------------------------------------------------------
-    println(s"Running for $DURATION_SECONDS seconds...")
-    Thread.sleep(DURATION_SECONDS * 1000)
+    // 3. CHAOS FLUSHER (The Destabilizer)
+    // Forces data from RAM -> Disk while others are reading/writing
+    val flusher = Future {
+      while (running.get()) {
+        Thread.sleep(FLUSH_INTERVAL_MS)
+        // This is the most dangerous moment: Moving pointers while threads are active
+        table.flush()
+      }
+    }
+
+    // 4. WAIT FOR WRITERS
+    Await.result(Future.sequence(writers), 2.minutes)
+    running.set(false) // Stop readers and flusher
     
-    running.set(false)
-    pool.shutdown()
-    pool.awaitTermination(2, TimeUnit.SECONDS)
+    Await.result(Future.sequence(readers), 10.seconds)
+    Await.result(flusher, 10.seconds)
+
+    println(s"\n--- WRITES COMPLETE. VERIFYING INTEGRITY... ---")
+
+    // 5. [CRITICAL] DATA INTEGRITY CHECKS
+    
+    // Check A: Total Count
+    // This proves we didn't "drop" rows during race conditions
+    // It also PROVES that MorselExec is partitioning correctly (Fixed 16x Bug)
+    val finalCount = table.query("id", -1)
+    println(f"   Expected: $TOTAL_ITEMS%,d")
+    println(f"   Actual:   $finalCount%,d")
+    finalCount shouldBe TOTAL_ITEMS
+
+    // Check B: Specific Data Retrieval (Zone Map Verification)
+    // We pick a random ID that definitely exists and try to find it.
+    // If the ZoneMap is corrupted, this query will return 0.
+    val sampleId = (TOTAL_ITEMS / 2)
+    val foundInt = table.query("id", sampleId - 1) // Query > sampleId-1
+    foundInt should be >= 1
+
+    // Check C: String Dictionary Consistency
+    // If the Dictionary wasn't locked correctly, this string might be garbage or point to wrong ID
+    val sampleStr = s"val_$sampleId"
+    val foundStr = table.query("data", sampleStr)
+    if (foundStr != 1) {
+      println(s"   [FAILURE] Could not find string '$sampleStr'. Dictionary might be corrupted.")
+    }
+    foundStr shouldBe 1
+
     table.close()
-
-    // -------------------------------------------------------
-    // 4. REPORT
-    // -------------------------------------------------------
-    val readsPerSec = totalQueries.get() / DURATION_SECONDS
-    val writesPerSec = totalInserts.get() / DURATION_SECONDS
-    
-    println(f"""
-    |=========================================================
-    | RESULTS: $testName
-    |---------------------------------------------------------
-    | Total Writes  : ${totalInserts.get()}
-    | Total Reads   : ${totalQueries.get()}
-    |
-    | Write Speed   : $writesPerSec%,d rows/sec
-    | Read Speed    : $readsPerSec%,d queries/sec
-    |=========================================================
-    """.stripMargin)
-  }
-
-  "AwanDB" should "demonstrate the impact of Write Lock Contention" in {
-    // TEST A: The "Bad" Way (Row-by-Row)
-    // Writers constantly acquire/release locks, causing high CPU context switching overhead.
-    // Readers struggle to find a gap to enter.
-    runConcurrencyTest("Standard Concurrent Write (Row-by-Row)", useBatching = false)
-
-    // TEST B: The "Optimized" Way (Batch / Fusion)
-    // Writers hold the lock ONCE for a microsecond to dump data.
-    // Readers have huge windows of time to execute concurrently.
-    runConcurrencyTest("Fused Concurrent Write (Batching)", useBatching = true)
+    println("--- CHAOS TEST PASSED ---")
   }
 }

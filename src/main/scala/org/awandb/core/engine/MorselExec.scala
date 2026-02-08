@@ -17,79 +17,104 @@
 package org.awandb.core.engine
 
 import org.awandb.core.jni.NativeBridge
-import java.util.concurrent.{ForkJoinPool, Callable}
+import java.util.concurrent.{ForkJoinPool, Callable, ExecutionException} // [FIX] Added Import
 import java.util.ArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.Seq
 import scala.jdk.CollectionConverters._
 
 object MorselExec {
   
-  // 1. HARDWARE DISCOVERY
-  // [FIX] Explicit type annotation solves the "recursive value" error
   val hardwareInfo: (Int, Long) = try {
-     NativeBridge.getHardwareInfo()
+      NativeBridge.getHardwareInfo()
   } catch {
-     case e: Throwable => (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
+      case e: Throwable => (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
   }
   
   val cores: Int = hardwareInfo._1
-  val l3CacheBytes: Long = hardwareInfo._2
-  
   val activeCores = math.max(1, cores - 1)
   
-  println(s"[MorselExec] Detected $cores Cores, L3 Cache: ${l3CacheBytes / 1024 / 1024} MB")
-  println(s"[MorselExec] Parallelism Level: $activeCores Threads")
+  println(s"[MorselExec] Detected $cores Cores. Pool Size: $activeCores Threads.")
 
   val executor = new ForkJoinPool(activeCores)
 
-  // ... (Rest of scanParallel / scanSharedParallel logic) ...
-  // (Paste the logic from your previous snippet here)
-  
+  class ScanTask(val blockPtr: Long, val scanFunc: Long => Int) extends Callable[Int] {
+    override def call(): Int = {
+      if (blockPtr == 0) 0 else scanFunc(blockPtr)
+    }
+  }
+
+  // --- SINGLE VALUE AGGREGATION ---
   def scanParallel(blocks: Seq[Long], scanFunc: Long => Int): Int = {
     if (blocks.isEmpty) return 0
     val taskCount = blocks.size
+    
     if (taskCount == 1) return scanFunc(blocks.head)
 
     val tasks = new ArrayList[Callable[Int]](taskCount)
     val it = blocks.iterator
+    
     while (it.hasNext) {
-       val ptr = it.next()
-       tasks.add(new Callable[Int] {
-         override def call(): Int = scanFunc(ptr)
-       })
+       tasks.add(new ScanTask(it.next(), scanFunc))
     }
 
     val futures = executor.invokeAll(tasks)
     var total = 0
     val resIt = futures.iterator()
-    while (resIt.hasNext) total += resIt.next().get() 
+    
+    while (resIt.hasNext) {
+      try {
+        total += resIt.next().get() 
+      } catch {
+        // [FIX] Unwrap ExecutionException to reveal the true crash reason
+        case e: ExecutionException => throw e.getCause
+      }
+    }
     total
   }
 
-  def scanSharedParallel(blocks: Seq[Long], thresholds: Array[Int]): Array[Int] = {
-    if (blocks.isEmpty) return new Array[Int](thresholds.length)
+  // --- ARRAY AGGREGATION ---
+  def scanSharedParallel(
+      blocks: Seq[Long], 
+      allocator: () => Array[Int], 
+      scanner: (Long, Array[Int]) => Unit
+  ): Array[Int] = {
+    
+    if (blocks.isEmpty) return allocator()
+    
     val tasks = new ArrayList[Callable[Array[Int]]](blocks.size)
-    val len = thresholds.length
     val it = blocks.iterator
+    
     while (it.hasNext) {
        val ptr = it.next()
        tasks.add(new Callable[Array[Int]] {
          override def call(): Array[Int] = {
-           val localCounts = new Array[Int](len)
-           if (ptr > 100000) NativeBridge.avxScanMultiBlock(ptr, 0, thresholds, localCounts)
+           val localCounts = allocator() 
+           if (ptr != 0) {
+             scanner(ptr, localCounts)
+           }
            localCounts
          }
        })
     }
+    
     val futures = executor.invokeAll(tasks)
-    val finalCounts = new Array[Int](len)
+    
+    val finalCounts = allocator() 
+    val len = finalCounts.length
     val resIt = futures.iterator()
+    
     while (resIt.hasNext) {
-       val partial = resIt.next().get()
-       var i = 0
-       while (i < len) {
-         finalCounts(i) += partial(i)
-         i += 1
+       try {
+         val partial = resIt.next().get()
+         var i = 0
+         while (i < len) {
+           finalCounts(i) += partial(i)
+           i += 1
+         }
+       } catch {
+         // [FIX] Unwrap here too
+         case e: ExecutionException => throw e.getCause
        }
     }
     finalCounts

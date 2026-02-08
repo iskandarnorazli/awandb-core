@@ -17,8 +17,9 @@ package org.awandb.core.storage
 
 import java.io.File
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, CopyOnWriteArrayList}
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._ 
 import org.awandb.core.jni.NativeBridge
+import org.awandb.core.util.UnsafeHelper // [NEW] Required for Header Patching
 
 trait StorageRouter {
   def getPathForBlock(blockId: Int): String
@@ -43,17 +44,11 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
   def this(dataDir: String, enableIndex: Boolean = true) = 
     this(new SimpleStorageRouter(dataDir), enableIndex)
 
-  // Atomic counter for thread safety
   private val blockCounter = new java.util.concurrent.atomic.AtomicInteger(0)
-
+  
   // [THREAD SAFETY] CopyOnWriteArrayList for lock-free reads
   private val loadedBlocks = new CopyOnWriteArrayList[Long]() 
-  
-  // [THREAD SAFETY] Concurrent map for O(1) lookups
   private val loadedFilters = new ConcurrentHashMap[Int, Long]() 
-  
-  // [THREAD SAFETY] Queue for the background worker
-  // We use java.lang.Integer to safely handle nulls when polling empty queue
   private val pendingIndexes = new ConcurrentLinkedQueue[java.lang.Integer]()
 
   router.initialize()
@@ -64,6 +59,9 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
   def recover(): Unit = {
     val dir = new File(router.getDataDir)
     if (!dir.exists() || !dir.isDirectory) return
+
+    loadedBlocks.clear()
+    loadedFilters.clear()
 
     val files = dir.listFiles().filter(f => f.isFile && f.getName.endsWith(".udb") && f.getName.startsWith("block_"))
     val sortedFiles = files.sortBy(_.getName)
@@ -88,7 +86,6 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
                   val filterPtr = NativeBridge.cuckooLoad(filterPath)
                   if (filterPtr != 0) loadedFilters.put(blockIdx, filterPtr)
               } else {
-                  // Index missing -> Queue for background build
                   pendingIndexes.offer(blockIdx)
               }
           }
@@ -100,16 +97,10 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
   /**
    * [FAST PATH] Create and Persist Block Data ONLY.
-   * Does NOT build the Cuckoo filter immediately.
-   * Returns fast, queues work for later.
-   * [UPDATED] Accepts Seq[Any] to handle mixed types (Array[Int] / Array[String])
    */
   def createAndPersistBlock(columnsData: Seq[Any]): Unit = {
     if (columnsData.isEmpty) return
 
-    // 1. Inspect Data Types & Count
-    // We check the first column to get row count.
-    // We scan all columns to see if ANY are strings (to trigger the allocation hack).
     val (rowCount, hasString) = columnsData.head match {
       case a: Array[Int] => (a.length, columnsData.exists(_.isInstanceOf[Array[String]]))
       case a: Array[String] => (a.length, true)
@@ -120,17 +111,21 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     val colCount = columnsData.length
     val currentId = blockCounter.getAndIncrement()
     
-    // 2. Memory Allocation Strategy
-    // NATIVE BRIDGE CONSTRAINT: createBlock allocates (N * 4) bytes per column.
-    // German Strings need 16 bytes/row + Heap space (~48 bytes/row safety).
-    // If Strings are present, we request 16x the row count to force C++ to allocate enough RAM.
+    // [STRATEGY: Over-Allocate, Then Patch]
+    // 1. Allocate 16x memory if strings are present to prevent C++ Heap Overflow.
+    //    This creates a valid block memory-wise, but metadata says "Rows = 16 * N".
     val allocationRows = if (hasString) rowCount * 16 else rowCount
-
-    // 1. Create Block
     val blockPtr = NativeBridge.createBlock(allocationRows, colCount)
     
+    // 2. [PATCH] Immediately correct the header.
+    //    We overwrite row_count with the TRUE count. This ensures:
+    //    a) Scans stop at the correct row (fixing the 8M vs 500k bug).
+    //    b) Saves only write the valid data (fixing disk bloat).
+    if (hasString) {
+        UnsafeHelper.putInt(blockPtr, rowCount)
+    }
+    
     try {
-        // 3. Ingest Data (Polyglot)
         val dataArray = columnsData.toArray
         
         for (colIdx <- 0 until colCount) {
@@ -140,7 +135,7 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
                    NativeBridge.loadData(colPtr, ints)
                    
                case strs: Array[String] =>
-                   // German String Ingest
+                   // Safe now because physical memory is massive (16x)
                    NativeBridge.loadStringData(blockPtr, colIdx, strs)
                    
                case _ => 
@@ -148,7 +143,8 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
            }
         }
         
-        // 4. Save Data to Disk
+        // 4. Save to Disk
+        // saveColumn reads the header we patched, so it writes a compact file.
         val filename = router.getPathForBlock(currentId)
         val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename) 
         
@@ -156,35 +152,23 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
           throw new RuntimeException(s"Failed to save block: $filename")
         }
 
-        // 5. Register Block
         loadedBlocks.add(blockPtr)
         
-        // 6. Queue for Background Indexing
-        // Note: Cuckoo currently supports Ints only. If we have strings, we might skip
-        // or only index the Int columns. For now, we queue it and let the Indexer decide.
         if (enableIndex && rowCount > 0) {
             pendingIndexes.offer(loadedBlocks.size() - 1)
         }
 
     } catch {
         case e: Throwable =>
-            // Leak protection
             NativeBridge.freeMainStore(blockPtr)
             throw e
     }
   }
 
-  /**
-   * [BACKGROUND WORKER] Builds pending indexes.
-   * Returns 1 if work was done, 0 if queue was empty.
-   */
   def buildPendingIndexes(): Int = {
     val blockIdx = pendingIndexes.poll()
-    
-    // Safe check for null (Queue Empty)
     if (blockIdx == null) return 0
 
-    // Safety checks
     if (blockIdx >= loadedBlocks.size()) return 0 
     if (loadedFilters.containsKey(blockIdx)) return 0 
 
@@ -192,43 +176,27 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     val rowCount = NativeBridge.getRowCount(blockPtr)
     if (rowCount == 0) return 0
 
-    // 1. Fetch Data (Assume Primary Key is Col 0)
     val colPtr = NativeBridge.getColumnPtr(blockPtr, 0)
-    
-    // We only support indexing Int PKs for now.
-    // Ideally, we check metadata here. For now, assume PK is Int.
     val data = new Array[Int](rowCount)
     NativeBridge.copyToScala(colPtr, data, rowCount)
 
-    // 2. Build Filter (The slow part)
     val filterPtr = NativeBridge.cuckooCreate((rowCount * 1.5).toInt)
     NativeBridge.cuckooBuildBatch(filterPtr, data)
     
-    // 3. Save
-    // NOTE: This assumes blockId == listIndex (Valid for append-only)
     val path = router.getPathForFilter(blockIdx) 
     NativeBridge.cuckooSave(filterPtr, path)
-    
-    // 4. Publish (Atomic Put makes it visible to readers)
     loadedFilters.put(blockIdx, filterPtr)
-    
-    // println(s"[Indexer] Built background index for block $blockIdx")
     1 
   }
 
-  // [O(1) POINT LOOKUP]
   def mightContain(blockIndex: Int, key: Int): Boolean = {
     if (!enableIndex) return true
-    
     val ptr = loadedFilters.get(blockIndex)
-    // If index not ready (null/0), return true to force scan (Safety)
     if (ptr == 0L) return true 
-    
     NativeBridge.cuckooContains(ptr, key)
   }
 
-  // [FIX] Explicit conversion to Immutable Seq to match return type
-  def getLoadedBlocks: Seq[Long] = loadedBlocks.asScala.toSeq
+  def getLoadedBlocks: scala.collection.Seq[Long] = loadedBlocks.asScala.toSeq
 
   def close(): Unit = {
     loadedBlocks.asScala.foreach(NativeBridge.freeMainStore)

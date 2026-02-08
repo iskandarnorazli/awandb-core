@@ -13,7 +13,13 @@ Test / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 connectInput in run := true 
 
 // Dependencies
-libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.17" % Test
+libraryDependencies ++= Seq(
+  "org.scalatest" %% "scalatest" % "3.2.17" % Test,
+  
+  // [CRITICAL] Required for .par and ForkJoinPool integration
+  "org.scala-lang.modules" %% "scala-parallel-collections" % "1.0.4"
+)
+
 
 // ... inside your project settings ...
 parallelExecution in Test := false
