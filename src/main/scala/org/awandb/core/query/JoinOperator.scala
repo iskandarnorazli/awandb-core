@@ -42,12 +42,10 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
       val offset = totalInput * 4L // offset for keys (4 bytes)
       val payloadOffset = totalInput * 8L // offset for payloads (8 bytes)
       
-      // Copy Keys
+      // Copy Keys: Batch -> TempBuffer
       NativeBridge.memcpy(batch.keysPtr, NativeBridge.getOffsetPointer(tempKeys, offset), batch.count * 4L)
       
-      // Copy Values (Payloads) - Assume inputs are Longs/Pointers or 64-bit Values
-      // Note: If input values are Ints (4B), we need to expand them? 
-      // For now, let's assume the child operator produces 8B values (like HashAgg output).
+      // Copy Values (Payloads): Batch -> TempBuffer
       NativeBridge.memcpy(batch.valuesPtr, NativeBridge.getOffsetPointer(tempPayloads, payloadOffset), batch.count * 8L)
       
       totalInput += batch.count
@@ -60,7 +58,6 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
     }
     
     // Build Operator returns nothing (it is a sink for the pipeline)
-    // The Probe operator will access 'mapPtr' directly via a shared context or getter.
     null 
   }
   
@@ -70,11 +67,9 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
     child.close()
     if (tempKeys != 0) NativeBridge.freeMainStore(tempKeys)
     if (tempPayloads != 0) NativeBridge.freeMainStore(tempPayloads)
-    // Don't free mapPtr here! It's needed by Probe. 
-    // It should be freed by the Probe operator or the Executor.
+    // Don't free mapPtr here! It's needed by Probe.
   }
   
-  // Explicit cleanup helper
   def destroyMap(): Unit = {
     if (mapPtr != 0) {
       NativeBridge.joinDestroy(mapPtr)
@@ -86,22 +81,20 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
 // -------------------------------------------------------------------------
 // 2. PROBE OPERATOR (Streaming)
 // Reads the LEFT table and probes the Hash Map.
+// Output: Join Keys + Payloads + Selection Vector (Row IDs for Late Materialization)
 // -------------------------------------------------------------------------
 class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) extends Operator {
   
   private var mapPtr: Long = 0
   private var outBatch: VectorBatch = _
-  // Buffer to hold indices of matching probe rows (for reconstructing other cols if needed)
+  // Buffer to hold indices of matching probe rows (allocated once)
   private var matchIndicesPtr: Long = 0 
 
   override def open(): Unit = {
-    // Ensure Build side is ready!
-    // In a real scheduler, this dependency is managed explicitly.
-    // Here, we force execution of the build op if map is missing.
+    // Ensure Build side is ready
     if (buildOp.getMapPtr() == 0) {
        buildOp.open()
        buildOp.next() // Triggers the build loop
-       // buildOp.close() // Do not close child yet? Build op cleanup is tricky.
     }
     
     mapPtr = buildOp.getMapPtr()
@@ -119,9 +112,9 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
     while (inputBatch != null) {
       
       // Probe C++ Map
-      // keysPtr = Probe Keys
+      // keysPtr = Probe Keys from Input
       // valuesPtr = Output buffer for Payloads
-      // matchIndicesPtr = Output buffer for indices
+      // matchIndicesPtr = Output buffer for Row IDs (indices in inputBatch)
       val matches = NativeBridge.joinProbe(
           mapPtr, 
           inputBatch.keysPtr, 
@@ -131,13 +124,21 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
       )
       
       if (matches > 0) {
-        // We found matches!
-        // We need to copy the *matching keys* from input to output.
-        // The C++ joinProbe filled 'valuesPtr' (Payloads) and 'matchIndicesPtr'.
-        // Now use 'batchRead' (Gather) to pull the keys using the indices.
+        outBatch.count = matches
+        
+        // [LATE MATERIALIZATION SUPPORT]
+        // 1. Pass the Source Block Pointer downstream
+        outBatch.blockPtr = inputBatch.blockPtr
+        outBatch.hasSelection = true
+        
+        // 2. Copy the Match Indices into the Selection Vector
+        // This allows MaterializeOperator to know exactly which rows to fetch
+        NativeBridge.memcpy(matchIndicesPtr, outBatch.selectionVectorPtr, matches * 4L)
+        
+        // 3. Gather Keys for the Result Batch (completeness)
+        // We fetch the Keys from the Input using the indices we just got
         NativeBridge.batchRead(inputBatch.keysPtr, matchIndicesPtr, matches, outBatch.keysPtr)
         
-        outBatch.count = matches
         return outBatch
       }
       
@@ -153,7 +154,6 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
     if (outBatch != null) outBatch.close()
     if (matchIndicesPtr != 0) NativeBridge.freeMainStore(matchIndicesPtr)
     
-    // We own the map cleanup now
     buildOp.destroyMap()
     buildOp.close()
   }

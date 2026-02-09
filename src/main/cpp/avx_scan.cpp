@@ -17,6 +17,7 @@
 #include "common.h"
 #include "block.h" 
 #include <immintrin.h>
+#include <cstdio>
 
 extern "C" {
 
@@ -143,5 +144,41 @@ extern "C" {
         }
 
         return matchCount;
+    }
+
+    // --- GATHER (Same Width: Int -> Int) ---
+    // out[i] = base[indices[i]]
+    // Reads specific rows from a column block.
+    // Speedup plan: Use AVX2 _mm256_i32gather_epi32 in Phase 6.
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_batchReadNative(
+        JNIEnv* env, jobject obj, jlong basePtr, jlong indicesPtr, jint count, jlong outPtr
+    ) {
+        if (!basePtr || !indicesPtr || !outPtr) return;
+        
+        int32_t* base = (int32_t*)basePtr;
+        int32_t* indices = (int32_t*)indicesPtr;
+        int32_t* out = (int32_t*)outPtr;
+        
+        // Scalar Fallback (Robust & Functional)
+        for (int i = 0; i < count; i++) {
+            out[i] = base[indices[i]];
+        }
+    }
+
+    // --- GATHER (Widening: Int -> Long) ---
+    // out[i] = (long)base[indices[i]]
+    // Fixes the corruption when copying 32-bit Integers into the 64-bit valuesPtr.
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_batchReadIntToLongNative(
+        JNIEnv* env, jobject obj, jlong basePtr, jlong indicesPtr, jint count, jlong outPtr
+    ) {
+        if (!basePtr || !indicesPtr || !outPtr) return;
+        
+        int32_t* base = (int32_t*)basePtr;
+        int32_t* indices = (int32_t*)indicesPtr;
+        int64_t* out = (int64_t*)outPtr;
+        
+        for (int i = 0; i < count; i++) {
+            out[i] = (int64_t)base[indices[i]];
+        }
     }
 }

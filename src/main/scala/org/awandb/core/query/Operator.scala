@@ -32,9 +32,24 @@ class VectorBatch(val capacity: Int, val valueWidthBytes: Int = 4) {
   // 8 bytes -> capacity * 2
   val valuesPtr: Long = NativeBridge.allocMainStore(capacity * (valueWidthBytes / 4)) 
   
+  // [NEW] Late Materialization Metadata
+  // 1. Selection Vector: List of 32-bit Row IDs (indices) that survived filters/joins.
+  //    Allocates 'capacity' integers.
+  val selectionVectorPtr: Long = NativeBridge.allocMainStore(capacity)
+  
+  // 2. Source Block: Pointer to the memory block these Row IDs belong to.
+  //    Crucial for MaterializeOperator to know WHERE to fetch data from.
+  var blockPtr: Long = 0
+  
+  // 3. Flag: Does this batch contain a valid Selection Vector?
+  //    If true, downstream operators should use 'selectionVectorPtr' instead of assuming sequential rows.
+  var hasSelection: Boolean = false
+
   def close(): Unit = {
     NativeBridge.freeMainStore(keysPtr)
     NativeBridge.freeMainStore(valuesPtr)
+    // [CRITICAL] Free the new selection buffer to prevent memory leaks
+    NativeBridge.freeMainStore(selectionVectorPtr)
   }
 }
 

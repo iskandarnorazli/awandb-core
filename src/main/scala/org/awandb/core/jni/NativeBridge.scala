@@ -124,6 +124,10 @@ class NativeBridge {
   @native def joinBuildNative(keysPtr: Long, payloadsPtr: Long, count: Int): Long
   @native def joinProbeNative(mapPtr: Long, probeKeysPtr: Long, count: Int, outPayloadsPtr: Long, outIndicesPtr: Long): Int
   @native def joinDestroyNative(mapPtr: Long): Unit
+
+  // --- Materialised Operator ---
+  @native def batchReadNative(basePtr: Long, indicesPtr: Long, count: Int, outPtr: Long): Unit
+  @native def batchReadIntToLongNative(basePtr: Long, indicesPtr: Long, count: Int, outPtr: Long): Unit
 }
 
 // -----------------------------------------------------------
@@ -192,7 +196,10 @@ object NativeBridge {
   }
 
   // --- Legacy Compute ---
-  def batchRead(colPtr: Long, idx: Long, count: Int, out: Long): Unit = instance.batchRead(colPtr, idx, count, out)
+  def batchRead(basePtr: Long, indicesPtr: Long, count: Int, outPtr: Long): Unit = 
+      instance.batchReadNative(basePtr, indicesPtr, count, outPtr)
+  def batchReadIntToLong(basePtr: Long, indicesPtr: Long, count: Int, outPtr: Long): Unit = 
+      instance.batchReadIntToLongNative(basePtr, indicesPtr, count, outPtr)
   def avxScanIndices(colPtr: Long, size: Long, thresh: Int, out: Long): Int = instance.avxScanIndicesNative(colPtr, size.toInt, thresh, out) 
   def avxScanIndicesMulti(colPtr: Long, size: Long, thresholds: Array[Int], outCounts: Array[Int]): Unit = instance.avxScanIndicesMultiNative(colPtr, size.toInt, thresholds, outCounts)
 
