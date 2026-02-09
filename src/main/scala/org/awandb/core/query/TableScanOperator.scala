@@ -20,22 +20,22 @@ import org.awandb.core.storage.BlockManager
 
 // -------------------------------------------------------------------------
 // TABLE SCAN OPERATOR (Hybrid Reader)
-// Automatically handles Uncompressed (4B), Packed-8 (1B), and Packed-16 (2B) data.
 // -------------------------------------------------------------------------
 class TableScanOperator(
-    blockManager: BlockManager, 
-    keyColIdx: Int, 
-    valColIdx: Int,
-    batchSize: Int = 4096
+    val blocks: Array[Long], // [UPDATED] Accepts raw pointers for partitioning
+    val keyColIdx: Int, 
+    val valColIdx: Int,
+    val batchSize: Int = 4096
 ) extends Operator {
   
-  private var blocks: Array[Long] = _
+  // [COMPATIBILITY] Constructor for full-table scan
+  def this(bm: BlockManager, k: Int, v: Int) = this(bm.getLoadedBlocks.toArray, k, v)
+
   private var currentBlockIdx = 0
   private var currentRowInBlock = 0
   private var batch: VectorBatch = _
 
   override def open(): Unit = {
-    blocks = blockManager.getLoadedBlocks.toArray
     currentBlockIdx = 0
     currentRowInBlock = 0
     batch = new VectorBatch(batchSize)
@@ -50,32 +50,19 @@ class TableScanOperator(
       dstPtr: Long, 
       dstOffsetBytes: Long
   ): Unit = {
-    // 1. Get Stride
     var stride = NativeBridge.getColumnStride(blockPtr, colIdx)
-    
-    // [CRITICAL FIX] Safety net for uninitialized blocks (stride=0)
-    // If stride is 0, we assume standard 4-byte Integers.
-    if (stride == 0) stride = 4
+    if (stride == 0) stride = 4 // Safety net
     
     val colBase = NativeBridge.getColumnPtr(blockPtr, colIdx)
-    
-    // 2. Calculate Source Pointer
     val srcOffset = startRow.toLong * stride.toLong
     val srcPtr = NativeBridge.getOffsetPointer(colBase, srcOffset)
-    
-    // 3. Calculate Dest Pointer
     val finalDstPtr = NativeBridge.getOffsetPointer(dstPtr, dstOffsetBytes)
     
-    // 4. Dispatch
     stride match {
-      case 4 => 
-        NativeBridge.memcpy(srcPtr, finalDstPtr, count * 4L)
-      case 1 =>
-        NativeBridge.unpack8To32(srcPtr, finalDstPtr, count)
-      case 2 =>
-        NativeBridge.unpack16To32(srcPtr, finalDstPtr, count)
-      case _ =>
-        NativeBridge.memcpy(srcPtr, finalDstPtr, count * 4L)
+      case 4 => NativeBridge.memcpy(srcPtr, finalDstPtr, count * 4L)
+      case 1 => NativeBridge.unpack8To32(srcPtr, finalDstPtr, count)
+      case 2 => NativeBridge.unpack16To32(srcPtr, finalDstPtr, count)
+      case _ => NativeBridge.memcpy(srcPtr, finalDstPtr, count * 4L)
     }
   }
 
@@ -98,7 +85,6 @@ class TableScanOperator(
         
         if (toCopy > 0) {
           val destOffset = rowsFilled * 4L
-          
           readColumnChunk(blockPtr, keyColIdx, currentRowInBlock, toCopy, batch.keysPtr, destOffset)
           readColumnChunk(blockPtr, valColIdx, currentRowInBlock, toCopy, batch.valuesPtr, destOffset)
           

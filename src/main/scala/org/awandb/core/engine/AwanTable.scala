@@ -17,10 +17,11 @@ package org.awandb.core.engine
 
 import org.awandb.core.storage.{NativeColumn, BlockManager, Wal}
 import org.awandb.core.jni.NativeBridge
+import org.awandb.core.query._ // Import Operators
+import java.util.concurrent.Callable
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.collection.mutable.{LinkedHashMap, ListBuffer}
 import scala.collection.Seq 
-import org.awandb.core.engine.MorselExec
 
 class AwanTable(
     val name: String, 
@@ -381,8 +382,9 @@ class AwanTable(
      totalCounts
   }
 
-  // [FUSION ENGINE] Operator DAG Execution
+  // [FUSION ENGINE] PARALLEL OPERATOR DAG EXECUTION
   // Executes: SELECT SUM(valueCol) GROUP BY keyCol
+  // Uses Morsel-Driven Parallelism to run multiple DAG instances per core.
   def executeGroupBy(keyCol: String, valCol: String): Map[Int, Long] = {
     // 1. Resolve Column Indices
     val keyIdx = columnOrder.indexOf(keyCol)
@@ -390,38 +392,65 @@ class AwanTable(
     
     if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
 
-    // 2. Build Plan
-    // Scan -> Aggregate
-    val scanOp = new org.awandb.core.query.TableScanOperator(blockManager, keyIdx, valIdx)
-    val aggOp = new org.awandb.core.query.HashAggOperator(scanOp)
-    
-    // 3. Execute
-    aggOp.open()
-    val resultBatch = aggOp.next() // Aggregation emits one single batch
-    
-    // 4. Materialize Result (Vector -> Scala Map)
-    val resultMap = scala.collection.mutable.Map[Int, Long]()
-    
-    if (resultBatch != null && resultBatch.count > 0) {
-       val keys = new Array[Int](resultBatch.count)
-       val vals = new Array[Long](resultBatch.count) // HashAgg exports Longs (Sums)
-       
-       // Use copyToScala for Keys (Int)
-       NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
-       
-       // Use copyToScalaLong for Values (Long)
-       // We need to ensure NativeBridge exposes this. It does!
-       NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
-       
-       var i = 0
-       while (i < resultBatch.count) {
-         resultMap(keys(i)) = vals(i)
-         i += 1
-       }
+    // 2. Get Blocks & Partition
+    val allBlocks = blockManager.getLoadedBlocks.toSeq
+    if (allBlocks.isEmpty) return Map.empty
+
+    val cores = MorselExec.activeCores
+    // Partition blocks evenly among available cores
+    val blockSize = math.ceil(allBlocks.size.toDouble / cores).toInt
+    val blockChunks = allBlocks.grouped(blockSize).toSeq
+
+    // 3. Define Parallel Task (Map Phase)
+    // Each core gets a list of blocks and runs its own TableScan -> HashAgg pipeline.
+    val tasks = blockChunks.map { subset =>
+      new Callable[scala.collection.mutable.Map[Int, Long]] {
+        override def call(): scala.collection.mutable.Map[Int, Long] = {
+          // A. Build Local Pipeline
+          // Note: Requires TableScanOperator to accept Array[Long] (block pointers)
+          val scanOp = new TableScanOperator(subset.toArray, keyIdx, valIdx)
+          val aggOp = new HashAggOperator(scanOp)
+          
+          // B. Execute
+          aggOp.open()
+          val resultBatch = aggOp.next() // HashAgg emits one consolidated batch
+          
+          // C. Materialize to Thread-Local Map
+          val localMap = scala.collection.mutable.Map[Int, Long]()
+          
+          if (resultBatch != null && resultBatch.count > 0) {
+             val keys = new Array[Int](resultBatch.count)
+             val vals = new Array[Long](resultBatch.count) // HashAgg exports Longs (Sums)
+             
+             NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
+             NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
+             
+             var i = 0
+             while (i < resultBatch.count) {
+               localMap(keys(i)) = vals(i)
+               i += 1
+             }
+          }
+          
+          aggOp.close()
+          localMap
+        }
+      }
+    }
+
+    // 4. Run Parallel Execution
+    val partialResults = MorselExec.runParallel(tasks)
+
+    // 5. Merge Phase (Reduce)
+    val finalMap = scala.collection.mutable.Map[Int, Long]()
+    for (partial <- partialResults) {
+      for ((k, v) <- partial) {
+        val current = finalMap.getOrElse(k, 0L)
+        finalMap(k) = current + v
+      }
     }
     
-    aggOp.close()
-    resultMap.toMap
+    finalMap.toMap
   }
 
   // ---------------------------------------------------------

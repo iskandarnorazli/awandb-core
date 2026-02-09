@@ -4,9 +4,8 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
-
+ * * http://www.apache.org/licenses/LICENSE-2.0
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,7 +16,7 @@
 package org.awandb.core.engine
 
 import org.awandb.core.jni.NativeBridge
-import java.util.concurrent.{ForkJoinPool, Callable, ExecutionException} // [FIX] Added Import
+import java.util.concurrent.{ForkJoinPool, Callable, ExecutionException}
 import java.util.ArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.Seq
@@ -37,6 +36,25 @@ object MorselExec {
   println(s"[MorselExec] Detected $cores Cores. Pool Size: $activeCores Threads.")
 
   val executor = new ForkJoinPool(activeCores)
+
+  // --- GENERIC PARALLEL RUNNER [NEW] ---
+  // Allows executing arbitrary DAGs (like HashAgg -> Scan) in parallel.
+  // This is used by AwanTable.executeGroupBy to run one pipeline per core.
+  def runParallel[T](tasks: Seq[Callable[T]]): Seq[T] = {
+    if (tasks.isEmpty) return Seq.empty
+    
+    // Invoke all tasks in the pool
+    val futures = executor.invokeAll(tasks.asJava)
+    
+    // Collect results and unwrap execution exceptions
+    futures.asScala.toSeq.map { f =>
+      try {
+        f.get()
+      } catch {
+        case e: ExecutionException => throw e.getCause
+      }
+    }
+  }
 
   class ScanTask(val blockPtr: Long, val scanFunc: Long => Int) extends Callable[Int] {
     override def call(): Int = {
