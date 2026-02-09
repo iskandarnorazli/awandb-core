@@ -15,7 +15,6 @@
 */
 
 package org.awandb.core.util
-
 import sun.misc.Unsafe
 
 object UnsafeHelper {
@@ -25,19 +24,8 @@ object UnsafeHelper {
     f.get(null).asInstanceOf[Unsafe]
   }
 
-  // BlockHeader Memory Layout:
-  // Offset 0: Magic (4 bytes)
-  // Offset 4: Version (4 bytes)
-  // Offset 8: Row Count (4 bytes) <--- We patch this
-  private val ROW_COUNT_OFFSET = 8L
-
-  /**
-   * Overwrites the row_count field in the BlockHeader.
-   * Used to fix metadata after over-allocating memory for safety.
-   */
-  def putInt(address: Long, value: Int): Unit = {
-    if (address != 0) {
-      unsafe.putInt(address + ROW_COUNT_OFFSET, value)
-    }
+  // Generic write to address + offset
+  def putInt(address: Long, offset: Long, value: Int): Unit = {
+    if (address != 0) unsafe.putInt(address + offset, value)
   }
 }

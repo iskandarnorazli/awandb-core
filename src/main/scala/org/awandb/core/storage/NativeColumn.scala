@@ -16,105 +16,145 @@
 package org.awandb.core.storage
 
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import org.awandb.core.jni.NativeBridge
 
-// [FIX] Define Block wrapper so we can track native pointers
+// Wrapper for Block Pointers
 case class Block(ptr: Long, rowCount: Int)
 
-class NativeColumn(val name: String, val isString: Boolean = false) {
+class NativeColumn(val name: String, val isString: Boolean = false, val useDictionary: Boolean = false) {
   
   // 1. Delta Store (Write-Optimized RAM)
-  // We maintain two separate buffers to avoid Boxing/Unboxing overhead.
   val deltaIntBuffer = new ArrayBuffer[Int]()
   val deltaStringBuffer = new ArrayBuffer[String]()
 
   // 2. Snapshot Store (Read-Optimized Disk/Native RAM)
-  // [FIX] Added this field so AwanTable and Tests can track flushed blocks
   val snapshotBlocks = new ListBuffer[Block]()
+
+  // 3. Dictionary State (Native C++)
+  // We allocate this lazily on first insert or recovery if enabled
+  var dictionaryPtr: Long = 0
+
+  if (useDictionary && isString) {
+    dictionaryPtr = NativeBridge.dictionaryCreate()
+  }
 
   // -----------------------------------------------------------
   // INSERT API
   // -----------------------------------------------------------
 
-  /**
-   * Append an Integer. Throws if this is a String column.
-   */
   def insert(value: Int): Unit = {
-    if (isString) throw new IllegalStateException(s"Column $name is a String column. Cannot insert Int.")
+    if (isString) throw new IllegalStateException(s"Col $name is String")
     deltaIntBuffer.append(value)
   }
 
-  /**
-   * [NEW] Append a String. Throws if this is an Integer column.
-   */
   def insert(value: String): Unit = {
-    if (!isString) throw new IllegalStateException(s"Column $name is an Int column. Cannot insert String.")
+    if (!isString) throw new IllegalStateException(s"Col $name is Int")
     deltaStringBuffer.append(value)
   }
 
-  /**
-   * [WRITE FUSION] Integer Batch
-   */
   def insertBatch(values: Array[Int]): Unit = {
-    if (isString) throw new IllegalStateException(s"Column $name is a String column.")
+    if (isString) throw new IllegalStateException(s"Col $name is String")
     deltaIntBuffer ++= values
   }
 
-  /**
-   * [NEW] [WRITE FUSION] String Batch
-   */
   def insertBatch(values: Array[String]): Unit = {
-    if (!isString) throw new IllegalStateException(s"Column $name is an Int column.")
+    if (!isString) throw new IllegalStateException(s"Col $name is Int")
     deltaStringBuffer ++= values
+  }
+
+  // -----------------------------------------------------------
+  // ENCODING LOGIC (The Magic)
+  // -----------------------------------------------------------
+
+  /**
+   * Compresses the current String buffer into Integer IDs.
+   * Uses the C++ Native Dictionary for extreme speed.
+   */
+  def encodeDelta(): Array[Int] = {
+    if (!useDictionary || dictionaryPtr == 0) return Array.empty
+    if (deltaStringBuffer.isEmpty) return Array.empty
+
+    val count = deltaStringBuffer.length
+    val outIds = new Array[Int](count)
+    
+    // 1. Alloc Native Buffer for results (Reuse NativeBridge aligned alloc)
+    val nativeIdsPtr = NativeBridge.allocMainStore(count)
+    
+    try {
+      // 2. Batch Encode (C++ does the heavy lifting: String -> Hash -> ID)
+      NativeBridge.dictionaryEncodeBatch(dictionaryPtr, deltaStringBuffer.toArray, nativeIdsPtr)
+      
+      // 3. Copy back to Scala Array (for Block creation)
+      NativeBridge.copyToScala(nativeIdsPtr, outIds, count)
+    } finally {
+      NativeBridge.freeMainStore(nativeIdsPtr)
+    }
+    
+    outIds
+  }
+
+  // -----------------------------------------------------------
+  // QUERY HELPER (Required for DAGSpec)
+  // -----------------------------------------------------------
+  
+  def getDictId(value: String): Int = {
+    if (dictionaryPtr == 0) return -1
+    // dictionaryEncode returns the ID (creating it if missing, but existing keys are stable)
+    NativeBridge.dictionaryEncode(dictionaryPtr, value)
+  }
+
+  // -----------------------------------------------------------
+  // PERSISTENCE (Native C++)
+  // -----------------------------------------------------------
+
+  def saveDictionary(path: String): Unit = {
+    if (useDictionary && dictionaryPtr != 0) {
+      NativeBridge.dictionarySave(dictionaryPtr, path)
+    }
+  }
+
+  def loadDictionary(path: String): Unit = {
+    if (useDictionary) {
+      // Destroy existing empty dictionary if present
+      if (dictionaryPtr != 0) {
+          NativeBridge.dictionaryDestroy(dictionaryPtr)
+      }
+      
+      // Try load from disk
+      dictionaryPtr = NativeBridge.dictionaryLoad(path)
+      
+      // If file doesn't exist, create a fresh one
+      if (dictionaryPtr == 0) {
+          dictionaryPtr = NativeBridge.dictionaryCreate()
+      }
+    }
   }
 
   // -----------------------------------------------------------
   // LIFECYCLE API
   // -----------------------------------------------------------
 
-  /**
-   * Clear buffers after a successful flush to disk.
-   */
   def clearDelta(): Unit = {
     deltaIntBuffer.clear()
     deltaStringBuffer.clear()
   }
   
-  /**
-   * Check if the active buffer is empty.
-   */
   def isEmpty: Boolean = {
     if (isString) deltaStringBuffer.isEmpty else deltaIntBuffer.isEmpty
   }
 
-  /**
-   * Closes all native blocks associated with this column.
-   * [CRITICAL] Prevents memory leaks when dropping a table.
-   */
   def close(): Unit = {
-    // Ideally, we call NativeBridge.freeBlock(b.ptr) here
-    // For now, we clear the list to drop references
     snapshotBlocks.clear()
     deltaIntBuffer.clear()
     deltaStringBuffer.clear()
+    
+    if (dictionaryPtr != 0) {
+      NativeBridge.dictionaryDestroy(dictionaryPtr)
+      dictionaryPtr = 0
+    }
   }
 
-  // ==============================================================================
-  // HELPER FUNCTIONS (Critical for JNI Flush)
-  // ==============================================================================
-
-  /**
-   * Helper to get current delta as an Int array (for flushing to NativeBridge).
-   */
   def toIntArray: Array[Int] = deltaIntBuffer.toArray
-  
-  /**
-   * [NEW] Helper to get current delta as a String array.
-   * AwanTable calls this to pass data to NativeBridge.loadStringDataNative()
-   */
   def toStringArray: Array[String] = deltaStringBuffer.toArray
-  
-  /**
-   * Legacy compatibility (optional, but good for existing tests).
-   */
   def toArray: Array[Int] = toIntArray
 }

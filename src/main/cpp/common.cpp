@@ -15,6 +15,7 @@
 */
 
 #include "common.h"
+#include <cstring> // for std::memset, std::memcpy
 
 void* alloc_aligned(size_t size) {
     size_t alignment = 64; 
@@ -63,5 +64,25 @@ extern "C" {
         if (srcPtr && dstPtr && bytes > 0) {
             std::memcpy((void*)dstPtr, (void*)srcPtr, (size_t)bytes);
         }
+    }
+
+    // Returns the stride (bytes per row) of a column: 1, 2, or 4.
+    // This allows TableScanOperator to calculate offsets correctly.
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_getColumnStrideNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx
+    ) {
+        if (blockPtr == 0) return 0;
+        
+        uint8_t* rawPtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)rawPtr;
+        
+        // [SAFETY FIX] Add Bounds Check
+        if (colIdx < 0 || colIdx >= (int)header->column_count) return 0;
+        
+        // Jump to Column Headers
+        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
+        
+        // Return stride (populated during creation/loading)
+        return (jint)colHeaders[colIdx].stride;
     }
 }

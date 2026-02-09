@@ -26,6 +26,7 @@ class NativeBridge {
   @native def getOffsetPointerNative(basePtr: Long, offsetBytes: Long): Long
   @native def allocMainStoreNative(size: Long): Long
   @native def freeMainStoreNative(ptr: Long): Unit
+  @native def getColumnStrideNative(blockPtr: Long, colIdx: Int): Int
 
   // --- IO / DATA TRANSFER ---
   @native def loadDataNative(ptr: Long, data: Array[Int]): Unit
@@ -42,6 +43,8 @@ class NativeBridge {
   // --- SMART ENGINES (Predicate Pushdown) ---
   @native def avxScanBlockNative(blockPtr: Long, colIdx: Int, threshold: Int, outIndicesPtr: Long): Int
   @native def avxScanMultiBlockNative(blockPtr: Long, colIdx: Int, thresholds: Array[Int], outCounts: Array[Int]): Unit
+  // [NEW] Equality Scan
+  @native def avxScanBlockEqualityNative(blockPtr: Long, colIdx: Int, target: Int, outIndicesPtr: Long): Int
   
   // [NEW] German String Native Definition
   @native def avxScanStringNative(blockPtr: Long, colIdx: Int, search: String, outIndicesPtr: Long): Int
@@ -105,9 +108,17 @@ class NativeBridge {
   @native def dictionaryDecodeNative(ptr: Long, id: Int): String
   @native def dictionaryEncodeBatchNative(ptr: Long, strings: Array[String], outIdsPtr: Long): Unit
 
+  // [NEW] Persistence Hooks
+  @native def dictionarySaveNative(ptr: Long, path: String): Boolean
+  @native def dictionaryLoadNative(path: String): Long
+
   // --- Operator ---
   @native def aggregateExportNative(mapPtr: Long, outKeysPtr: Long, outValsPtr: Long): Int
   @native def memcpyNative(src: Long, dst: Long, bytes: Long): Unit
+
+  // --- Bit Packing / Compression ---
+  @native def unpack8To32Native(src: Long, dst: Long, count: Int): Unit
+  @native def unpack16To32Native(src: Long, dst: Long, count: Int): Unit
 }
 
 // -----------------------------------------------------------
@@ -168,6 +179,7 @@ object NativeBridge {
   def freeMainStore(ptr: Long): Unit = instance.freeMainStoreNative(ptr)
   def loadData(ptr: Long, data: Array[Int]): Unit = instance.loadDataNative(ptr, data)
   def copyToScala(srcPtr: Long, dst: Array[Int], len: Int): Unit = instance.copyToScalaNative(srcPtr, dst, len)
+  def copyToScalaLong(src: Long, dst: Array[Long], len: Int): Unit = instance.copyToScalaLongNative(src, dst, len)
   
   // [NEW] String Public Wrapper
   def loadStringData(blockPtr: Long, colIdx: Int, data: Array[String]): Unit = {
@@ -191,6 +203,11 @@ object NativeBridge {
     if (blockPtr != 0) {
        instance.avxScanMultiBlockNative(blockPtr, colIdx, thresholds, outCounts)
     }
+  }
+
+  def avxScanBlockEquality(blockPtr: Long, colIdx: Int, target: Int, out: Long): Int = {
+    if (blockPtr == 0) return 0
+    instance.avxScanBlockEqualityNative(blockPtr, colIdx, target, out)
   }
 
   // [NEW] String Search Public Wrapper
@@ -315,17 +332,44 @@ object NativeBridge {
      }
   }
 
-  // --- Dictionary Encoding ---
+  // --- Dictionary Encoding Public API ---
   def dictionaryCreate(): Long = instance.dictionaryCreateNative()
   def dictionaryDestroy(ptr: Long): Unit = instance.dictionaryDestroyNative(ptr)
-  def dictionaryEncode(ptr: Long, str: String): Int = instance.dictionaryEncodeNative(ptr, str)
-  def dictionaryDecode(ptr: Long, id: Int): String = instance.dictionaryDecodeNative(ptr, id)
+  
+  def dictionaryEncode(ptr: Long, str: String): Int = {
+    if (ptr == 0) throw new IllegalStateException("Dictionary not initialized")
+    instance.dictionaryEncodeNative(ptr, str)
+  }
+  
+  def dictionaryDecode(ptr: Long, id: Int): String = {
+    if (ptr == 0) return null
+    instance.dictionaryDecodeNative(ptr, id)
+  }
   
   def dictionaryEncodeBatch(ptr: Long, strings: Array[String], outIdsPtr: Long): Unit = 
       instance.dictionaryEncodeBatchNative(ptr, strings, outIdsPtr)
+
+  // [NEW] Save/Load
+  def dictionarySave(ptr: Long, path: String): Boolean = {
+    if (ptr == 0) return false
+    instance.dictionarySaveNative(ptr, path)
+  }
+
+  def dictionaryLoad(path: String): Long = {
+    // Returns 0 if file not found or load failed
+    instance.dictionaryLoadNative(path)
+  }
 
   // --- Operator ---
   def aggregateExport(mapPtr: Long, outKeysPtr: Long, outValsPtr: Long): Int = 
       instance.aggregateExportNative(mapPtr, outKeysPtr, outValsPtr)
   def memcpy(src: Long, dst: Long, bytes: Long): Unit = instance.memcpyNative(src, dst, bytes)
+
+  // --- Bitpacking / Compression ---
+  def getColumnStride(blockPtr: Long, colIdx: Int): Int = {
+    if (blockPtr == 0) return 4 // Default to 4 bytes if null
+    instance.getColumnStrideNative(blockPtr, colIdx)
+  }
+  def unpack8To32(src: Long, dst: Long, count: Int): Unit = instance.unpack8To32Native(src, dst, count)
+  def unpack16To32(src: Long, dst: Long, count: Int): Unit = instance.unpack16To32Native(src, dst, count)
 }

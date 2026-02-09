@@ -121,8 +121,9 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     //    We overwrite row_count with the TRUE count. This ensures:
     //    a) Scans stop at the correct row (fixing the 8M vs 500k bug).
     //    b) Saves only write the valid data (fixing disk bloat).
+    // [PATCH] Correct the header row count (Offset 8)
     if (hasString) {
-        UnsafeHelper.putInt(blockPtr, rowCount)
+        UnsafeHelper.putInt(blockPtr, 8L, rowCount)
     }
     
     try {

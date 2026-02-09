@@ -14,7 +14,13 @@
  * limitations under the License.
 */
 
+/*
+ * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
+ */
+
 #include "common.h"
+#include <cstring>
+#include <cstdio> // For printf debugging
 
 // ---------------------------------------------------------
 // HIGH-PERFORMANCE HASH MAP (Linear Probing)
@@ -31,27 +37,28 @@ struct NativeHashMap {
 
     NativeHashMap(size_t input_size) {
         // [TUNING] Load Factor 0.5
-        // Allocating 2x input size drastically reduces collision chains (Linear Probing)
-        // This trades RAM for raw CPU speed.
+        // Allocating 2x input size drastically reduces collision chains
         size_t target = input_size * 2;
         
-        // Round up to nearest power of 2 for fast bitwise masking (idx & mask)
-        capacity = 1;
+        // Round up to nearest power of 2
+        capacity = 1024;
         while (capacity < target) capacity <<= 1;
-        if (capacity < 1024) capacity = 1024; 
         
         mask = capacity - 1;
         size = 0;
 
-        // Aligned Allocation for AVX compatibility (future proofing)
+        //printf("[NativeHashMap] Init: Input=%zu, Target=%zu, Capacity=%zu, Mask=%zu\n", input_size, target, capacity, mask);
+
+        // Aligned Allocation for AVX
         keys = (int*)alloc_aligned(capacity * sizeof(int));
         values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
 
-        // Initialize memory
         if (keys && values && occupied) {
             std::memset(occupied, 0, capacity * sizeof(uint8_t));
             std::memset(values, 0, capacity * sizeof(int64_t));
+        } else {
+            printf("[NativeHashMap] ERROR: Allocation Failed!\n");
         }
     }
 
@@ -62,14 +69,14 @@ struct NativeHashMap {
     }
 
     // THE HOT LOOP
-    // Fuses "Hash" + "Lookup" + "Insert/Update" into a single tight loop.
     void aggregate_batch(int* input_keys, int* input_vals, size_t count) {
+        size_t collisions = 0;
+        
         for (size_t i = 0; i < count; i++) {
             int key = input_keys[i];
             int val = input_vals[i];
 
-            // [HASH ALGORITHM] Murmur3 Avalanche Mixer (Finalizer)
-            // Faster than CRC32 for simple 32-bit integer keys.
+            // Murmur3 Finalizer Hash
             uint32_t k = (uint32_t)key;
             k ^= k >> 16;
             k *= 0x85ebca6b;
@@ -79,35 +86,33 @@ struct NativeHashMap {
             
             size_t idx = k & mask;
 
-            // [COLLISION RESOLUTION] Linear Probing
-            // If slot is taken, simply check the next slot. 
-            // Modern CPUs prefetch this pattern efficiently.
             while (true) {
-                // 1. Check if slot is empty
+                // 1. Empty Slot -> Claim
                 if (!occupied[idx]) {
-                    // Found empty slot -> CLAIM IT
                     occupied[idx] = 1;
                     keys[idx] = key;
-                    values[idx] = val; // Initialize sum
+                    values[idx] = val;
                     size++;
                     break;
                 }
                 
-                // 2. Check if key matches (Update existing group)
+                // 2. Match -> Accumulate
                 if (keys[idx] == key) {
-                    values[idx] += val; // Accumulate sum
+                    values[idx] += val;
                     break;
                 }
 
-                // 3. Collision -> Probe next slot (Wrap around via mask)
+                // 3. Collision -> Probe Next
+                collisions++;
                 idx = (idx + 1) & mask;
             }
         }
+        
+        if (collisions > count / 10) {
+             printf("[NativeHashMap] Batch Processed. Collisions: %zu\n", collisions);
+        }
     }
 
-    // [NEW] EXPORT FUNCTION (Flatten Map to Arrays)
-    // Copies valid entries to the provided output buffers.
-    // Returns number of rows exported.
     int32_t export_to_arrays(int* outKeys, int64_t* outValues) {
         int32_t count = 0;
         for (size_t i = 0; i < capacity; i++) {
@@ -117,41 +122,41 @@ struct NativeHashMap {
                 count++;
             }
         }
+        //printf("[NativeHashMap] Exporting %d groups (Internal Size: %zu)\n", count, size);
         return count;
     }
 };
 
 extern "C" {
-    // JNI Wrapper: Create Map -> Aggregate -> Return Pointer
+    // --------------------------------------------------------
+    // AGGREGATION WRAPPERS ONLY
+    // (Do NOT include storage functions here!)
+    // --------------------------------------------------------
+
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateSumNative(
         JNIEnv* env, jobject obj, jlong keysPtr, jlong valsPtr, jint count
     ) {
         if (keysPtr == 0 || valsPtr == 0 || count <= 0) return 0;
 
-        // Create the map on the C++ Heap
         NativeHashMap* map = new (std::nothrow) NativeHashMap((size_t)count);
-        if (!map) return 0; // OOM check
+        if (!map) return 0;
 
         int* keys = (int*)keysPtr;
         int* vals = (int*)valsPtr;
         
-        // Run High-Speed Aggregation
         map->aggregate_batch(keys, vals, (size_t)count);
 
         return (jlong)map;
     }
 
-    // [NEW] JNI Wrapper for Export (Map -> Arrays)
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateExportNative(
         JNIEnv* env, jobject obj, jlong mapPtr, jlong outKeysPtr, jlong outValsPtr
     ) {
         if (mapPtr == 0 || outKeysPtr == 0 || outValsPtr == 0) return 0;
-        
         NativeHashMap* map = (NativeHashMap*)mapPtr;
         return map->export_to_arrays((int*)outKeysPtr, (int64_t*)outValsPtr);
     }
 
-    // JNI Wrapper: Cleanup
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_freeAggregationResultNative(
         JNIEnv* env, jobject obj, jlong mapPtr
     ) {

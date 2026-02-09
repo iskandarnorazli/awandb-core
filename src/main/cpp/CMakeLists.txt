@@ -46,6 +46,7 @@ set(SOURCES
     aggregation.cpp  # Hash Aggregation
     dictionary.cpp  # Dictionary Encoding
     avx_scan.cpp     # AVX2 Scan Operations
+    bitpacking.cpp      # Bitpacking Utilities
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})

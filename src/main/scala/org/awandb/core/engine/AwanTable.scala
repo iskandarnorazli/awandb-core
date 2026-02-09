@@ -59,12 +59,12 @@ class AwanTable(
   // SCHEMA
   // ---------------------------------------------------------
   
-  def addColumn(colName: String, isString: Boolean = false): Unit = {
+  def addColumn(colName: String, isString: Boolean = false, useDictionary: Boolean = false): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) throw new IllegalStateException("Table is closed")
       if (!columns.contains(colName)) {
-        columns += (colName -> new NativeColumn(colName, isString))
+        columns += (colName -> new NativeColumn(colName, isString, useDictionary))
         columnOrder += colName
       }
     } finally {
@@ -164,6 +164,7 @@ class AwanTable(
     }
   }
 
+  // --- FLUSH (The "Compress & Persist" Pipeline) ---
   def flush(): Unit = {
     rwLock.writeLock().lock()
     try {
@@ -173,20 +174,40 @@ class AwanTable(
       val headCol = columns.values.headOption
       if (headCol.isEmpty || headCol.get.isEmpty) return
 
-      // 1. Snapshot Data (Deep Copy to Arrays)
-      // We extract the data while holding the lock to ensure atomicity.
+      // 1. Prepare Data (Encode Strings if needed)
+      // This transforms the Write-Optimized RAM format (Buffers)
+      // into the Read-Optimized Disk format (Arrays/Native Pointers).
       val allColumnsData = columns.values.map { col =>
-        if (col.isString) col.toStringArray
-        else col.toIntArray
+        if (col.isString) {
+          if (col.useDictionary) {
+            // [COMPRESSION] Turn Strings -> Ints
+            // The BlockManager will treat this as an Int column (Type 0), saving massive space.
+            // This happens instantly in RAM before disk IO.
+            col.encodeDelta() 
+          } else {
+            col.toStringArray // Raw strings (fallback / uncompressed)
+          }
+        } else {
+          col.toIntArray
+        }
       }.toList
       
-      // 2. Persist to Disk (The "Point of No Return")
-      // We write to disk BEFORE clearing RAM. 
-      // Since we hold the WriteLock, no Readers can see this intermediate state.
+      // 2. Persist Data Block (The "Point of No Return")
+      // We write to disk BEFORE clearing RAM.
       blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
+      
+      // 3. Persist Dictionaries (Sidecar Files)
+      // We save the dictionary state *after* the data block is safe.
+      // Naming convention: {tableName}_{colName}.dict
+      columns.values.foreach { col =>
+        if (col.useDictionary && col.dictionaryPtr != 0) {
+           val dictPath = s"$dataDir/${name}_${col.name}.dict"
+           NativeBridge.dictionarySave(col.dictionaryPtr, dictPath)
+        }
+      }
 
     } finally {
-      // 3. Guaranteed Cleanup [CRITICAL]
+      // 4. Guaranteed Cleanup [CRITICAL]
       // We clear the RAM buffer in 'finally' to ensure that even if the Disk Write fails 
       // (e.g. IO Error), we DO NOT leave the data in the buffer. 
       // Leaving it would cause the next flush to re-write it, leading to infinite duplication.
@@ -206,9 +227,14 @@ class AwanTable(
     }
   }
 
-// ---------------------------------------------------------
+  // ---------------------------------------------------------
   // READ PATH (Fully Optimized: RAM + Disk via Morsel Parallelism)
   // ---------------------------------------------------------
+
+  // Helper for tests to see dictionary effect
+  def getDictionary(colName: String): Option[Long] = {
+    columns.get(colName).map(_.dictionaryPtr)
+  }
 
   def query(colName: String, search: Any): Int = {
       search match {
@@ -222,6 +248,10 @@ class AwanTable(
     var ramCount = 0
     var snapshotBlocks: Seq[Long] = Seq.empty 
     var colIdx = 0
+    
+    // [NEW] Dictionary State
+    var useDict = false
+    var searchId = -1
 
     rwLock.readLock().lock()
     try {
@@ -229,23 +259,24 @@ class AwanTable(
        
        columns.get(colName) match {
          case Some(col) =>
-           // 1. RAM Optimization: Scan the Delta Buffer (String)
-           // Checks the in-memory write buffer before hitting disk
+           // 1. RAM Optimization: Scan the Delta Buffer (Always Raw Strings)
            if (col.deltaStringBuffer.nonEmpty) {
              ramCount = col.deltaStringBuffer.count(_ == value)
            }
            
-           // 2. Resolve Column ID for Native Access
+           // 2. Resolve Column Metadata
            colIdx = columnOrder.indexOf(colName) 
-           
-           // [CRITICAL SNAPSHOT] 
-           // Creates an immutable copy (.toList) of the block pointers.
-           // This protects against the "Flush Race Condition" where background flushing 
-           // modifies the block list while this query is trying to iterate it.
            snapshotBlocks = blockManager.getLoadedBlocks.toList
            
-           // [DEBUG] Enable to verify 16x Duplication Bug is gone (Should match Flush count)
-           // println(s"[AwanTable] String Query scanning ${snapshotBlocks.size} blocks")
+           // 3. Check Compression Mode
+           if (col.useDictionary) { //
+             useDict = true
+             // [CRITICAL] Encode inside lock to ensure dictionaryPtr is valid.
+             // Converts "Value" -> ID (e.g., 5023) for fast Integer scanning.
+             if (col.dictionaryPtr != 0) {
+                searchId = NativeBridge.dictionaryEncode(col.dictionaryPtr, value)
+             }
+           }
 
          case None => return 0
        }
@@ -253,11 +284,22 @@ class AwanTable(
        rwLock.readLock().unlock()
     }
 
-    // 3. Disk Scan (Morsel Parallelism)
-    // Distributes blocks across cores. Now safe because 'snapshotBlocks' is immutable.
-    val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-       NativeBridge.avxScanString(blockPtr, colIdx, value)
-    })
+    // 4. Disk Scan (Morsel Parallelism)
+    // We choose the engine based on the compression mode.
+    val diskCount = if (useDict) {
+       // [FAST PATH] Scan Compressed Integers (Dictionary IDs)
+       // [FIX] Use Equality Scan (==) to find exact matches.
+       // The previous 'avxScanBlock' was a Range Scan (>), which returned wrong counts for IDs.
+       MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+          NativeBridge.avxScanBlockEquality(blockPtr, colIdx, searchId, 0)
+       })
+    } else {
+       // [SLOW PATH] Scan Raw Strings (German String Layout)
+       // Checks 4-byte prefix, then memcmp. Slower but works without dict.
+       MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+          NativeBridge.avxScanString(blockPtr, colIdx, value)
+       })
+    }
 
     ramCount + diskCount
   }
@@ -339,6 +381,49 @@ class AwanTable(
      totalCounts
   }
 
+  // [FUSION ENGINE] Operator DAG Execution
+  // Executes: SELECT SUM(valueCol) GROUP BY keyCol
+  def executeGroupBy(keyCol: String, valCol: String): Map[Int, Long] = {
+    // 1. Resolve Column Indices
+    val keyIdx = columnOrder.indexOf(keyCol)
+    val valIdx = columnOrder.indexOf(valCol)
+    
+    if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
+
+    // 2. Build Plan
+    // Scan -> Aggregate
+    val scanOp = new org.awandb.core.query.TableScanOperator(blockManager, keyIdx, valIdx)
+    val aggOp = new org.awandb.core.query.HashAggOperator(scanOp)
+    
+    // 3. Execute
+    aggOp.open()
+    val resultBatch = aggOp.next() // Aggregation emits one single batch
+    
+    // 4. Materialize Result (Vector -> Scala Map)
+    val resultMap = scala.collection.mutable.Map[Int, Long]()
+    
+    if (resultBatch != null && resultBatch.count > 0) {
+       val keys = new Array[Int](resultBatch.count)
+       val vals = new Array[Long](resultBatch.count) // HashAgg exports Longs (Sums)
+       
+       // Use copyToScala for Keys (Int)
+       NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
+       
+       // Use copyToScalaLong for Values (Long)
+       // We need to ensure NativeBridge exposes this. It does!
+       NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
+       
+       var i = 0
+       while (i < resultBatch.count) {
+         resultMap(keys(i)) = vals(i)
+         i += 1
+       }
+    }
+    
+    aggOp.close()
+    resultMap.toMap
+  }
+
   // ---------------------------------------------------------
   // CLEANUP
   // ---------------------------------------------------------
@@ -352,6 +437,7 @@ class AwanTable(
       
       blockManager.close()
       wal.close()
+      columns.values.foreach(_.close())
       
       NativeBridge.freeMainStore(resultIndexBuffer)
       

@@ -361,4 +361,73 @@ extern "C" {
             out[i] = (int64_t)hash;
         }
     }
+
+    // [NEW] Dictionary Lookup Kernel (Equality Scan)
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanBlockEqualityNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint targetVal, jlong outIndicesPtr
+    ) {
+        if (blockPtr == 0) return 0;
+        uint8_t* rawPtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)rawPtr;
+        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
+        ColumnHeader& col = colHeaders[colIdx];
+
+        // Metadata Pruning (Bloom-like check on Min/Max)
+        // If target is outside the range [min, max], it cannot exist.
+        if (targetVal < col.min_int || targetVal > col.max_int) return 0;
+
+        int32_t* data = (int32_t*)(rawPtr + col.data_offset);
+        int32_t* out = (int32_t*)outIndicesPtr;
+        int rows = header->row_count;
+        int matchCount = 0;
+        
+        __m256i vTarget = _mm256_set1_epi32(targetVal);
+        int i = 0;
+        
+        // Mode A: Count Only
+        if (outIndicesPtr == 0) {
+            int limit = rows - 64;
+            for (; i <= limit; i += 64) {
+                // Load 8 vectors
+                __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
+                __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
+                __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
+                __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+                __m256i v4 = _mm256_loadu_si256((__m256i*)&data[i+32]);
+                __m256i v5 = _mm256_loadu_si256((__m256i*)&data[i+40]);
+                __m256i v6 = _mm256_loadu_si256((__m256i*)&data[i+48]);
+                __m256i v7 = _mm256_loadu_si256((__m256i*)&data[i+56]);
+
+                // Compare EQUALITY (_mm256_cmpeq_epi32)
+                __m256i m0 = _mm256_cmpeq_epi32(v0, vTarget);
+                __m256i m1 = _mm256_cmpeq_epi32(v1, vTarget);
+                __m256i m2 = _mm256_cmpeq_epi32(v2, vTarget);
+                __m256i m3 = _mm256_cmpeq_epi32(v3, vTarget);
+                __m256i m4 = _mm256_cmpeq_epi32(v4, vTarget);
+                __m256i m5 = _mm256_cmpeq_epi32(v5, vTarget);
+                __m256i m6 = _mm256_cmpeq_epi32(v6, vTarget);
+                __m256i m7 = _mm256_cmpeq_epi32(v7, vTarget);
+
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m0)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m1)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m2)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m3)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m4)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m5)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m6)));
+                matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m7)));
+            }
+        }
+        // Mode B: Indices (omitted for brevity, typically used for WHERE clauses)
+        
+        // Scalar Tail
+        for (; i < rows; i++) {
+            if (data[i] == targetVal) {
+                if (outIndicesPtr != 0) out[matchCount] = i;
+                matchCount++;
+            }
+        }
+        
+        return matchCount;
+    }
 }
