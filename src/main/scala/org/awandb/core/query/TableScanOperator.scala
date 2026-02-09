@@ -70,10 +70,11 @@ class TableScanOperator(
     if (currentBlockIdx >= blocks.length) return null
 
     var rowsFilled = 0
-    // [NEW] Track which block this batch belongs to. 
-    // Limitation: A single batch currently cannot span multiple blocks if we want late materialization.
-    // We grab the pointer of the *first* block we touch in this iteration.
+    // [LATE MAT] Track which block this batch belongs to. 
     var activeBlockPtr: Long = 0
+    // [CRITICAL FIX] Capture the starting row for this batch relative to the block.
+    // This allows MaterializeOperator to calculate the correct memory offset later.
+    var batchStartRow = -1 
 
     while (rowsFilled < batchSize && currentBlockIdx < blocks.length) {
       val blockPtr = blocks(currentBlockIdx)
@@ -82,15 +83,17 @@ class TableScanOperator(
         currentBlockIdx += 1
         currentRowInBlock = 0
       } else {
-        // [LATE MAT] Capture the block pointer for the batch metadata
-        if (activeBlockPtr == 0) activeBlockPtr = blockPtr
+        if (activeBlockPtr == 0) {
+            activeBlockPtr = blockPtr
+            // [FIX] Set the offset for the entire batch based on the first row we touch
+            batchStartRow = currentRowInBlock
+        }
         
         // [LATE MAT CONSTRAINT] If we cross into a NEW block, we must stop this batch here.
-        // Downstream operators expect all RowIDs in a batch to map to the SAME blockPtr.
         if (blockPtr != activeBlockPtr) {
-            // Stop here. Return what we have. Next call will handle the new block.
             batch.count = rowsFilled
             batch.blockPtr = activeBlockPtr
+            batch.startRowInBlock = batchStartRow // Pass offset
             return batch
         }
 
@@ -118,8 +121,8 @@ class TableScanOperator(
     if (rowsFilled == 0) return null
     
     batch.count = rowsFilled
-    // [NEW] Tag the batch with the source block address
     batch.blockPtr = activeBlockPtr
+    batch.startRowInBlock = batchStartRow // Pass offset
     
     batch
   }

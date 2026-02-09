@@ -13,6 +13,10 @@
  * limitations under the License.
 */
 
+/*
+ * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
+ */
+
 package org.awandb.core.query
 
 import org.awandb.core.jni.NativeBridge
@@ -129,6 +133,11 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
         // [LATE MATERIALIZATION SUPPORT]
         // 1. Pass the Source Block Pointer downstream
         outBatch.blockPtr = inputBatch.blockPtr
+        
+        // [CRITICAL FIX] Pass the Start Row Offset downstream
+        // This ensures MaterializeOperator knows where the batch starts relative to the block
+        outBatch.startRowInBlock = inputBatch.startRowInBlock
+        
         outBatch.hasSelection = true
         
         // 2. Copy the Match Indices into the Selection Vector

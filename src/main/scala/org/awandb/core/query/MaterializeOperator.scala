@@ -17,13 +17,9 @@ package org.awandb.core.query
 
 import org.awandb.core.jni.NativeBridge
 
-// -------------------------------------------------------------------------
-// MATERIALIZE OPERATOR (Late Fetch)
-// Fetches a column using Row IDs from the Selection Vector.
-// -------------------------------------------------------------------------
 class MaterializeOperator(
     child: Operator, 
-    colIdx: Int // The column index within the source block
+    colIdx: Int 
 ) extends Operator {
   
   override def open(): Unit = child.open()
@@ -32,16 +28,25 @@ class MaterializeOperator(
     val batch = child.next()
     if (batch == null) return null
     
-    // IF we have Row IDs and a Source Block -> Fetch Data
     if (batch.hasSelection && batch.blockPtr != 0) {
         
-        // 1. Get pointer to the column we want
+        // 1. Get Base Pointer of the block
         val colBasePtr = NativeBridge.getColumnPtr(batch.blockPtr, colIdx)
         
         if (colBasePtr != 0) {
-            // [CRITICAL FIX] Use IntToLong gather because Source is Int(4B) but Dest is Long(8B)
+            // [CRITICAL FIX] Apply the Batch Offset!
+            // The batch contains indices 0..N, but these correspond to rows (Start + 0)..(Start + N)
+            // So we advance the pointer to the start of this batch's range in the block.
+            
+            // Assume Stride is 4 (Int)
+            // TODO: In a real engine, resolve stride from header. 
+            // For now, we assume integers as per spec.
+            val offsetBytes = batch.startRowInBlock * 4L 
+            val chunkPtr = NativeBridge.getOffsetPointer(colBasePtr, offsetBytes)
+            
+            // 2. Gather from the offset position
             NativeBridge.batchReadIntToLong(
-                colBasePtr, 
+                chunkPtr, // Read from here
                 batch.selectionVectorPtr, 
                 batch.count, 
                 batch.valuesPtr 

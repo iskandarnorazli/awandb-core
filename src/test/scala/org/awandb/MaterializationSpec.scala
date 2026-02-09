@@ -22,13 +22,14 @@ import org.awandb.core.jni.NativeBridge
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import java.io.File
+import scala.util.Random
 
 class MaterializationSpec extends AnyFlatSpec with Matchers {
 
-  val TEST_DIR = new File("data/materialize_test").getAbsolutePath
+  val BASE_TEST_DIR = new File("data/materialize_test").getAbsolutePath
 
-  def cleanUp(): Unit = {
-    val dir = new File(TEST_DIR)
+  def cleanUp(dirPath: String): Unit = {
+    val dir = new File(dirPath)
     if (dir.exists()) {
       dir.listFiles().foreach(_.delete())
       dir.delete()
@@ -36,61 +37,113 @@ class MaterializationSpec extends AnyFlatSpec with Matchers {
     dir.mkdirs()
   }
 
-  "AwanDB Late Materialization" should "fetch non-key columns after a Join" in {
-    cleanUp()
+  "AwanDB Late Materialization" should "fetch non-key columns correctly (Small Scale)" in {
+    val dir = s"$BASE_TEST_DIR/small"
+    cleanUp(dir)
     
-    // SETUP: Orders Table with an "Amount" column (Column 2)
-    // 0: OID, 1: UID_FK, 2: AMOUNT
-    val orders = new AwanTable("orders_mat", 1000, TEST_DIR)
-    orders.addColumn("oid"); orders.addColumn("uid_fk"); orders.addColumn("amount")
-    
-    orders.insertRow(Array(100, 1, 500))  // Row 0: User 1 spent 500
-    orders.insertRow(Array(101, 1, 300))  // Row 1: User 1 spent 300
-    orders.insertRow(Array(102, 2, 900))  // Row 2: User 2 spent 900
-    orders.insertRow(Array(103, 99, 100)) // Row 3: User 99 (No Match)
+    // SETUP: Orders (0:OID, 1:UID, 2:AMOUNT)
+    val orders = new AwanTable("orders", 1000, dir)
+    orders.addColumn("oid"); orders.addColumn("uid"); orders.addColumn("amount")
+    orders.insertRow(Array(100, 1, 500))
+    orders.insertRow(Array(101, 1, 300))
+    orders.insertRow(Array(102, 2, 900))
+    orders.insertRow(Array(103, 99, 100))
     orders.flush()
     
-    // SETUP: Users Table
-    val users = new AwanTable("users_mat", 1000, TEST_DIR)
+    val users = new AwanTable("users", 1000, dir)
     users.addColumn("uid"); users.addColumn("age")
-    users.insertRow(Array(1, 25))
-    users.insertRow(Array(2, 30))
+    users.insertRow(Array(1, 25)); users.insertRow(Array(2, 30))
     users.flush()
     
-    // BUILD PLAN
-    // 1. Build Hash on Users
+    // PLAN
     val usersScan = new TableScanOperator(users.blockManager, 0, 1)
     val usersAgg = new HashAggOperator(usersScan)
     val buildOp = new HashJoinBuildOperator(usersAgg)
     
-    // 2. Probe Orders (Key = UID_FK)
-    // Note: We only scan Col 1 (UID_FK). We do NOT read Col 2 (Amount) yet!
     val ordersScan = new TableScanOperator(orders.blockManager, 1, 0)
     val joinOp = new HashJoinProbeOperator(ordersScan, buildOp)
+    val matOp = new MaterializeOperator(joinOp, colIdx = 2) // Fetch Amount
     
-    // 3. Materialize Amount (Col 2)
-    // Takes the matching Row IDs from Join and fetches Col 2 from Orders.
-    val matOp = new MaterializeOperator(joinOp, colIdx = 2)
-    
-    // EXECUTE
     matOp.open()
     val batch = matOp.next()
     
-    // VERIFY
-    // Matched Rows: 0 (500), 1 (300), 2 (900).
-    // Result Batch: Keys=UID, Values=AMOUNT (Materialized)
     batch.count shouldBe 3
-    
-    val amounts = new Array[Long](3) // Materialized into valuesPtr
+    val amounts = new Array[Long](3)
     NativeBridge.copyToScalaLong(batch.valuesPtr, amounts, 3)
-    
-    println(s"Materialized Amounts: ${amounts.mkString(", ")}")
     
     amounts should contain (500L)
     amounts should contain (300L)
     amounts should contain (900L)
     
-    matOp.close()
-    users.close(); orders.close()
+    matOp.close(); users.close(); orders.close()
+  }
+
+  it should "scale to 50k rows (Stress Test Gather Kernel)" in {
+    val usersDir = s"$BASE_TEST_DIR/scale/users"
+    val ordersDir = s"$BASE_TEST_DIR/scale/orders"
+    cleanUp(usersDir); cleanUp(ordersDir)
+    
+    val count = 50000
+    
+    // 1. Users (Build Side)
+    val users = new AwanTable("users_scale", 100000, usersDir)
+    users.addColumn("uid"); users.addColumn("val")
+    for (i <- 0 until 1000) users.insertRow(Array(i, 1)) // 1000 Users
+    users.flush()
+    
+    // 2. Orders (Probe Side)
+    val orders = new AwanTable("orders_scale", 100000, ordersDir)
+    orders.addColumn("oid"); orders.addColumn("uid_fk"); orders.addColumn("price")
+    
+    var expectedSum: Long = 0
+    val rnd = new Random(42)
+    
+    for (i <- 0 until count) {
+      val uid = rnd.nextInt(1000) // Always matches
+      val price = rnd.nextInt(100)
+      orders.insertRow(Array(i, uid, price))
+      expectedSum += price
+    }
+    orders.flush()
+    
+    println(s"[SETUP] Generated $count Orders. Expected Sum: $expectedSum")
+    
+    // 3. Pipeline
+    val usersScan = new TableScanOperator(users.blockManager, 0, 1)
+    val buildOp = new HashJoinBuildOperator(new HashAggOperator(usersScan))
+    
+    val ordersScan = new TableScanOperator(orders.blockManager, 1, 0)
+    val joinOp = new HashJoinProbeOperator(ordersScan, buildOp)
+    
+    // MATERIALIZE 'price' (Column 2)
+    val matOp = new MaterializeOperator(joinOp, colIdx = 2)
+    
+    matOp.open()
+    var totalSum: Long = 0
+    var rowsProcessed = 0
+    var batch = matOp.next()
+    
+    val t0 = System.nanoTime()
+    while (batch != null) {
+      val prices = new Array[Long](batch.count)
+      NativeBridge.copyToScalaLong(batch.valuesPtr, prices, batch.count)
+      
+      var i = 0
+      while(i < batch.count) {
+        totalSum += prices(i)
+        i += 1
+      }
+      
+      rowsProcessed += batch.count
+      batch = matOp.next()
+    }
+    val t1 = System.nanoTime()
+    
+    println(s"[RESULT] Materialized $rowsProcessed rows in ${(t1-t0)/1e6} ms. Sum: $totalSum")
+    
+    rowsProcessed shouldBe count
+    totalSum shouldBe expectedSum
+    
+    matOp.close(); users.close(); orders.close()
   }
 }
