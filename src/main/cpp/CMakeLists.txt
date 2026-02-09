@@ -47,6 +47,7 @@ set(SOURCES
     dictionary.cpp  # Dictionary Encoding
     avx_scan.cpp     # AVX2 Scan Operations
     bitpacking.cpp      # Bitpacking Utilities
+    join.cpp         # Join Engine
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})

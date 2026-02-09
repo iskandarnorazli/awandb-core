@@ -14,10 +14,6 @@
  * limitations under the License.
 */
 
-/*
- * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
- */
-
 #include "common.h"
 #include <cstring>
 #include <cstdio> // For printf debugging
@@ -55,8 +51,12 @@ struct NativeHashMap {
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
 
         if (keys && values && occupied) {
+            // [CRITICAL FIX] Zero-Initialize Memory
+            // Without this, garbage 'occupied' flags cause ghost groups to appear.
             std::memset(occupied, 0, capacity * sizeof(uint8_t));
             std::memset(values, 0, capacity * sizeof(int64_t));
+            // Keys don't strictly need zeroing if occupied is 0, but good for safety
+            std::memset(keys, 0, capacity * sizeof(int)); 
         } else {
             printf("[NativeHashMap] ERROR: Allocation Failed!\n");
         }

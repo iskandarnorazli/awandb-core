@@ -119,6 +119,11 @@ class NativeBridge {
   // --- Bit Packing / Compression ---
   @native def unpack8To32Native(src: Long, dst: Long, count: Int): Unit
   @native def unpack16To32Native(src: Long, dst: Long, count: Int): Unit
+
+  // --- JOIN ENGINE ---
+  @native def joinBuildNative(keysPtr: Long, payloadsPtr: Long, count: Int): Long
+  @native def joinProbeNative(mapPtr: Long, probeKeysPtr: Long, count: Int, outPayloadsPtr: Long, outIndicesPtr: Long): Int
+  @native def joinDestroyNative(mapPtr: Long): Unit
 }
 
 // -----------------------------------------------------------
@@ -372,4 +377,10 @@ object NativeBridge {
   }
   def unpack8To32(src: Long, dst: Long, count: Int): Unit = instance.unpack8To32Native(src, dst, count)
   def unpack16To32(src: Long, dst: Long, count: Int): Unit = instance.unpack16To32Native(src, dst, count)
+
+  // --- JOIN ENGINE ---
+  def joinBuild(keysPtr: Long, payloadsPtr: Long, count: Int): Long = instance.joinBuildNative(keysPtr, payloadsPtr, count)
+  def joinProbe(mapPtr: Long, probeKeysPtr: Long, count: Int, outPayloadsPtr: Long, outIndicesPtr: Long): Int = 
+      instance.joinProbeNative(mapPtr, probeKeysPtr, count, outPayloadsPtr, outIndicesPtr)
+  def joinDestroy(mapPtr: Long): Unit = instance.joinDestroyNative(mapPtr)
 }

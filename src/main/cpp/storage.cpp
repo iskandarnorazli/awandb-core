@@ -17,11 +17,11 @@
 #include "common.h"
 #include <cstdio>
 #include <limits>
+#include <cstring> // for memcpy, memset
 
 extern "C" {
 
     // --- Block Management ---
-    // Creates a raw memory block for the table.
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_createBlockNative(
         JNIEnv* env, jobject obj, jint rowCount, jint colCount
     ) {
@@ -29,40 +29,35 @@ extern "C" {
         size_t colHeadersSize = colCount * sizeof(ColumnHeader);
         size_t metaDataSize = headerSize + colHeadersSize;
         
-        // Align data start to 256 bytes (AVX friendly)
         size_t padding = (metaDataSize % 256 != 0) ? (256 - (metaDataSize % 256)) : 0;
         size_t dataStartOffset = metaDataSize + padding;
         
-        // Default: 4 bytes per integer
         size_t columnSizeBytes = (size_t)rowCount * sizeof(int);
         size_t totalDataSize = (size_t)colCount * columnSizeBytes;
         size_t totalBlockSize = dataStartOffset + totalDataSize;
 
-        // Allocate Zeroed Memory
         uint8_t* rawPtr = (uint8_t*)alloc_aligned(totalBlockSize);
         if (!rawPtr) return 0; 
         std::memset(rawPtr, 0, totalBlockSize);
 
-        // 1. Init Block Header
         BlockHeader* blkHeader = (BlockHeader*)rawPtr;
         blkHeader->magic_number = BLOCK_MAGIC;
         blkHeader->version = BLOCK_VERSION;
         blkHeader->row_count = rowCount;
         blkHeader->column_count = colCount;
 
-        // 2. Init Column Headers
         ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
         size_t currentOffset = dataStartOffset;
 
         for (int i = 0; i < colCount; i++) {
             colHeaders[i].col_id = i;
-            colHeaders[i].type = TYPE_INT; // Default to Int
+            colHeaders[i].type = TYPE_INT; 
             colHeaders[i].compression = COMP_NONE;
             colHeaders[i].data_offset = currentOffset;
             colHeaders[i].data_length = columnSizeBytes;
             
-            // [CRITICAL FIX] Set Default Stride to 4 Bytes
-            // Without this, stride stays 0, causing TableScan to read the same rows repeatedly.
+            // [CRITICAL FIX] Set Stride to 4. 
+            // If this is 0, TableScan reads the first rows forever.
             colHeaders[i].stride = 4; 
             
             colHeaders[i].string_pool_offset = 0;
@@ -91,6 +86,14 @@ extern "C" {
         jint* scalaData = env->GetIntArrayElements(dstArray, nullptr);
         std::memcpy(scalaData, cppData, (size_t)len * sizeof(int));
         env->ReleaseIntArrayElements(dstArray, scalaData, 0);
+    }
+
+    // [RESTORED] This function was missing in the previous partial snippet
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaLongNative(JNIEnv* env, jobject obj, jlong srcPtr, jlongArray dstArray, jint len) {
+        if (srcPtr == 0) return;
+        jlong* scalaData = env->GetLongArrayElements(dstArray, nullptr);
+        std::memcpy(scalaData, (void*)srcPtr, (size_t)len * sizeof(int64_t));
+        env->ReleaseLongArrayElements(dstArray, scalaData, 0);
     }
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadStringDataNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jobjectArray jStrings) {
@@ -145,13 +148,6 @@ extern "C" {
         env->ReleaseFloatArrayElements(jData, srcData, 0);
     }
 
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaLongNative(JNIEnv* env, jobject obj, jlong srcPtr, jlongArray dstArray, jint len) {
-        if (srcPtr == 0) return;
-        jlong* scalaData = env->GetLongArrayElements(dstArray, nullptr);
-        std::memcpy(scalaData, (void*)srcPtr, (size_t)len * sizeof(int64_t));
-        env->ReleaseLongArrayElements(dstArray, scalaData, 0);
-    }
-
     // --- IO & Metadata ---
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getColumnPtr(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx) {
         if (blockPtr == 0) return 0;
@@ -176,8 +172,6 @@ extern "C" {
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_getRowCount(JNIEnv* env, jobject obj, jlong blockPtr) {
         return (blockPtr == 0) ? 0 : (jint)((BlockHeader*)blockPtr)->row_count;
     }
-
-    // [REMOVED] getColumnStrideNative (Already exists in common.cpp)
 
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_loadBlockFromFile(JNIEnv* env, jobject obj, jstring path) {
         const char* filename = env->GetStringUTFChars(path, nullptr);

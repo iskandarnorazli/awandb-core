@@ -18,17 +18,13 @@ package org.awandb.core.query
 import org.awandb.core.jni.NativeBridge
 import org.awandb.core.storage.BlockManager
 
-// -------------------------------------------------------------------------
-// TABLE SCAN OPERATOR (Hybrid Reader)
-// -------------------------------------------------------------------------
 class TableScanOperator(
-    val blocks: Array[Long], // [UPDATED] Accepts raw pointers for partitioning
+    val blocks: Array[Long], 
     val keyColIdx: Int, 
     val valColIdx: Int,
     val batchSize: Int = 4096
 ) extends Operator {
   
-  // [COMPATIBILITY] Constructor for full-table scan
   def this(bm: BlockManager, k: Int, v: Int) = this(bm.getLoadedBlocks.toArray, k, v)
 
   private var currentBlockIdx = 0
@@ -41,7 +37,6 @@ class TableScanOperator(
     batch = new VectorBatch(batchSize)
   }
 
-  // [SMART READER] Handles compression dispatch
   private def readColumnChunk(
       blockPtr: Long, 
       colIdx: Int, 
@@ -51,7 +46,13 @@ class TableScanOperator(
       dstOffsetBytes: Long
   ): Unit = {
     var stride = NativeBridge.getColumnStride(blockPtr, colIdx)
-    if (stride == 0) stride = 4 // Safety net
+    
+    // [CRITICAL FIX] Safety net for uninitialized blocks (stride=0)
+    // If stride is 0, we assume standard 4-byte Integers.
+    if (stride == 0) {
+       // println(s"[TableScan] WARNING: Stride is 0 for col $colIdx. Fixing to 4.") 
+       stride = 4
+    }
     
     val colBase = NativeBridge.getColumnPtr(blockPtr, colIdx)
     val srcOffset = startRow.toLong * stride.toLong
