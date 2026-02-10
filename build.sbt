@@ -17,7 +17,8 @@ libraryDependencies ++= Seq(
   "org.scalatest" %% "scalatest" % "3.2.17" % Test,
   
   // [CRITICAL] Required for .par and ForkJoinPool integration
-  "org.scala-lang.modules" %% "scala-parallel-collections" % "1.0.4"
+  "org.scala-lang.modules" %% "scala-parallel-collections" % "1.0.4",
+  "com.github.jsqlparser" % "jsqlparser" % "4.7"
 )
 
 

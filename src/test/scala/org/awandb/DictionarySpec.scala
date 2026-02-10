@@ -14,95 +14,124 @@
  * limitations under the License.
 */
 
-/*
- * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
- */
-
 package org.awandb
 
-import org.awandb.core.engine.{AwanTable, MorselExec} // [FIX] Added MorselExec import
+import org.awandb.core.engine.{AwanTable, MorselExec}
 import org.awandb.core.jni.NativeBridge
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import java.io.File
 import scala.util.Random
+import java.util.UUID
 
 class DictionarySpec extends AnyFlatSpec with Matchers {
 
-  // --- PART 1: STORAGE INTEGRATION (The "Does it work?" Test) ---
-  
-  val TEST_DIR = new File("data/dictionary_spec").getAbsolutePath
-
-  def cleanUp(): Unit = {
-    val dir = new File(TEST_DIR)
-    if (dir.exists()) {
-      dir.listFiles().foreach(_.delete())
-      dir.delete()
+  // --- HELPER: Test Isolation ---
+  // Ensures every test runs in a fresh folder to avoid "Zombie Data"
+  def withTestDir(testCode: String => Any): Unit = {
+    val uniqueId = UUID.randomUUID().toString.take(8)
+    val dirPath = s"target/dict_test_$uniqueId"
+    val dir = new File(dirPath)
+    
+    if (dir.exists()) deleteRecursively(dir)
+    dir.mkdirs()
+    
+    try {
+      testCode(dirPath)
+    } finally {
+      deleteRecursively(dir)
     }
   }
 
+  def deleteRecursively(f: File): Unit = {
+    if (f.isDirectory) f.listFiles().foreach(deleteRecursively)
+    f.delete()
+  }
+
+  // --- PART 1: STORAGE INTEGRATION ---
+
   "AwanDB Dictionary" should "seamlessly encode, persist, and query strings" in {
-    cleanUp()
-    val table = new AwanTable("dict_test", 1000, TEST_DIR)
-    
-    // Create column with Dictionary enabled
-    table.addColumn("city", isString = true, useDictionary = true)
-    
-    // 1. Insert Data (RAM)
-    table.insert("city", "Kuala Lumpur")
-    table.insert("city", "Penang")
-    table.insert("city", "Kuala Lumpur") // Duplicate
-    
-    // 2. Query RAM (Should work via raw string scan)
-    table.query("city", "Kuala Lumpur") shouldBe 2
-    
-    // 3. Flush to Disk (Triggers Compression)
-    table.flush()
-    
-    // 4. Verify Sidecar File Exists
-    val dictFile = new File(TEST_DIR, "dict_test_city.dict")
-    dictFile.exists() shouldBe true
-    
-    // 5. Query Disk (Should use Fast Integer Scan)
-    // The engine converts "Kuala Lumpur" -> ID -> avxScanBlock
-    table.query("city", "Kuala Lumpur") shouldBe 2
-    table.query("city", "Singapore") shouldBe 0 // Negative case
-    
-    table.close()
+    withTestDir { dir =>
+      val table = new AwanTable("dict_test", 1000, dir)
+      
+      // Create column with Dictionary enabled
+      table.addColumn("city", isString = true, useDictionary = true)
+      
+      // 1. Insert Data (RAM)
+      table.insert("city", "Kuala Lumpur")
+      table.insert("city", "Penang")
+      table.insert("city", "Kuala Lumpur") // Duplicate
+      
+      // 2. Query RAM (Should work via raw string scan)
+      table.query("city", "Kuala Lumpur") shouldBe 2
+      
+      // 3. Flush to Disk (Triggers Compression)
+      table.flush()
+      
+      // 4. Verify Sidecar File Exists
+      val dictFile = new File(dir, "dict_test_city.dict")
+      dictFile.exists() shouldBe true
+      
+      // 5. Query Disk (Should use Fast Integer Scan)
+      // The engine converts "Kuala Lumpur" -> ID -> avxScanBlock
+      table.query("city", "Kuala Lumpur") shouldBe 2
+      table.query("city", "Singapore") shouldBe 0 // Negative case
+      
+      table.close()
+    }
   }
 
   it should "demonstrate massive storage compression vs Raw Strings" in {
-    // [FIX] Use separate directories
-    val rawDir = new File(TEST_DIR, "raw").getAbsolutePath
-    val dictDir = new File(TEST_DIR, "dict").getAbsolutePath
-    cleanUp(); new File(rawDir).mkdirs(); new File(dictDir).mkdirs()
-    
-    val rawTable = new AwanTable("raw_bench", 10000, rawDir)
-    rawTable.addColumn("data", isString = true, useDictionary = false)
-    
-    val dictTable = new AwanTable("dict_bench", 10000, dictDir)
-    dictTable.addColumn("data", isString = true, useDictionary = true)
-    
-    // ... (Generate Data) ...
-    
-    rawTable.flush()
-    dictTable.flush()
-    
-    // MEASURE
-    val rawSize = new File(rawDir).listFiles().map(_.length()).sum
-    val dictSize = new File(dictDir).listFiles().map(_.length()).sum
-    
-    println(f"\n[Compression Benchmark]")
-    println(f"Raw String Size:  ${rawSize / 1024} KB")
-    println(f"Dictionary Size:  ${dictSize / 1024} KB")
-    
-    if (dictSize > 0) {
-        println(f"Compression:      ${rawSize.toDouble / dictSize}%.2fx")
-        rawSize should be > dictSize
+    withTestDir { dir =>
+      val rawDir = new File(dir, "raw").getAbsolutePath
+      val dictDir = new File(dir, "dict").getAbsolutePath
+      
+      val rawTable = new AwanTable("raw_bench", 10000, rawDir)
+      rawTable.addColumn("data", isString = true, useDictionary = false)
+      
+      val dictTable = new AwanTable("dict_bench", 10000, dictDir)
+      dictTable.addColumn("data", isString = true, useDictionary = true)
+      
+      // [FIX] Generate Data (High Repetition = High Compression)
+      val prefixes = Array("Log_Entry_Error_", "User_Action_Click_", "Transaction_ID_", "Status_Pending_")
+      val random = new Random(42)
+      
+      for (i <- 0 until 5000) {
+        // Create a reasonably long string to make compression obvious
+        val value = prefixes(random.nextInt(prefixes.length)) + (i % 100)
+        val padded = value + "_padding_" + "x" * 20 
+        
+        rawTable.insert("data", padded)
+        dictTable.insert("data", padded)
+      }
+      
+      rawTable.flush()
+      dictTable.flush()
+      
+      // MEASURE
+      def dirSize(path: String): Long = {
+        val f = new File(path)
+        if (f.exists() && f.isDirectory) f.listFiles().map(_.length()).sum else 0
+      }
+
+      val rawSize = dirSize(rawDir)
+      val dictSize = dirSize(dictDir)
+      
+      println(f"\n[Compression Benchmark]")
+      println(f"Raw String Size:  ${rawSize / 1024} KB")
+      println(f"Dictionary Size:  ${dictSize / 1024} KB")
+      
+      if (dictSize > 0) {
+         val ratio = rawSize.toDouble / dictSize
+         println(f"Compression:      $ratio%.2fx")
+         rawSize should be > dictSize
+      } else {
+         fail("Dictionary size was 0 KB. Flush failed?")
+      }
+      
+      rawTable.close()
+      dictTable.close()
     }
-    
-    rawTable.close()
-    dictTable.close()
   }
 
   // --- PART 2: COMPUTE PERFORMANCE (The "Is it fast?" Test) ---

@@ -17,40 +17,42 @@ package org.awandb.core.engine
 
 import org.awandb.core.storage.{NativeColumn, BlockManager, Wal}
 import org.awandb.core.jni.NativeBridge
-import org.awandb.core.query._ // Import Operators
-import java.util.concurrent.Callable
+import org.awandb.core.query._ 
+import java.util.concurrent.{ConcurrentHashMap, Callable}
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.collection.mutable.{LinkedHashMap, ListBuffer}
 import scala.collection.Seq 
+
+// Location Pointer for Primary Index
+case class RowLocation(blockPtr: Long, rowId: Int)
 
 class AwanTable(
     val name: String, 
     val capacity: Int, 
     val dataDir: String = "data",
     val governor: EngineGovernor = NoOpGovernor,
-    val enableIndex: Boolean = true // Control Lazy Indexing
+    val enableIndex: Boolean = true 
 ) {
   
   // COMPONENTS
   val wal = new Wal(dataDir)
-  
-  // Pass the index flag to BlockManager
   val blockManager = new BlockManager(dataDir, enableIndex)
-  
   val columns = new LinkedHashMap[String, NativeColumn]()
-
-  // Explicitly track column order for Array-based inserts
   private val columnOrder = new ListBuffer[String]()
   
-  // [PERFORMANCE] Pre-allocated Buffer (Single-Threaded Speedup)
+  // [PERFORMANCE] Pre-allocated Buffer
   val resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
   
   private val rwLock = new ReentrantReadWriteLock()
   
-  // [SAFETY] Gatekeeper
   @volatile private var isClosed = false
+
+  // [INDEX] Primary Key Index (Maps ID -> Location)
+  private val primaryIndex = new ConcurrentHashMap[Int, RowLocation]()
+
+  // [DELETION] RAM Deletion Bitmap (For rows in Delta Buffer)
+  private val ramDeleted = new java.util.BitSet()
   
-  // ASYNC MANAGER
   val engineManager = new EngineManager(this, governor) 
   engineManager.start()
 
@@ -74,6 +76,51 @@ class AwanTable(
   }
 
   // ---------------------------------------------------------
+  // HELPER: Resolve ID (Fixes ClassCastException)
+  // ---------------------------------------------------------
+  private def resolveId(key: Any): Int = {
+    key match {
+      case i: Int => i
+      case s: String => s.hashCode // Simple hashing for String PKs
+      case _ => key.hashCode
+    }
+  }
+
+  // ---------------------------------------------------------
+  // CRUD OPERATIONS
+  // ---------------------------------------------------------
+
+  def delete(id: Int): Boolean = {
+    rwLock.writeLock().lock()
+    try {
+      val loc = primaryIndex.get(id)
+      if (loc == null) return false
+
+      if (loc.blockPtr == 0) {
+        ramDeleted.set(loc.rowId)
+      } else {
+        blockManager.markDeleted(loc.blockPtr, loc.rowId)
+      }
+      
+      primaryIndex.remove(id)
+      true
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
+  def update(id: Int, changes: Map[String, Any]): Boolean = {
+    rwLock.writeLock().lock()
+    try {
+      if (!primaryIndex.containsKey(id)) return false
+      delete(id)
+      true 
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
+  // ---------------------------------------------------------
   // WRITE PATH
   // ---------------------------------------------------------
   
@@ -86,6 +133,12 @@ class AwanTable(
     try {
       if (isClosed) throw new IllegalStateException("Cannot insert: Table is closed.")
       
+      // [FIX] Use resolveId instead of hard casting to Int.
+      // This fixes the ClassCastException in DictionarySpec.
+      val id = resolveId(values(0))
+      
+      val currentRamRowId = if (columns.nonEmpty) columns.values.head.deltaIntBuffer.length else 0
+
       columnOrder.zipWithIndex.foreach { case (colName, i) =>
         val col = columns(colName)
         val value = values(i)
@@ -94,14 +147,15 @@ class AwanTable(
           case v: Int => 
             wal.logInsert(v)
             col.insert(v)
-            
           case s: String => 
             if (col.isString) col.insert(s)
             else throw new IllegalArgumentException(s"Column '$colName' expects Int, but got String.")
-            
           case _ => throw new UnsupportedOperationException(s"Type not supported: ${value.getClass}")
         }
       }
+
+      primaryIndex.put(id, RowLocation(0, currentRamRowId))
+
     } finally {
       rwLock.writeLock().unlock()
     }
@@ -114,7 +168,6 @@ class AwanTable(
     try {
         if (isClosed) throw new IllegalStateException("Table is closed")
         columns.get(colName).foreach(_.insert(value))
-        
         if (columns.size == 1) wal.logInsert(value)
     } finally {
         rwLock.writeLock().unlock()
@@ -125,13 +178,9 @@ class AwanTable(
     rwLock.writeLock().lock()
     try {
         if (isClosed) throw new IllegalStateException("Table is closed")
-        
         columns.get(colName) match {
-          case Some(col) => 
-            if (col.isString) col.insert(value)
-            else throw new IllegalArgumentException(s"Column '$colName' is not a String column.")
-          case None => 
-            throw new IllegalArgumentException(s"Column '$colName' not found.")
+          case Some(col) => if (col.isString) col.insert(value)
+          case None => throw new IllegalArgumentException(s"Column '$colName' not found.")
         }
     } finally {
         rwLock.writeLock().unlock()
@@ -152,7 +201,6 @@ class AwanTable(
     }
   }
 
-  // [TEST HELPER] Direct Bulk Load
   def loadDataDirect(data: Array[Int]): Unit = {
     rwLock.writeLock().lock()
     try {
@@ -165,41 +213,66 @@ class AwanTable(
     }
   }
 
-  // --- FLUSH (The "Compress & Persist" Pipeline) ---
+  // --- FLUSH ---
   def flush(): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) return
 
-      // Optimization: Fast exit if nothing to flush
       val headCol = columns.values.headOption
-      if (headCol.isEmpty || headCol.get.isEmpty) return
-
-      // 1. Prepare Data (Encode Strings if needed)
-      // This transforms the Write-Optimized RAM format (Buffers)
-      // into the Read-Optimized Disk format (Arrays/Native Pointers).
-      val allColumnsData = columns.values.map { col =>
-        if (col.isString) {
-          if (col.useDictionary) {
-            // [COMPRESSION] Turn Strings -> Ints
-            // The BlockManager will treat this as an Int column (Type 0), saving massive space.
-            // This happens instantly in RAM before disk IO.
-            col.encodeDelta() 
-          } else {
-            col.toStringArray // Raw strings (fallback / uncompressed)
+      val hasData = headCol.isDefined && !headCol.get.isEmpty
+      
+      if (hasData) {
+          // 1. Prepare Data
+          val allColumnsData = columns.values.map { col =>
+            if (col.isString) {
+              if (col.useDictionary) col.encodeDelta() else col.toStringArray
+            } else {
+              col.toIntArray
+            }
+          }.toList
+          
+          // 2. Persist Data Block
+          blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
+    
+          // 3. Update Index Locations (RAM -> Disk)
+          // [SAFETY] Check if block was actually created
+          if (blockManager.getLoadedBlocks.nonEmpty) {
+              val newBlockPtr = blockManager.getLoadedBlocks.last
+              val rowCount = headCol.get.deltaIntBuffer.length
+              val firstCol = columns.values.head
+              
+              // [FIX] Only migrate index if the ID column is Int-based.
+              // Accessing deltaIntBuffer on a String column is invalid/empty.
+              if (!firstCol.isString) {
+                  val idColData = firstCol.deltaIntBuffer
+                  for (i <- 0 until rowCount) {
+                    if (!ramDeleted.get(i)) {
+                       val id = idColData(i)
+                       primaryIndex.put(id, RowLocation(newBlockPtr, i))
+                    } else {
+                       primaryIndex.remove(idColData(i))
+                       blockManager.markDeleted(newBlockPtr, i)
+                    }
+                  }
+              }
           }
-        } else {
-          col.toIntArray
-        }
-      }.toList
-      
-      // 2. Persist Data Block (The "Point of No Return")
-      // We write to disk BEFORE clearing RAM.
-      blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
-      
-      // 3. Persist Dictionaries (Sidecar Files)
-      // We save the dictionary state *after* the data block is safe.
-      // Naming convention: {tableName}_{colName}.dict
+          
+          // 4. Cleanup RAM
+          if (!isClosed) {
+             columns.values.foreach { col => 
+                 col.clearDelta()
+                 if (!col.isEmpty) { col.deltaIntBuffer.clear(); col.deltaStringBuffer.clear() }
+             }
+             wal.clear()
+             ramDeleted.clear() 
+          }
+      }
+
+      // 5. Always Save Bitmaps
+      blockManager.saveBitmaps()
+
+      // 6. Persist Dictionaries
       columns.values.foreach { col =>
         if (col.useDictionary && col.dictionaryPtr != 0) {
            val dictPath = s"$dataDir/${name}_${col.name}.dict"
@@ -208,106 +281,149 @@ class AwanTable(
       }
 
     } finally {
-      // 4. Guaranteed Cleanup [CRITICAL]
-      // We clear the RAM buffer in 'finally' to ensure that even if the Disk Write fails 
-      // (e.g. IO Error), we DO NOT leave the data in the buffer. 
-      // Leaving it would cause the next flush to re-write it, leading to infinite duplication.
-      if (!isClosed) {
-         columns.values.foreach { col => 
-             col.clearDelta()
-             
-             // Defensive: Force clear if standard reset failed
-             if (!col.isEmpty) {
-                 col.deltaIntBuffer.clear()
-                 col.deltaStringBuffer.clear()
-             }
-         }
-         wal.clear()
-      }
       rwLock.writeLock().unlock()
     }
   }
 
   // ---------------------------------------------------------
-  // READ PATH (Fully Optimized: RAM + Disk via Morsel Parallelism)
+  // READ PATH (Filtered Scans)
   // ---------------------------------------------------------
 
-  // Helper for tests to see dictionary effect
   def getDictionary(colName: String): Option[Long] = {
     columns.get(colName).map(_.dictionaryPtr)
   }
 
   def query(colName: String, search: Any): Int = {
       search match {
-          case i: Int => queryInt(i) 
-          case s: String => queryString(colName, s)
+          case i: Int => queryIntEquality(colName, i) 
+          case s: String => queryStringEquality(colName, s)
           case _ => 0
       }
   }
 
-  private def queryString(colName: String, value: String): Int = {
+  private def queryIntEquality(colName: String, target: Int): Int = {
     var ramCount = 0
     var snapshotBlocks: Seq[Long] = Seq.empty 
     var colIdx = 0
-    
-    // [NEW] Dictionary State
-    var useDict = false
-    var searchId = -1
 
     rwLock.readLock().lock()
     try {
        if (isClosed) throw new IllegalStateException("Table is closed")
-       
        columns.get(colName) match {
          case Some(col) =>
-           // 1. RAM Optimization: Scan the Delta Buffer (Always Raw Strings)
-           if (col.deltaStringBuffer.nonEmpty) {
-             ramCount = col.deltaStringBuffer.count(_ == value)
-           }
-           
-           // 2. Resolve Column Metadata
-           colIdx = columnOrder.indexOf(colName) 
-           snapshotBlocks = blockManager.getLoadedBlocks.toList
-           
-           // 3. Check Compression Mode
-           if (col.useDictionary) { //
-             useDict = true
-             // [CRITICAL] Encode inside lock to ensure dictionaryPtr is valid.
-             // Converts "Value" -> ID (e.g., 5023) for fast Integer scanning.
-             if (col.dictionaryPtr != 0) {
-                searchId = NativeBridge.dictionaryEncode(col.dictionaryPtr, value)
+           colIdx = columnOrder.indexOf(colName)
+           if (col.deltaIntBuffer.nonEmpty) {
+             val arr = col.deltaIntBuffer.toArray
+             var i = 0
+             while (i < arr.length) {
+               if (!ramDeleted.get(i) && arr(i) == target) ramCount += 1
+               i += 1
              }
            }
-
+           snapshotBlocks = blockManager.getLoadedBlocks.toList
          case None => return 0
        }
     } finally {
        rwLock.readLock().unlock()
     }
 
-    // 4. Disk Scan (Morsel Parallelism)
-    // We choose the engine based on the compression mode.
-    val diskCount = if (useDict) {
-       // [FAST PATH] Scan Compressed Integers (Dictionary IDs)
-       // [FIX] Use Equality Scan (==) to find exact matches.
-       // The previous 'avxScanBlock' was a Range Scan (>), which returned wrong counts for IDs.
-       MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-          NativeBridge.avxScanBlockEquality(blockPtr, colIdx, searchId, 0)
-       })
-    } else {
-       // [SLOW PATH] Scan Raw Strings (German String Layout)
-       // Checks 4-byte prefix, then memcmp. Slower but works without dict.
-       MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-          NativeBridge.avxScanString(blockPtr, colIdx, value)
-       })
-    }
-
+    val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+       if (blockManager.isClean(blockPtr)) {
+           // FAST PATH: Manual loop over Clean Block (Avoids Bitmap Check overhead)
+           val rowCount = NativeBridge.getRowCount(blockPtr)
+           val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+           val data = new Array[Int](rowCount)
+           NativeBridge.copyToScala(colPtr, data, rowCount)
+           
+           var localCount = 0
+           var i = 0
+           while (i < rowCount) {
+             if (data(i) == target) localCount += 1
+             i += 1
+           }
+           localCount
+       } else {
+           // SLOW PATH: Dirty Block
+           val rowCount = NativeBridge.getRowCount(blockPtr)
+           val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+           val data = new Array[Int](rowCount)
+           NativeBridge.copyToScala(colPtr, data, rowCount)
+           
+           var localCount = 0
+           var i = 0
+           while (i < rowCount) {
+             if (!blockManager.isDeleted(blockPtr, i)) {
+               if (data(i) == target) localCount += 1
+             }
+             i += 1
+           }
+           localCount
+       }
+    })
     ramCount + diskCount
   }
 
-  def query(threshold: Int): Int = queryInt(threshold)
+  private def queryStringEquality(colName: String, value: String): Int = {
+    var ramCount = 0
+    var snapshotBlocks: Seq[Long] = Seq.empty 
+    var colIdx = 0
+    var useDict = false
+    var searchId = -1
 
-  private def queryInt(threshold: Int): Int = {
+    rwLock.readLock().lock()
+    try {
+       if (isClosed) throw new IllegalStateException("Table is closed")
+       columns.get(colName) match {
+         case Some(col) =>
+           if (col.deltaStringBuffer.nonEmpty) {
+             var i = 0
+             while (i < col.deltaStringBuffer.length) {
+               if (!ramDeleted.get(i) && col.deltaStringBuffer(i) == value) ramCount += 1
+               i += 1
+             }
+           }
+           colIdx = columnOrder.indexOf(colName) 
+           snapshotBlocks = blockManager.getLoadedBlocks.toList
+           if (col.useDictionary) { 
+             useDict = true
+             if (col.dictionaryPtr != 0) searchId = NativeBridge.dictionaryEncode(col.dictionaryPtr, value)
+           }
+         case None => return 0
+       }
+    } finally {
+       rwLock.readLock().unlock()
+    }
+
+    val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+        val rowCount = NativeBridge.getRowCount(blockPtr)
+        var localCount = 0
+        if (useDict) {
+            val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+            val data = new Array[Int](rowCount)
+            NativeBridge.copyToScala(colPtr, data, rowCount)
+            
+            val isClean = blockManager.isClean(blockPtr)
+            var i = 0
+            if (isClean) {
+                while (i < rowCount) {
+                   if (data(i) == searchId) localCount += 1
+                   i += 1
+                }
+            } else {
+                while (i < rowCount) {
+                   if (!blockManager.isDeleted(blockPtr, i) && data(i) == searchId) localCount += 1
+                   i += 1
+                }
+            }
+        } else {
+            localCount = NativeBridge.avxScanString(blockPtr, colIdx, value)
+        }
+        localCount
+    })
+    ramCount + diskCount
+  }
+
+  def query(threshold: Int): Int = {
     if (columns.isEmpty) return 0
     val firstColName = columns.keys.head
     
@@ -317,38 +433,50 @@ class AwanTable(
     rwLock.readLock().lock()
     try {
        if (isClosed) throw new IllegalStateException("Table is closed")
-       
        val col = columns(firstColName)
        if (col.deltaIntBuffer.nonEmpty) {
-         ramCount = NativeBridge.avxScanArray(col.deltaIntBuffer.toArray, threshold)
+         val arr = col.deltaIntBuffer.toArray
+         var i = 0
+         while (i < arr.length) {
+           if (!ramDeleted.get(i) && arr(i) > threshold) ramCount += 1
+           i += 1
+         }
        }
-       
-       // [CRITICAL FIX] .toList creates an immutable snapshot of the block pointers.
-       // This is essential because 'flush()' runs in background and modifies the BlockManager's list.
        snapshotBlocks = blockManager.getLoadedBlocks.toList 
     } finally {
        rwLock.readLock().unlock()
     }
 
     val colIdx = 0
-    
     val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-       NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
+       if (blockManager.isClean(blockPtr)) {
+           NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
+       } else {
+           val rowCount = NativeBridge.getRowCount(blockPtr)
+           val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+           val data = new Array[Int](rowCount)
+           NativeBridge.copyToScala(colPtr, data, rowCount)
+           
+           var localCount = 0
+           var i = 0
+           while (i < rowCount) {
+             if (!blockManager.isDeleted(blockPtr, i)) {
+                if (data(i) > threshold) localCount += 1
+             }
+             i += 1
+           }
+           localCount
+       }
     })
-
     ramCount + diskCount
   }
 
-  // [FUSION ENGINE] Parallel Shared Scan
   def queryShared(thresholds: Array[Int]): Array[Int] = {
      val totalCounts = new Array[Int](thresholds.length)
      var snapshotBlocks: Seq[Long] = Seq.empty
-     
      rwLock.readLock().lock()
      try {
        if (isClosed) throw new IllegalStateException("Table is closed")
-       
-       // 1. Scan RAM (Delta)
        if (columns.nonEmpty) {
          val firstCol = columns.values.head
          if (firstCol.deltaIntBuffer.nonEmpty) {
@@ -356,23 +484,17 @@ class AwanTable(
            NativeBridge.avxScanArrayMulti(ramData, thresholds, totalCounts)
          }
        }
-       
-       // [CRITICAL] Snapshot the list to avoid ConcurrentModificationException during flush
        snapshotBlocks = blockManager.getLoadedBlocks.toList 
      } finally {
        rwLock.readLock().unlock()
      }
 
-     // 2. Scan Disk (Parallel)
-     // [UPDATED] Inject the native behavior here. 
-     // This tells MorselExec exactly how to allocate memory and how to scan a block.
      val diskCounts = MorselExec.scanSharedParallel(
         snapshotBlocks,
-        allocator = () => new Array[Int](thresholds.length), // Thread-local buffer
-        scanner = (ptr, counts) => NativeBridge.avxScanMultiBlock(ptr, 0, thresholds, counts) // JNI execution
+        allocator = () => new Array[Int](thresholds.length),
+        scanner = (ptr, counts) => NativeBridge.avxScanMultiBlock(ptr, 0, thresholds, counts)
      )
      
-     // 3. Aggregate RAM + Disk
      var i = 0
      while (i < totalCounts.length) {
        totalCounts(i) += diskCounts(i)
@@ -382,66 +504,43 @@ class AwanTable(
      totalCounts
   }
 
-  // [FUSION ENGINE] PARALLEL OPERATOR DAG EXECUTION
-  // Executes: SELECT SUM(valueCol) GROUP BY keyCol
-  // Uses Morsel-Driven Parallelism to run multiple DAG instances per core.
   def executeGroupBy(keyCol: String, valCol: String): Map[Int, Long] = {
-    // 1. Resolve Column Indices
     val keyIdx = columnOrder.indexOf(keyCol)
     val valIdx = columnOrder.indexOf(valCol)
-    
     if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
 
-    // 2. Get Blocks & Partition
     val allBlocks = blockManager.getLoadedBlocks.toSeq
     if (allBlocks.isEmpty) return Map.empty
 
     val cores = MorselExec.activeCores
-    // Partition blocks evenly among available cores
     val blockSize = math.ceil(allBlocks.size.toDouble / cores).toInt
     val blockChunks = allBlocks.grouped(blockSize).toSeq
 
-    // 3. Define Parallel Task (Map Phase)
-    // Each core gets a list of blocks and runs its own TableScan -> HashAgg pipeline.
     val tasks = blockChunks.map { subset =>
       new Callable[scala.collection.mutable.Map[Int, Long]] {
         override def call(): scala.collection.mutable.Map[Int, Long] = {
-          // A. Build Local Pipeline
-          // Note: Requires TableScanOperator to accept Array[Long] (block pointers)
-          val scanOp = new TableScanOperator(subset.toArray, keyIdx, valIdx)
+          val scanOp = new TableScanOperator(blockManager, subset.toArray, keyIdx, valIdx)
           val aggOp = new HashAggOperator(scanOp)
-          
-          // B. Execute
           aggOp.open()
-          val resultBatch = aggOp.next() // HashAgg emits one consolidated batch
-          
-          // C. Materialize to Thread-Local Map
+          val resultBatch = aggOp.next() 
           val localMap = scala.collection.mutable.Map[Int, Long]()
-          
           if (resultBatch != null && resultBatch.count > 0) {
              val keys = new Array[Int](resultBatch.count)
-             val vals = new Array[Long](resultBatch.count) // HashAgg exports Longs (Sums)
-             
+             val vals = new Array[Long](resultBatch.count)
              NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
              NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
-             
              var i = 0
              while (i < resultBatch.count) {
                localMap(keys(i)) = vals(i)
                i += 1
              }
           }
-          
           aggOp.close()
           localMap
         }
       }
     }
-
-    // 4. Run Parallel Execution
     val partialResults = MorselExec.runParallel(tasks)
-
-    // 5. Merge Phase (Reduce)
     val finalMap = scala.collection.mutable.Map[Int, Long]()
     for (partial <- partialResults) {
       for ((k, v) <- partial) {
@@ -449,27 +548,19 @@ class AwanTable(
         finalMap(k) = current + v
       }
     }
-    
     finalMap.toMap
   }
 
-  // ---------------------------------------------------------
-  // CLEANUP
-  // ---------------------------------------------------------
   def close(): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) return
-      
       engineManager.stopEngine()
       engineManager.joinThread()
-      
       blockManager.close()
       wal.close()
       columns.values.foreach(_.close())
-      
       NativeBridge.freeMainStore(resultIndexBuffer)
-      
       isClosed = true 
     } finally {
       rwLock.writeLock().unlock()

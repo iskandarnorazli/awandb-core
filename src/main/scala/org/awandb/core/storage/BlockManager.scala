@@ -15,15 +15,16 @@
 
 package org.awandb.core.storage
 
-import java.io.File
+import java.io.{File, FileOutputStream, ObjectOutputStream, FileInputStream, ObjectInputStream}
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, CopyOnWriteArrayList}
 import scala.jdk.CollectionConverters._ 
 import org.awandb.core.jni.NativeBridge
-import org.awandb.core.util.UnsafeHelper // [NEW] Required for Header Patching
+import org.awandb.core.util.UnsafeHelper
 
 trait StorageRouter {
   def getPathForBlock(blockId: Int): String
   def getPathForFilter(blockId: Int): String
+  def getPathForBitmap(blockId: Int): String 
   def getDataDir: String
   def initialize(): Unit
 }
@@ -33,10 +34,11 @@ class SimpleStorageRouter(val dataDir: String) extends StorageRouter {
   override def getDataDir: String = dataDir
   override def getPathForBlock(blockId: Int): String = f"$dataDir/block_$blockId%05d.udb"
   override def getPathForFilter(blockId: Int): String = f"$dataDir/block_$blockId%05d.cuckoo"
+  override def getPathForBitmap(blockId: Int): String = f"$dataDir/block_$blockId%05d.del" 
 }
 
 // ==================================================================================
-// THREAD-SAFE BLOCK MANAGER (Lazy Indexing)
+// THREAD-SAFE BLOCK MANAGER (Lazy Indexing + Deletion Vectors)
 // ==================================================================================
 
 class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
@@ -46,15 +48,15 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
   private val blockCounter = new java.util.concurrent.atomic.AtomicInteger(0)
   
-  // [THREAD SAFETY] CopyOnWriteArrayList for lock-free reads
   private val loadedBlocks = new CopyOnWriteArrayList[Long]() 
   private val loadedFilters = new ConcurrentHashMap[Int, Long]() 
   private val pendingIndexes = new ConcurrentLinkedQueue[java.lang.Integer]()
+  private val deletionBitmaps = new ConcurrentHashMap[Long, java.util.BitSet]()
 
   router.initialize()
 
   /**
-   * RECOVERY: Loads blocks. If index file exists, load it. If not, queue it.
+   * RECOVERY: Loads blocks, filters, and [NEW] deletion bitmaps.
    */
   def recover(): Unit = {
     val dir = new File(router.getDataDir)
@@ -62,6 +64,7 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
     loadedBlocks.clear()
     loadedFilters.clear()
+    deletionBitmaps.clear()
 
     val files = dir.listFiles().filter(f => f.isFile && f.getName.endsWith(".udb") && f.getName.startsWith("block_"))
     val sortedFiles = files.sortBy(_.getName)
@@ -75,6 +78,9 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
           loadedBlocks.add(ptr)
           val blockIdx = loadedBlocks.size() - 1
           
+          // Load Deletions for this block immediately
+          loadBitmap(blockIdx, ptr)
+
           val name = file.getName
           val idPart = name.stripPrefix("block_").stripSuffix(".udb")
           val id = scala.util.Try(idPart.toInt).getOrElse(0)
@@ -112,19 +118,12 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     val currentId = blockCounter.getAndIncrement()
     
     // [STRATEGY: Over-Allocate, Then Patch]
-    // 1. Allocate 16x memory if strings are present to prevent C++ Heap Overflow.
-    //    This creates a valid block memory-wise, but metadata says "Rows = 16 * N".
     val allocationRows = if (hasString) rowCount * 16 else rowCount
     val blockPtr = NativeBridge.createBlock(allocationRows, colCount)
     
-    // 2. [PATCH] Immediately correct the header.
-    //    We overwrite row_count with the TRUE count. This ensures:
-    //    a) Scans stop at the correct row (fixing the 8M vs 500k bug).
-    //    b) Saves only write the valid data (fixing disk bloat).
-    // [PATCH] Correct the header row count (Offset 8)
-    if (hasString) {
-        UnsafeHelper.putInt(blockPtr, 8L, rowCount)
-    }
+    // [CRITICAL FIX] ALWAYS patch the header row count.
+    // This fixes the "0 items found" bug for Integer-only tables.
+    UnsafeHelper.putInt(blockPtr, 8L, rowCount)
     
     try {
         val dataArray = columnsData.toArray
@@ -134,18 +133,13 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
                case ints: Array[Int] =>
                    val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
                    NativeBridge.loadData(colPtr, ints)
-                   
                case strs: Array[String] =>
-                   // Safe now because physical memory is massive (16x)
                    NativeBridge.loadStringData(blockPtr, colIdx, strs)
-                   
                case _ => 
                    throw new IllegalArgumentException(s"Unsupported column type at index $colIdx")
            }
         }
         
-        // 4. Save to Disk
-        // saveColumn reads the header we patched, so it writes a compact file.
         val filename = router.getPathForBlock(currentId)
         val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename) 
         
@@ -169,7 +163,6 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
   def buildPendingIndexes(): Int = {
     val blockIdx = pendingIndexes.poll()
     if (blockIdx == null) return 0
-
     if (blockIdx >= loadedBlocks.size()) return 0 
     if (loadedFilters.containsKey(blockIdx)) return 0 
 
@@ -199,10 +192,64 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
   def getLoadedBlocks: scala.collection.Seq[Long] = loadedBlocks.asScala.toSeq
 
+  def saveBitmaps(): Unit = {
+    val it = loadedBlocks.iterator()
+    var idx = 0
+    while(it.hasNext) {
+      val ptr = it.next()
+      val bitset = deletionBitmaps.get(ptr)
+      
+      if (bitset != null && !bitset.isEmpty) {
+         val path = router.getPathForBitmap(idx)
+         try {
+           val fos = new FileOutputStream(path)
+           val oos = new ObjectOutputStream(fos)
+           oos.writeObject(bitset)
+           oos.close()
+         } catch {
+           case e: Exception => println(s"[BlockManager] Failed to save bitmap $idx: ${e.getMessage}")
+         }
+      }
+      idx += 1
+    }
+  }
+
+  private def loadBitmap(blockIdx: Int, blockPtr: Long): Unit = {
+    val path = router.getPathForBitmap(blockIdx)
+    val file = new File(path)
+    if (file.exists()) {
+       try {
+         val fis = new FileInputStream(file)
+         val ois = new ObjectInputStream(fis)
+         val bitset = ois.readObject().asInstanceOf[java.util.BitSet]
+         deletionBitmaps.put(blockPtr, bitset)
+         ois.close()
+         println(s"[BlockManager] Loaded Deletions for Block $blockIdx")
+       } catch {
+         case e: Exception => println(s"[BlockManager] Failed to load bitmap: ${e.getMessage}")
+       }
+    }
+  }
+
+  def markDeleted(blockPtr: Long, rowId: Int): Unit = {
+    deletionBitmaps.computeIfAbsent(blockPtr, _ => new java.util.BitSet()).set(rowId)
+  }
+
+  def isClean(blockPtr: Long): Boolean = {
+    val bitset = deletionBitmaps.get(blockPtr)
+    bitset == null || bitset.isEmpty
+  }
+
+  def isDeleted(blockPtr: Long, rowId: Int): Boolean = {
+    val bits = deletionBitmaps.get(blockPtr)
+    if (bits == null) false else bits.get(rowId)
+  }
+
   def close(): Unit = {
     loadedBlocks.asScala.foreach(NativeBridge.freeMainStore)
     loadedBlocks.clear()
     loadedFilters.values().asScala.foreach(NativeBridge.cuckooDestroy)
     loadedFilters.clear()
+    deletionBitmaps.clear()
   }
 }
