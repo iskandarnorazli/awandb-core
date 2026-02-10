@@ -5,3 +5,7 @@ target/
 *.log
 *.csv
 *.dll
+*.del
+*.udb
+*.dict
+*.wal
