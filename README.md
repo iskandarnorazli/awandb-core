@@ -157,7 +157,7 @@ resultOp.close()
 **1. Build Native Engine (C++)**
 
 ```bash
-cd src/main/resources/native
+cd src/main/cpp
 mkdir build && cd build
 cmake -G "Visual Studio 17 2022" -A x64 ..  # Or `cmake ..` on Linux
 cmake --build . --config Release
