@@ -13,7 +13,7 @@ jobs:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # If Windows fails, don't kill Linux immediately (let us see results)
+      fail-fast: false # If Windows fails, don't kill Linux immediately
       matrix:
         include:
           - os: ubuntu-latest
@@ -30,7 +30,7 @@ jobs:
             lib_path: "build"
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       # 1. We need Java installed to run SBT tests!
       - uses: actions/setup-java@v3
@@ -55,14 +55,16 @@ jobs:
           echo "Running Tests with Lib Path: ../${{ matrix.lib_path }}"
           sbt -Djava.library.path=../${{ matrix.lib_path }} test
 
+      # 3. Upload Artifact (Updated to v4)
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: native-lib-${{ matrix.os }}
           path: |
             build/Release/*.dll
             build/*.so
             build/*.dylib
+          if-no-files-found: error
 
   # ---------------------------------------------------
   # JOB 2: Package the Fat JAR (Only if ALL tests pass)
@@ -71,39 +73,46 @@ jobs:
     needs: build_and_test # <--- Blocks until ALL OSs pass tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
           java-version: '21'
 
-      # 1. Download ALL verified libraries
+      # 1. Download ALL verified libraries (Updated to v4)
+      # Note: v4 downloads do not create a directory for the artifact name by default if 'path' is set.
+      # It downloads the file directly into the specified path.
+      
       - name: Download Windows Lib
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: native-lib-windows-latest
           path: awandb-core/src/main/resources/native/
           
       - name: Download Linux Lib
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: native-lib-ubuntu-latest
           path: awandb-core/src/main/resources/native/
 
       - name: Download Mac Lib
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: native-lib-macos-latest
           path: awandb-core/src/main/resources/native/
 
-      # 2. Build the "Magic JAR"
+      # 2. Verify files are present (Debug step)
+      - name: Verify Native Libs
+        run: ls -R awandb-core/src/main/resources/native/
+
+      # 3. Build the "Magic JAR"
       # We skip tests here (sbt assembly) because we already tested inside the matrix!
       - name: Build SBT Assembly
         run: |
           cd awandb-core
           sbt 'set test in assembly := {}' assembly
 
-      # 3. Create Release
+      # 4. Create Release
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
