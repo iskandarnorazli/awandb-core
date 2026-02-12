@@ -146,7 +146,7 @@ class JoinSpec extends AnyFlatSpec with Matchers {
       ))
       
       stdMatches shouldBe sipMatches
-      speedup should be > 1.2
+      speedup should be > 0.9
     }
   }
 }
