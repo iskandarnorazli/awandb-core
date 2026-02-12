@@ -1,19 +1,20 @@
 name := "AwanDB"
-version := "0.1"
+version := "0.1.0-alpha" // Updated to match your release tag
 scalaVersion := "3.3.5"
 
 // --- Run Configuration ---
 fork := true
 run / connectInput := true 
 
-// [CRITICAL] Tell GraalVM where the 'main' function lives
+// [CRITICAL] Default main class (Flight Server)
 Compile / mainClass := Some("org.awandb.server.AwanFlightServer")
 
-// Define the path INSIDE the setting assignment using .value
+// Native Library Path Support
+// We look in 'lib/Release' for local dev and 'src/main/resources/native' for the embedded logic
 run / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 Test / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 
-// Ensure tests run sequentially to avoid "Zombie Data" race conditions
+// Ensure tests run sequentially to avoid JNI memory race conditions
 Test / parallelExecution := false
 
 // --- Dependencies ---
@@ -40,7 +41,9 @@ libraryDependencies ++= Seq(
 )
 
 // --- Assembly (Fat JAR) Configuration ---
+// This ensures that the DLL, SO, and DYLIB files built by GitHub are all included
 assembly / assemblyMergeStrategy := {
+  case PathList("native", xs @ _*) => MergeStrategy.first // Keep our native engines
   case PathList("META-INF", xs @ _*) =>
     xs map {_.toLowerCase} match {
       case "services" :: xs => MergeStrategy.filterDistinctLines
@@ -53,8 +56,6 @@ assembly / assemblyMergeStrategy := {
 // --- GraalVM Native Image Configuration ---
 enablePlugins(NativeImagePlugin)
 
-// [CRITICAL FIX] Use GraalVM Community Edition 21 (Java 21)
-// This forces SBT to ignore your old local installation and download a compatible one.
 nativeImageVersion := "21.0.2"
 nativeImageJvm := "graalvm-java21" 
 
@@ -62,9 +63,12 @@ nativeImageOptions ++= Seq(
   "--no-fallback",
   "--allow-incomplete-classpath",
   "--enable-url-protocols=http,https",
-  "-H:+JNI",                      // Allow JNI access (for C++ Engine)
+  "-H:+JNI",                      
   "-H:+ReportExceptionStackTraces",
+  // Essential for JSqlParser and Arrow to work in a binary
   "--initialize-at-build-time=org.slf4j",
-  "--initialize-at-run-time=io.netty",   // Netty must initialize at runtime
-  "--initialize-at-run-time=org.apache.arrow.memory.NettyAllocationManager"
+  "--initialize-at-run-time=io.netty",   
+  "--initialize-at-run-time=org.apache.arrow.memory.NettyAllocationManager",
+  // Allow the engine to see its own native methods
+  "-H:IncludeResources=native/.*" 
 )

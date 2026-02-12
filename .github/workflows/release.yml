@@ -6,6 +6,9 @@ on:
       - 'v*'
 
 jobs:
+  # ---------------------------------------------------
+  # JOB 1: Build & Test Native Engines (Matrix)
+  # ---------------------------------------------------
   build_and_test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -14,42 +17,47 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: libawan_engine_core.so
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
             lib_path: "build"
           - os: windows-latest
-            artifact_name: awan_engine_core.dll
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
             lib_path: "build/Release"
           - os: macos-latest
-            artifact_name: libawan_engine_core.dylib
-            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64'"
+            # [FIX] Force universal binary support and standard optimization to avoid CPU mismatch errors
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' -DCMAKE_CXX_FLAGS='-O3'"
             lib_path: "build"
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v3
+      - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
+          cache: 'sbt'
+
+      # [FIX] Manually install SBT on Ubuntu (it is not pre-installed on the default runner)
+      - name: Install SBT (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | sudo tee /etc/apt/sources.list.d/sbt.list
+          echo "deb https://repo.scala-sbt.org/scalasbt/debian /" | sudo tee /etc/apt/sources.list.d/sbt_old.list
+          curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | sudo apt-key add
+          sudo apt-get update
+          sudo apt-get install sbt
 
       - name: Build C++ Engine
         shell: bash
         run: |
           mkdir build
           cd build
-          # [FIX] Removed 'awandb-core' from path. 
-          # We are in 'build', so '../src' points correctly to the source root.
           cmake ../src/main/cpp ${{ matrix.cmake_flags }}
           cmake --build . --config Release
 
       - name: Run Scala Tests
         shell: bash
         run: |
-          # [FIX] No need to cd into 'awandb-core' if this is the repo root.
-          # If your build.sbt is in the root, remove 'cd awandb-core'
-          echo "Running Tests with Lib Path: ../${{ matrix.lib_path }}"
+          # Use -Djava.library.path so NativeBridge finds the DLL/SO just built
           sbt -Djava.library.path=../${{ matrix.lib_path }} test
 
       - name: Upload Artifact
@@ -62,44 +70,43 @@ jobs:
             build/*.dylib
           if-no-files-found: error
 
+  # ---------------------------------------------------
+  # JOB 2: Package the Fat JAR
+  # ---------------------------------------------------
   package_jar:
     needs: build_and_test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v3
+      
+      - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
+          cache: 'sbt'
 
-      - name: Download Windows Lib
-        uses: actions/download-artifact@v4
-        with:
-          name: native-lib-windows-latest
-          path: src/main/resources/native/ # [FIX] Adjusted path assuming repo root
-          
-      - name: Download Linux Lib
-        uses: actions/download-artifact@v4
-        with:
-          name: native-lib-ubuntu-latest
-          path: src/main/resources/native/
+      # Install SBT for the final assembly stage
+      - name: Install SBT
+        run: |
+          echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | sudo tee /etc/apt/sources.list.d/sbt.list
+          curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | sudo apt-key add
+          sudo apt-get update
+          sudo apt-get install sbt
 
-      - name: Download Mac Lib
+      - name: Download All Native Libs
         uses: actions/download-artifact@v4
         with:
-          name: native-lib-macos-latest
           path: src/main/resources/native/
+          pattern: native-lib-*
+          merge-multiple: true # Flattens all OS-specific binaries into one resource folder
 
       - name: Verify Native Libs
         run: ls -R src/main/resources/native/
 
       - name: Build SBT Assembly
-        run: |
-          # [FIX] Removed 'cd awandb-core' assuming we are at root
-          sbt 'set test in assembly := {}' assembly
+        run: sbt 'set test in assembly := {}' assembly
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          # [FIX] Adjusted target path
           files: target/scala-3.3.5/AwanDB-assembly-*.jar
