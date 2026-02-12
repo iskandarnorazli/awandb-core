@@ -49,23 +49,25 @@ jobs:
           cmake ../src/main/cpp ${{ matrix.cmake_flags }}
           cmake --build . --config Release
 
-      # [NEW STEP] Deploy binaries to where SBT expects them
+      # [NEW STEP] Deploy binaries using 'find' to handle inconsistent build paths
       - name: Deploy Native Binaries for Test
         shell: bash
         run: |
-          # Create the target directory structure
           mkdir -p lib/Release
+          echo "Searching for artifacts in build/..."
           
-          # Copy the built artifacts
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp build/Release/*.dll lib/Release/
+            # Windows puts it in build/Release/Release/
+            find build -name "awan_engine_core.dll" -print -exec cp {} lib/Release/ \;
           elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            cp build/*.dylib lib/Release/
+            # Mac usually puts it in build/Release/
+            find build -name "*.dylib" -print -exec cp {} lib/Release/ \;
           else
-            cp build/*.so lib/Release/
+            # Linux usually puts it in build/Release/
+            find build -name "*.so" -print -exec cp {} lib/Release/ \;
           fi
           
-          # Verify copy
+          echo "✅ Artifacts deployed to lib/Release:"
           ls -R lib/Release/
 
       - name: Run Scala Tests
