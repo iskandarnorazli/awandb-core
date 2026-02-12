@@ -1,7 +1,21 @@
+/*
+ * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+*/
+
 package org.awandb.core.jni
 
 import java.io.File
-import java.nio.file.{Files, StandardCopyOption} // [NEW] Required for extraction
 
 // -----------------------------------------------------------
 // 1. THE JNI CLASS (Defines the native interface)
@@ -122,77 +136,32 @@ class NativeBridge {
 object NativeBridge {
   
   // =========================================================
-  // [UPDATED] DYNAMIC LIBRARY LOADING (Embedded Support)
+  // DYNAMIC LIBRARY LOADING
   // =========================================================
-  private val loadedMode: String = loadEmbeddedLibrary()
-  private val instance = new NativeBridge()
-
-  /**
-   * Attempts to load the native library in the following order:
-   * 1. Internal JAR Resources (Preferred for Distribution)
-   * 2. System Library Path (Fallback for Local Dev)
-   */
-  private def loadEmbeddedLibrary(): String = {
-    val os = System.getProperty("os.name").toLowerCase
-    val isWindows = os.contains("win")
-    
-    // Define target libraries (Enterprise first, then Core)
-    val targets = if (isWindows) {
-      Seq("awan_engine_ent.dll", "awan_engine_core.dll")
-    } else {
-      Seq("libawan_engine_ent.so", "libawan_engine_core.so")
-    }
-
-    // A. TRY LOADING FROM RESOURCES (The Magic JAR way)
-    for (libName <- targets) {
-      val resourcePath = s"/native/$libName"
-      val stream = getClass.getResourceAsStream(resourcePath)
-      
-      if (stream != null) {
-        try {
-          // Extract to temp folder so OS can load it
-          val tempDir = Files.createTempDirectory("awandb_native")
-          val tempFile = tempDir.resolve(libName)
-          
-          Files.copy(stream, tempFile, StandardCopyOption.REPLACE_EXISTING)
-          tempFile.toFile.deleteOnExit() // Auto-cleanup
-          
-          // Load the extracted file
-          System.load(tempFile.toAbsolutePath.toString)
-          
-          val mode = if (libName.contains("ent")) "ENT" else "OSS"
-          println(s"[NativeBridge] MODE: $mode (Loaded embedded $libName)")
-          return mode
-        } catch {
-          case e: Exception =>
-            println(s"[NativeBridge] Warning: Failed to extract embedded $libName: ${e.getMessage}")
-        }
-      }
-    }
-
-    // B. FALLBACK TO SYSTEM PATH (The 'sbt run' way)
+  private val loadedLibrary: String = {
     try {
       System.loadLibrary("awan_engine_ent")
-      println("[NativeBridge] MODE: Enterprise (Loaded from System Path)")
+      println("[NativeBridge] MODE: Enterprise Edition (Hardware Aware & Secured)")
       "ENT"
     } catch {
       case _: UnsatisfiedLinkError =>
         try {
           System.loadLibrary("awan_engine_core")
-          println("[NativeBridge] MODE: Open Source Core (Loaded from System Path)")
+          println("[NativeBridge] MODE: Open Source Core (Standard Engine)")
           "OSS"
         } catch {
           case e: UnsatisfiedLinkError =>
-            println("\n!! CRITICAL ERROR !! Could not load AwanDB Native Engine.")
-            println("1. Checked JAR Resources (/native/) -> Not Found.")
-            println("2. Checked System Path (java.library.path) -> Not Found.")
+            println("!! CRITICAL ERROR !! Could not load 'awan_engine_ent' OR 'awan_engine_core'.")
+            println("Ensure .dll/.so files are in java.library.path.")
             throw e
         }
     }
   }
 
+  private val instance = new NativeBridge()
+
   def init(): Unit = {
-    if (loadedMode == "ENT") {
+    if (loadedLibrary == "ENT") {
       try {
         instance.initHardwareTopology()
         println("[NativeBridge] Hardware Topology Initialized.")
@@ -204,7 +173,7 @@ object NativeBridge {
   }
 
   // =========================================================
-  // PUBLIC API WRAPPERS (Unchanged)
+  // PUBLIC API WRAPPERS
   // =========================================================
 
   // --- Memory ---
@@ -332,17 +301,17 @@ object NativeBridge {
   
   // DIRECT POINTER VERSION (For high speed)
   def computeHashNativePtr(blockPtr: Long, colIdx: Int): Long = {
-      val rows = getRowCount(blockPtr)
-      // Allocate native buffer for Hashes (8 bytes per row)
-      // allocMainStore allocates 4-byte chunks. So we need rows * 2.
-      val hashPtr = allocMainStore(rows * 2) 
-      instance.avxHashVectorNative(blockPtr, colIdx, hashPtr)
-      hashPtr
+     val rows = getRowCount(blockPtr)
+     // Allocate native buffer for Hashes (8 bytes per row)
+     // allocMainStore allocates 4-byte chunks. So we need rows * 2.
+     val hashPtr = allocMainStore(rows * 2) 
+     instance.avxHashVectorNative(blockPtr, colIdx, hashPtr)
+     hashPtr
   }
   
   // Helper to read a specific hash back (for testing)
   def getHashAt(hashPtr: Long, index: Int): Long = {
-      0L 
+     0L 
   }
 
   def getHashes(hashPtr: Long, count: Int): Array[Long] = {
@@ -363,16 +332,16 @@ object NativeBridge {
 
   // Hardware Discovery Wrapper
   def getHardwareInfo(): (Int, Long) = {
-      // If native lib not loaded yet (e.g. tests), return default
-      if (instance == null) return (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
-      
-      try {
-        val info = instance.getSystemTopologyNative()
-        // Info: [0] = Cores, [1] = L3 Cache Bytes
-        (info(0).toInt, info(1))
-      } catch {
-        case _: UnsatisfiedLinkError => (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
-      }
+     // If native lib not loaded yet (e.g. tests), return default
+     if (instance == null) return (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
+     
+     try {
+       val info = instance.getSystemTopologyNative()
+       // Info: [0] = Cores, [1] = L3 Cache Bytes
+       (info(0).toInt, info(1))
+     } catch {
+       case _: UnsatisfiedLinkError => (Runtime.getRuntime.availableProcessors(), 12 * 1024 * 1024L)
+     }
   }
 
   // --- Dictionary Encoding Public API ---

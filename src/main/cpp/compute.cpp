@@ -248,7 +248,10 @@ extern "C" {
     }
 
     // --- UTILS ---
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_batchRead(JNIEnv* env, jobject obj, jlong colPtr, jlong indicesPtr, jint count, jlong outDataPtr) {
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_batchReadNative(
+        JNIEnv* env, jobject obj, jlong colPtr, jlong indicesPtr, jint count, jlong outDataPtr
+    ) {
         if (colPtr == 0 || indicesPtr == 0 || outDataPtr == 0) return;
         int* data = (int*)colPtr;
         int* indices = (int*)indicesPtr;
