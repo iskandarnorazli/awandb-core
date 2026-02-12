@@ -18,21 +18,28 @@
 #include "cuckoo.h"
 
 extern "C" {
+    // --- LIFECYCLE ---
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooCreateNative(JNIEnv* env, jobject obj, jint capacity) {
         CuckooFilter* filter = new (std::nothrow) CuckooFilter(capacity);
         return (jlong)filter;
     }
+
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooDestroyNative(JNIEnv* env, jobject obj, jlong ptr) {
         if (ptr != 0) delete (CuckooFilter*)ptr;
     }
+
+    // --- SCALAR OPERATIONS ---
     JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooInsertNative(JNIEnv* env, jobject obj, jlong ptr, jint key) {
         if (ptr == 0) return false;
         return ((CuckooFilter*)ptr)->insert(key);
     }
+
     JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooContainsNative(JNIEnv* env, jobject obj, jlong ptr, jint key) {
         if (ptr == 0) return false;
         return ((CuckooFilter*)ptr)->contains(key);
     }
+
+    // --- PERSISTENCE ---
     JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooSaveNative(JNIEnv* env, jobject obj, jlong ptr, jstring path) {
         if (ptr == 0) return false;
         const char* p = env->GetStringUTFChars(path, nullptr);
@@ -40,24 +47,30 @@ extern "C" {
         env->ReleaseStringUTFChars(path, p);
         return res;
     }
+
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooLoadNative(JNIEnv* env, jobject obj, jstring path) {
         const char* p = env->GetStringUTFChars(path, nullptr);
         CuckooFilter* filter = CuckooFilter::load(p);
         env->ReleaseStringUTFChars(path, p);
         return (jlong)filter;
     }
+
+    // --- BATCH OPERATIONS ---
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooBuildBatchNative(JNIEnv* env, jobject obj, jlong ptr, jintArray jData) {
         if (ptr == 0) return;
         CuckooFilter* filter = (CuckooFilter*)ptr;
         jint* data = (jint*)env->GetPrimitiveArrayCritical(jData, nullptr);
         jsize len = env->GetArrayLength(jData);
+        
+        // Uses the hardware-aware prefetch logic in cuckoo.h
         filter->insert_batch((int32_t*)data, (size_t)len);
+        
         env->ReleasePrimitiveArrayCritical(jData, data, 0);
     }
 
     // [CRITICAL FIX] 
-    // Java expects int[] (4 bytes per element), but C++ was writing bytes (1 byte).
-    // We must cast the output pointer to int32_t* and write 32-bit integers.
+    // Matches Java's int[] (4 bytes) expectation.
+    // Writes 1 (true) or 0 (false) as 32-bit integers.
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_cuckooProbeBatchNative(
         JNIEnv* env, jobject obj, jlong ptr, jlong keysPtr, jint count, jlong outPtr
     ) {
@@ -65,11 +78,10 @@ extern "C" {
         
         CuckooFilter* filter = (CuckooFilter*)ptr;
         int32_t* keys = (int32_t*)keysPtr;
-        int32_t* out = (int32_t*)outPtr; // Treat output as INT array (4 bytes stride)
+        int32_t* out = (int32_t*)outPtr; 
         
-        // We cannot use the default 'contains_batch' if it writes bytes.
-        // We run the loop here to ensure 32-bit writes.
-        // (Compiler will vectorize this loop automatically via AVX2)
+        // Compiler will auto-vectorize this loop where possible.
+        // Manual SIMD here is inefficient due to random memory access (gather/scatter).
         for(int i=0; i<count; i++) {
             out[i] = filter->contains(keys[i]) ? 1 : 0;
         }

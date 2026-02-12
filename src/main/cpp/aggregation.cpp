@@ -16,11 +16,13 @@
 
 #include "common.h"
 #include <cstring>
-#include <cstdio> // For printf debugging
+#include <cstdio> 
+#include <new> // [FIX] Required for std::nothrow
 
 // ---------------------------------------------------------
 // HIGH-PERFORMANCE HASH MAP (Linear Probing)
 // Optimized for: GROUP BY key SUM(val)
+// NOTE: This uses Scalar C++ and is cross-platform (Intel/ARM) by default.
 // ---------------------------------------------------------
 struct NativeHashMap {
     int* keys;          // Stored Group IDs (Keys)
@@ -43,9 +45,7 @@ struct NativeHashMap {
         mask = capacity - 1;
         size = 0;
 
-        //printf("[NativeHashMap] Init: Input=%zu, Target=%zu, Capacity=%zu, Mask=%zu\n", input_size, target, capacity, mask);
-
-        // Aligned Allocation for AVX
+        // Aligned Allocation for AVX/NEON compatibility
         keys = (int*)alloc_aligned(capacity * sizeof(int));
         values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
@@ -58,7 +58,8 @@ struct NativeHashMap {
             // Keys don't strictly need zeroing if occupied is 0, but good for safety
             std::memset(keys, 0, capacity * sizeof(int)); 
         } else {
-            printf("[NativeHashMap] ERROR: Allocation Failed!\n");
+            // Handle OOM gracefully if possible, though constructor can't return error easily.
+            // Caller checks for null map pointer.
         }
     }
 
@@ -108,9 +109,7 @@ struct NativeHashMap {
             }
         }
         
-        if (collisions > count / 10) {
-             printf("[NativeHashMap] Batch Processed. Collisions: %zu\n", collisions);
-        }
+        // if (collisions > count / 10) printf("[NativeHashMap] High Collisions: %zu\n", collisions);
     }
 
     int32_t export_to_arrays(int* outKeys, int64_t* outValues) {
@@ -122,7 +121,6 @@ struct NativeHashMap {
                 count++;
             }
         }
-        //printf("[NativeHashMap] Exporting %d groups (Internal Size: %zu)\n", count, size);
         return count;
     }
 };
@@ -130,7 +128,6 @@ struct NativeHashMap {
 extern "C" {
     // --------------------------------------------------------
     // AGGREGATION WRAPPERS ONLY
-    // (Do NOT include storage functions here!)
     // --------------------------------------------------------
 
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateSumNative(

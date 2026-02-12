@@ -4,10 +4,8 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
+ * * http://www.apache.org/licenses/LICENSE-2.0
+ * * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -19,7 +17,7 @@
 
 #include <cstdint>
 #include <cstring>
-#include <immintrin.h>
+#include "common.h" // [CRITICAL] Include common to see ARCH definitions
 
 // ==============================================================================
 // THE GERMAN STRING (Fixed 16-Byte Layout)
@@ -94,10 +92,21 @@ struct GermanString {
         }
     }
     
-    // Load into SIMD Register for Vectorized comparison
+    // --- SIMD SUPPORT (Cross-Platform) ---
+#ifdef ARCH_X86
+    // Intel/AMD: Load into 128-bit AVX register
     inline __m128i toSIMD() const {
         return _mm_loadu_si128((const __m128i*)this);
     }
+#elif defined(ARCH_ARM)
+    // ARM/Apple Silicon: Load into 128-bit NEON register
+    inline uint8x16_t toSIMD() const {
+        return vld1q_u8((const uint8_t*)this);
+    }
+#else
+    // Fallback stub for generic CPUs (rarely used)
+    inline void* toSIMD() const { return nullptr; }
+#endif
 };
 
 #endif

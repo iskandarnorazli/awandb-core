@@ -16,13 +16,19 @@
 
 #include "common.h"
 #include <cstring> // for std::memset, std::memcpy
+#include <cstdlib> // [FIX] Required for posix_memalign & free on Linux/Mac
 
 void* alloc_aligned(size_t size) {
+    // 64-byte alignment is optimal for:
+    // 1. Cache Lines (64 bytes on most x86/ARM CPUs)
+    // 2. AVX2/AVX-512 registers (32/64 bytes)
+    // 3. NEON registers (16 bytes, so 64 is safe)
     size_t alignment = 64; 
 #ifdef _WIN32
     return _aligned_malloc(size, alignment);
 #else
     void* ptr = nullptr;
+    // posix_memalign returns 0 on success
     if (posix_memalign(&ptr, alignment, size) != 0) return nullptr;
     return ptr;
 #endif
@@ -40,8 +46,13 @@ void free_aligned(void* ptr) {
 extern "C" {
     // JNI Wrappers for Memory
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_allocMainStoreNative(JNIEnv* env, jobject obj, jlong num_elements) {
+        // [SAFETY] Prevent negative allocation
+        if (num_elements < 0) return 0;
+
         size_t bytes = (size_t)num_elements * sizeof(int);
         void* ptr = alloc_aligned(bytes);
+        
+        // [SAFETY] Always zero-init to prevent "Ghost Data" bugs
         if (ptr) std::memset(ptr, 0, bytes);
         return (jlong)ptr;
     }
@@ -51,10 +62,11 @@ extern "C" {
     }
 
     // Allows Scala to get a pointer to an offset without copying data.
+    // Critical for Zero-Copy Arrow Flight.
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getOffsetPointerNative(
         JNIEnv* env, jobject obj, jlong basePtr, jlong offsetBytes
     ) {
-        // Just return the address + offset
+        if (basePtr == 0) return 0;
         return basePtr + offsetBytes; 
     }
 

@@ -21,8 +21,17 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
-#include <new>         // <--- Added for std::nothrow
-#include <xmmintrin.h> // For _mm_prefetch
+#include <new>
+
+// --- PREFETCH PORTABILITY WRAPPER ---
+#if defined(_MSC_VER)
+    #include <xmmintrin.h> // Required for _mm_prefetch on MSVC
+    #define PREFETCH_READ(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T0)
+#else
+    // GCC / Clang (Linux, macOS, ARM) use builtin
+    // 0 = Read, 3 = High Temporal Locality (keep in cache)
+    #define PREFETCH_READ(ptr) __builtin_prefetch((const void*)(ptr), 0, 3)
+#endif
 
 #define BUCKET_SIZE 4
 #define MAX_KICKS 500
@@ -87,7 +96,7 @@ public:
         return (fp == 0) ? 1 : fp; 
     }
 
-    // [OPTIMIZATION] Batch Insert with Prefetching
+    // [OPTIMIZATION] Batch Insert with Cross-Platform Prefetching
     // Pipelining memory requests hides RAM latency (the biggest bottleneck).
     void insert_batch(int32_t* keys, size_t n) {
         const int PREFETCH_DIST = 16;
@@ -100,8 +109,8 @@ public:
                 uint32_t h = hash(next_key);
                 uint32_t idx = h & (num_buckets - 1);
                 
-                // _MM_HINT_T0 = Temporal Data (Keep in all levels of cache)
-                _mm_prefetch((const char*)&buckets[idx], _MM_HINT_T0);
+                // USE PORTABLE MACRO
+                PREFETCH_READ(&buckets[idx]);
             }
             
             // 2. Insert Current

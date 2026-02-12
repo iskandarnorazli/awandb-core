@@ -15,11 +15,12 @@
 */
 
 #include "common.h"
-#include <immintrin.h>
+
+// Note: <immintrin.h> and <arm_neon.h> are handled in common.h
 
 extern "C" {
 
-    // --- UNPACK 8-BIT -> 32-BIT (AVX2) ---
+    // --- UNPACK 8-BIT -> 32-BIT (Hybrid) ---
     // Expands 8 compressed bytes into 8 32-bit integers.
     // Speed: ~30-40 GB/s throughput
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_unpack8To32Native(
@@ -31,25 +32,18 @@ extern "C" {
         int32_t* dst = (int32_t*)dstPtr;
         
         int i = 0;
+
+// =========================================================
+// PATH A: INTEL / AMD (AVX2 - 256 bit)
+// =========================================================
+#ifdef ARCH_X86
         int limit = count - 32; 
         
         // Process 32 integers (32 bytes) per iteration using AVX2
         for (; i <= limit; i += 32) {
-            // Load 32 bytes (256 bits) -> This contains 32 integers!
-            __m256i vRaw = _mm256_loadu_si256((__m256i*)&src[i]);
-            
-            // We need to expand these 8-bit ints into 32-bit ints.
-            // AVX2 'pmovzxbd' (Packed Move Zero-Extend Byte to Dword) takes 128-bit chunks.
-            
-            // Lane 1: Bytes 0-7
-            __m128i chunk1 = _mm256_castsi256_si128(vRaw);
-            _mm256_storeu_si256((__m256i*)&dst[i], _mm256_cvtepu8_epi32(chunk1));
-            
-            // Lane 2: Bytes 8-15
-            // Extract upper 128 bits isn't direct in C intrinsic for cvt, so we shift/permute or just load simpler.
-            // Actually, simpler strategy: Load 8 bytes (64 bits) -> Expand to 256 bits (8 ints)
-            
             // RELOAD STRATEGY (Simpler code, still fast)
+            // Load 8 bytes (64 bits) -> Expand to 256 bits (8 ints)
+            
             // Group 0 (0-7)
             __m128i lo = _mm_loadu_si64((const void*)&src[i]); 
             _mm256_storeu_si256((__m256i*)&dst[i], _mm256_cvtepu8_epi32(lo));
@@ -66,6 +60,37 @@ extern "C" {
             __m128i lo4 = _mm_loadu_si64((const void*)&src[i+24]); 
             _mm256_storeu_si256((__m256i*)&dst[i+24], _mm256_cvtepu8_epi32(lo4));
         }
+
+// =========================================================
+// PATH B: APPLE SILICON / ARM (NEON - 128 bit)
+// =========================================================
+#elif defined(ARCH_ARM)
+        int limit = count - 16;
+        for (; i <= limit; i += 16) {
+            // Load 16 bytes (128 bits) -> contains 16 integers
+            uint8x16_t raw = vld1q_u8(&src[i]);
+
+            // Step 1: Widen 8 -> 16 bit
+            // vmovl_u8 takes lower/upper half (8x8) and widens to 8x16
+            uint16x8_t mid_low  = vmovl_u8(vget_low_u8(raw));
+            uint16x8_t mid_high = vmovl_u8(vget_high_u8(raw));
+
+            // Step 2: Widen 16 -> 32 bit
+            // Expand the mid_low part (first 8 ints)
+            uint32x4_t dst0 = vmovl_u16(vget_low_u16(mid_low));   // 0-3
+            uint32x4_t dst1 = vmovl_u16(vget_high_u16(mid_low));  // 4-7
+
+            // Expand the mid_high part (last 8 ints)
+            uint32x4_t dst2 = vmovl_u16(vget_low_u16(mid_high));  // 8-11
+            uint32x4_t dst3 = vmovl_u16(vget_high_u16(mid_high)); // 12-15
+
+            // Step 3: Store
+            vst1q_u32((uint32_t*)&dst[i],    dst0);
+            vst1q_u32((uint32_t*)&dst[i+4],  dst1);
+            vst1q_u32((uint32_t*)&dst[i+8],  dst2);
+            vst1q_u32((uint32_t*)&dst[i+12], dst3);
+        }
+#endif
         
         // Scalar Tail
         for (; i < count; i++) {
@@ -73,7 +98,7 @@ extern "C" {
         }
     }
 
-    // --- UNPACK 16-BIT -> 32-BIT (AVX2) ---
+    // --- UNPACK 16-BIT -> 32-BIT (Hybrid) ---
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_unpack16To32Native(
         JNIEnv* env, jobject obj, jlong srcPtr, jlong dstPtr, jint count
     ) {
@@ -83,8 +108,12 @@ extern "C" {
         int32_t* dst = (int32_t*)dstPtr;
         
         int i = 0;
+
+// =========================================================
+// PATH A: INTEL / AMD (AVX2)
+// =========================================================
+#ifdef ARCH_X86
         int limit = count - 16;
-        
         for (; i <= limit; i += 16) {
             // Group 0 (0-7): Load 8 shorts (128 bits) -> Expand to 8 ints (256 bits)
             __m128i v0 = _mm_loadu_si128((__m128i*)&src[i]);
@@ -94,6 +123,25 @@ extern "C" {
             __m128i v1 = _mm_loadu_si128((__m128i*)&src[i+8]);
             _mm256_storeu_si256((__m256i*)&dst[i+8], _mm256_cvtepu16_epi32(v1));
         }
+
+// =========================================================
+// PATH B: APPLE SILICON / ARM (NEON)
+// =========================================================
+#elif defined(ARCH_ARM)
+        int limit = count - 8;
+        for (; i <= limit; i += 8) {
+            // Load 8 shorts (128 bits)
+            uint16x8_t raw = vld1q_u16(&src[i]);
+
+            // Widen 16 -> 32 bit
+            uint32x4_t dst0 = vmovl_u16(vget_low_u16(raw));  // 0-3
+            uint32x4_t dst1 = vmovl_u16(vget_high_u16(raw)); // 4-7
+
+            // Store
+            vst1q_u32((uint32_t*)&dst[i],   dst0);
+            vst1q_u32((uint32_t*)&dst[i+4], dst1);
+        }
+#endif
         
         // Scalar Tail
         for (; i < count; i++) {
