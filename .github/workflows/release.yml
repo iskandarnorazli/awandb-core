@@ -3,27 +3,24 @@ name: Build AwanDB Universal
 on:
   push:
     tags:
-      - 'v*' # Run only when you push a tag like v0.1
+      - 'v*'
 
 jobs:
-  # ---------------------------------------------------
-  # JOB 1: Build & Test Native Engines (Matrix)
-  # ---------------------------------------------------
   build_and_test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # If Windows fails, don't kill Linux immediately
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             artifact_name: libawan_engine_core.so
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
-            lib_path: "build" # Linux puts .so here
+            lib_path: "build"
           - os: windows-latest
             artifact_name: awan_engine_core.dll
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
-            lib_path: "build/Release" # MSVC puts .dll here
+            lib_path: "build/Release"
           - os: macos-latest
             artifact_name: libawan_engine_core.dylib
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64'"
@@ -32,7 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. We need Java installed to run SBT tests!
       - uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
@@ -43,19 +39,19 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake ../awandb-core/src/main/cpp ${{ matrix.cmake_flags }}
+          # [FIX] Removed 'awandb-core' from path. 
+          # We are in 'build', so '../src' points correctly to the source root.
+          cmake ../src/main/cpp ${{ matrix.cmake_flags }}
           cmake --build . --config Release
 
-      # 2. THE CRITICAL STEP: Run SBT Tests against the fresh library
-      # We pass -Djava.library.path so NativeBridge finds the DLL/SO we just built.
       - name: Run Scala Tests
         shell: bash
         run: |
-          cd awandb-core
+          # [FIX] No need to cd into 'awandb-core' if this is the repo root.
+          # If your build.sbt is in the root, remove 'cd awandb-core'
           echo "Running Tests with Lib Path: ../${{ matrix.lib_path }}"
           sbt -Djava.library.path=../${{ matrix.lib_path }} test
 
-      # 3. Upload Artifact (Updated to v4)
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -66,11 +62,8 @@ jobs:
             build/*.dylib
           if-no-files-found: error
 
-  # ---------------------------------------------------
-  # JOB 2: Package the Fat JAR (Only if ALL tests pass)
-  # ---------------------------------------------------
   package_jar:
-    needs: build_and_test # <--- Blocks until ALL OSs pass tests
+    needs: build_and_test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,41 +72,34 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      # 1. Download ALL verified libraries (Updated to v4)
-      # Note: v4 downloads do not create a directory for the artifact name by default if 'path' is set.
-      # It downloads the file directly into the specified path.
-      
       - name: Download Windows Lib
         uses: actions/download-artifact@v4
         with:
           name: native-lib-windows-latest
-          path: awandb-core/src/main/resources/native/
+          path: src/main/resources/native/ # [FIX] Adjusted path assuming repo root
           
       - name: Download Linux Lib
         uses: actions/download-artifact@v4
         with:
           name: native-lib-ubuntu-latest
-          path: awandb-core/src/main/resources/native/
+          path: src/main/resources/native/
 
       - name: Download Mac Lib
         uses: actions/download-artifact@v4
         with:
           name: native-lib-macos-latest
-          path: awandb-core/src/main/resources/native/
+          path: src/main/resources/native/
 
-      # 2. Verify files are present (Debug step)
       - name: Verify Native Libs
-        run: ls -R awandb-core/src/main/resources/native/
+        run: ls -R src/main/resources/native/
 
-      # 3. Build the "Magic JAR"
-      # We skip tests here (sbt assembly) because we already tested inside the matrix!
       - name: Build SBT Assembly
         run: |
-          cd awandb-core
+          # [FIX] Removed 'cd awandb-core' assuming we are at root
           sbt 'set test in assembly := {}' assembly
 
-      # 4. Create Release
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          files: awandb-core/target/scala-3.3.5/AwanDB-assembly-*.jar
+          # [FIX] Adjusted target path
+          files: target/scala-3.3.5/AwanDB-assembly-*.jar
