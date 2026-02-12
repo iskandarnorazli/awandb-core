@@ -82,7 +82,8 @@ jobs:
         with:
           name: native-lib-${{ matrix.os }}
           # We already gathered the correct files here in the previous step
-          path: lib/Release/* if-no-files-found: error
+          path: lib/Release/*
+          if-no-files-found: error
 
   package_jar:
     needs: build_and_test
