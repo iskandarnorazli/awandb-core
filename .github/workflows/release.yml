@@ -49,6 +49,25 @@ jobs:
           cmake ../src/main/cpp ${{ matrix.cmake_flags }}
           cmake --build . --config Release
 
+      # [NEW STEP] Deploy binaries to where SBT expects them
+      - name: Deploy Native Binaries for Test
+        shell: bash
+        run: |
+          # Create the target directory structure
+          mkdir -p lib/Release
+          
+          # Copy the built artifacts
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp build/Release/*.dll lib/Release/
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            cp build/*.dylib lib/Release/
+          else
+            cp build/*.so lib/Release/
+          fi
+          
+          # Verify copy
+          ls -R lib/Release/
+
       - name: Run Scala Tests
         shell: bash
         run: |
