@@ -679,7 +679,6 @@ class AwanTable(
     }
   }
 
-  // Add this inside class AwanTable
   def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Iterator.empty
@@ -714,7 +713,7 @@ class AwanTable(
     
     val diskIter = snapshotBlocks.flatMap { blockPtr =>
        val rowCount = NativeBridge.getRowCount(blockPtr)
-       val outIndicesPtr = NativeBridge.allocMainStore(rowCount) // Temp buffer for Row IDs
+       val outIndicesPtr = NativeBridge.allocMainStore(rowCount)
        
        val bitset = blockManager.getDeletionBitSet(blockPtr)
        var bitmaskPtr: Long = 0
@@ -733,7 +732,6 @@ class AwanTable(
                NativeBridge.loadData(bitmaskPtr, paddedInts)
            }
            
-           // THE MAGIC JUMP: C++ does the heavy lifting
            val matchCount = NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
            
            if (matchCount == 0) {
@@ -742,13 +740,14 @@ class AwanTable(
                val matchingIndices = new Array[Int](matchCount)
                NativeBridge.copyToScala(outIndicesPtr, matchingIndices, matchCount)
                
-               // Reconstruct ONLY the matched rows
+               // [FIX] Bypassing getRow() and fetching directly from native memory
                matchingIndices.map { i =>
                  val row = new Array[Any](columns.size)
                  var c = 0
                  for(cn <- columnOrder) {
                      val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
-                     val stride = NativeBridge.getColumnStride(blockPtr, c)
+                     var stride = NativeBridge.getColumnStride(blockPtr, c)
+                     if (stride == 0) stride = 4 // Fallback protection
                      val cellPtr = NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
                      val temp = new Array[Int](1)
                      NativeBridge.copyToScala(cellPtr, temp, 1)

@@ -29,28 +29,21 @@ class MaterializeOperator(
     if (batch == null) return null
     
     if (batch.hasSelection && batch.blockPtr != 0) {
-        
-        // 1. Get Base Pointer of the block
         val colBasePtr = NativeBridge.getColumnPtr(batch.blockPtr, colIdx)
         
         if (colBasePtr != 0) {
-            // [CRITICAL FIX] Apply the Batch Offset!
-            // The batch contains indices 0..N, but these correspond to rows (Start + 0)..(Start + N)
-            // So we advance the pointer to the start of this batch's range in the block.
-            
-            // Assume Stride is 4 (Int)
-            // TODO: In a real engine, resolve stride from header. 
-            // For now, we assume integers as per spec.
+            // [CRITICAL FIX 1] Restore the offset! selectionVector is batch-local (0 to count-1)
             val offsetBytes = batch.startRowInBlock * 4L 
             val chunkPtr = NativeBridge.getOffsetPointer(colBasePtr, offsetBytes)
             
-            // 2. Gather from the offset position
-            NativeBridge.batchReadIntToLong(
-                chunkPtr, // Read from here
-                batch.selectionVectorPtr, 
-                batch.count, 
-                batch.valuesPtr 
-            )
+            // [CRITICAL FIX 2] Dynamic Memory Width check to prevent Segfaults & Corruption!
+            if (batch.valueWidthBytes == 8) {
+                // Downstream (e.g., HashAgg) allocated a 64-bit buffer. Widen the ints.
+                NativeBridge.batchReadIntToLong(chunkPtr, batch.selectionVectorPtr, batch.count, batch.valuesPtr)
+            } else {
+                // Downstream allocated a 32-bit buffer. Do a direct 1:1 copy.
+                NativeBridge.batchRead(chunkPtr, batch.selectionVectorPtr, batch.count, batch.valuesPtr)
+            }
         }
     }
     

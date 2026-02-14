@@ -13,20 +13,16 @@
  * limitations under the License.
 */
 
-/*
- * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
- */
-
 package org.awandb.core.sql
 
 import net.sf.jsqlparser.parser.CCJSqlParserUtil
-import net.sf.jsqlparser.statement.select.{Select, PlainSelect, SelectItem}
+import net.sf.jsqlparser.statement.select.{Select, PlainSelect, SelectItem, OrderByElement, Limit}
 import net.sf.jsqlparser.statement.delete.Delete
 import net.sf.jsqlparser.statement.update.Update
 import net.sf.jsqlparser.statement.insert.Insert
-// [FIX] Added imports for complex filter operators
-import net.sf.jsqlparser.expression.operators.relational.{EqualsTo, GreaterThan, GreaterThanEquals, MinorThan, MinorThanEquals, ExpressionList}
-import net.sf.jsqlparser.expression.{LongValue, StringValue, Function}
+import net.sf.jsqlparser.expression.operators.relational.{EqualsTo, GreaterThan, GreaterThanEquals, MinorThan, MinorThanEquals}
+import net.sf.jsqlparser.expression.operators.conditional.{AndExpression, OrExpression}
+import net.sf.jsqlparser.expression.{LongValue, StringValue, Function, Expression, Parenthesis}
 import net.sf.jsqlparser.schema.{Column, Table}
 import org.awandb.core.engine.AwanTable
 import org.awandb.core.query.{HashJoinBuildOperator, HashJoinProbeOperator, TableScanOperator}
@@ -46,9 +42,6 @@ object SQLHandler {
       val statement = CCJSqlParserUtil.parse(sql)
 
       statement match {
-        // -------------------------------------------------------
-        // SELECT (Scan, Group By, Join)
-        // -------------------------------------------------------
         case select: Select =>
           val plain = select.getSelectBody.asInstanceOf[PlainSelect]
           val leftTableName = plain.getFromItem.asInstanceOf[Table].getName.toLowerCase
@@ -59,7 +52,6 @@ object SQLHandler {
           val groupBy = plain.getGroupBy
           if (groupBy != null) {
             val keyCol = groupBy.getGroupByExpressionList.getExpressions.get(0).asInstanceOf[Column].getColumnName
-            
             var valCol = ""
             for (item <- plain.getSelectItems.asScala) {
                val expr = item.getExpression
@@ -70,15 +62,9 @@ object SQLHandler {
                   }
                }
             }
-            
             if (valCol.isEmpty) return "Error: GROUP BY currently requires a SUM(column) aggregate."
-            
             val resultMap = leftTable.executeGroupBy(keyCol, valCol)
-            
-            if (resultMap.isEmpty) {
-              return s"   GROUP BY Results: (Empty)"
-            }
-            
+            if (resultMap.isEmpty) return s"   GROUP BY Results: (Empty)"
             val sb = new StringBuilder()
             sb.append(s"\n   GROUP BY Results ($keyCol | SUM($valCol)):\n")
             resultMap.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
@@ -99,46 +85,116 @@ object SQLHandler {
 
             val leftKeyIdx = leftTable.columnOrder.indexOf(leftJoinCol)
             val leftPayloadIdx = if (leftTable.columnOrder.length > 2) 2 else 0 
-            
             val rightKeyIdx = rightTable.columnOrder.indexOf(rightJoinCol)
             val rightPayloadIdx = if (rightTable.columnOrder.length > 1) 1 else 0
 
             val rightScan = new TableScanOperator(rightTable.blockManager, rightTable.blockManager.getLoadedBlocks.toArray, rightKeyIdx, rightPayloadIdx)
             val buildOp = new HashJoinBuildOperator(rightScan)
-            
             val leftScan = new TableScanOperator(leftTable.blockManager, leftTable.blockManager.getLoadedBlocks.toArray, leftKeyIdx, leftPayloadIdx)
             val probeOp = new HashJoinProbeOperator(leftScan, buildOp)
 
             probeOp.open()
-            
             var totalMatches = 0
             var batch = probeOp.next()
             val sb = new StringBuilder()
             sb.append(s"\n   JOIN Results (Probe Output):\n")
-            
             while (batch != null) {
                totalMatches += batch.count
                val keys = new Array[Int](batch.count)
                val payloads = new Array[Long](batch.count)
                NativeBridge.copyToScala(batch.keysPtr, keys, batch.count)
                NativeBridge.copyToScalaLong(batch.valuesPtr, payloads, batch.count)
-               
                for (i <- 0 until math.min(batch.count, 10)) {
                   sb.append(s"   Match -> LeftKey: ${keys(i)} | RightPayload: ${payloads(i)}\n")
                }
                batch = probeOp.next()
             }
-            
             probeOp.close()
             sb.append(s"   Matches Found: $totalMatches\n")
             return sb.toString()
           }
 
           // -------------------------------------------------------
-          // 3. PROJECTION & FILTERING
+          // 3. PIPELINE: FILTER -> SORT -> LIMIT -> PROJECT
           // -------------------------------------------------------
           
-          // --- A. Identify Projection Columns ---
+          def evaluateExpression(expr: Expression): Seq[Array[Any]] = {
+              expr match {
+                 case p: Parenthesis => evaluateExpression(p.getExpression)
+                 case and: AndExpression =>
+                    val leftRows = evaluateExpression(and.getLeftExpression)
+                    val rightIds = evaluateExpression(and.getRightExpression).map(_(0)).toSet
+                    leftRows.filter(r => rightIds.contains(r(0)))
+                 case or: OrExpression =>
+                    val leftRows = evaluateExpression(or.getLeftExpression)
+                    val rightRows = evaluateExpression(or.getRightExpression)
+                    val leftIds = leftRows.map(_(0)).toSet
+                    leftRows ++ rightRows.filterNot(r => leftIds.contains(r(0)))
+                 case eq: EqualsTo =>
+                    val colName = eq.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    val targetVal = eq.getRightExpression.asInstanceOf[LongValue].getValue.toInt
+                    leftTable.scanFiltered(colName, 0, targetVal).toSeq
+                 case gt: GreaterThan =>
+                    val colName = gt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    val targetVal = gt.getRightExpression.asInstanceOf[LongValue].getValue.toInt
+                    leftTable.scanFiltered(colName, 1, targetVal).toSeq
+                 case gte: GreaterThanEquals =>
+                    val colName = gte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    val targetVal = gte.getRightExpression.asInstanceOf[LongValue].getValue.toInt
+                    leftTable.scanFiltered(colName, 2, targetVal).toSeq
+                 case lt: MinorThan =>
+                    val colName = lt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    val targetVal = lt.getRightExpression.asInstanceOf[LongValue].getValue.toInt
+                    leftTable.scanFiltered(colName, 3, targetVal).toSeq
+                 case lte: MinorThanEquals =>
+                    val colName = lte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    val targetVal = lte.getRightExpression.asInstanceOf[LongValue].getValue.toInt
+                    leftTable.scanFiltered(colName, 4, targetVal).toSeq
+                 case _ => throw new RuntimeException("Unsupported WHERE clause operator.")
+              }
+          }
+
+          val where = plain.getWhere
+          var finalRows = if (where == null) {
+              // [FIX] Bypass broken scanAll() by forcing an AVX scan
+              leftTable.scanFiltered(leftTable.columnOrder.head, 2, 0).toSeq
+          } else {
+              try { evaluateExpression(where) } 
+              catch { case e: RuntimeException => return "Error: " + e.getMessage }
+          }
+
+          // --- SORT (ORDER BY) ---
+          val orderByElements = plain.getOrderByElements
+          if (orderByElements != null && !orderByElements.isEmpty) {
+              val orderBy = orderByElements.get(0)
+              val sortColName = orderBy.getExpression.asInstanceOf[Column].getColumnName.toLowerCase
+              val sortColIdx = leftTable.columnOrder.indexOf(sortColName)
+              
+              if (sortColIdx == -1) return s"Error: ORDER BY column '$sortColName' not found."
+              
+              val isAsc = orderBy.isAsc
+              finalRows = finalRows.sortWith { (r1, r2) =>
+                  val cmp = (r1(sortColIdx), r2(sortColIdx)) match {
+                      case (i1: Int, i2: Int) => i1.compareTo(i2)
+                      case (l1: Long, l2: Long) => l1.compareTo(l2)
+                      case (s1: String, s2: String) => s1.compareTo(s2)
+                      case _ => 0
+                  }
+                  if (isAsc) cmp < 0 else cmp > 0
+              }
+          }
+
+          // --- LIMIT ---
+          val limit = plain.getLimit
+          if (limit != null) {
+              val limitExpr = limit.getRowCount
+              if (limitExpr != null && limitExpr.isInstanceOf[LongValue]) {
+                  val limitVal = limitExpr.asInstanceOf[LongValue].getValue.toInt
+                  finalRows = finalRows.take(limitVal)
+              }
+          }
+
+          // --- PROJECT & FORMAT OUTPUT ---
           val requestedColumns = scala.collection.mutable.ArrayBuffer[String]()
           val isAsterisk = plain.getSelectItems.get(0).toString == "*"
           
@@ -153,136 +209,65 @@ object SQLHandler {
              }
           }
           
-          // Map requested columns to their internal schema indices
           val projectionIndices = requestedColumns.map(col => leftTable.columnOrder.indexOf(col)).toArray
           if (projectionIndices.contains(-1)) return s"Error: One or more projected columns do not exist."
-
-          // --- B. Evaluate Filter (WHERE) ---
-          val where = plain.getWhere
           
-          val filteredRows = if (where == null) {
-              leftTable.scanAll() // No filter applied
-          } else {
-              where match {
-                 case eq: EqualsTo =>
-                    val colName = eq.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
-                    val targetVal = eq.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 0, targetVal)
-                 
-                 case gt: GreaterThan =>
-                    val colName = gt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
-                    val targetVal = gt.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 1, targetVal)
-                    
-                 case gte: GreaterThanEquals =>
-                    val colName = gte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
-                    val targetVal = gte.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 2, targetVal)
-                    
-                 case lt: MinorThan =>
-                    val colName = lt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
-                    val targetVal = lt.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 3, targetVal)
-                    
-                 case lte: MinorThanEquals =>
-                    val colName = lte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
-                    val targetVal = lte.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 4, targetVal)
-                    
-                 case _ => return "Error: Unsupported WHERE clause operator."
-              }
-          }
-          
-          // --- C. Format Output ---
           val sb = new StringBuilder()
           sb.append(s"\n   Found Rows:\n")
-          
-          filteredRows.foreach { row => 
-             // Build an array containing ONLY the requested columns in the requested order
+          finalRows.foreach { row => 
              val projectedRow = projectionIndices.map(idx => row(idx))
              sb.append("   " + projectedRow.mkString(" | ") + "\n") 
           }
           return sb.toString()
 
-        // -------------------------------------------------------
-        // INSERT
-        // -------------------------------------------------------
         case insert: Insert =>
           val tableName = insert.getTable.getName.toLowerCase
           val table = tables.get(tableName)
           if (table == null) return s"Error: Table '$tableName' not found."
-
           val valuesObj = insert.getValues
           val scalaExprs = valuesObj.getExpressions.asScala
-
           val values = scalaExprs.map {
             case l: LongValue => l.getValue.toInt 
             case s: StringValue => s.getValue
             case _ => 0
           }.toArray[Any]
-          
           table.insertRow(values)
           "Inserted 1 row."
 
-        // -------------------------------------------------------
-        // DELETE
-        // -------------------------------------------------------
         case delete: Delete =>
           val tableName = delete.getTable.getName.toLowerCase
           val table = tables.get(tableName)
           if (table == null) return s"Error: Table '$tableName' not found."
-
           val where = delete.getWhere
-          if (where == null || !where.isInstanceOf[EqualsTo]) {
-            return "Error: DELETE only supports 'WHERE id = value'."
-          }
-          
+          if (where == null || !where.isInstanceOf[EqualsTo]) return "Error: DELETE only supports 'WHERE id = value'."
           val eq = where.asInstanceOf[EqualsTo]
           val rightExpr = eq.getRightExpression
-          if (!rightExpr.isInstanceOf[LongValue]) {
-             return "Error: DELETE only supports integer IDs."
-          }
-
+          if (!rightExpr.isInstanceOf[LongValue]) return "Error: DELETE only supports integer IDs."
           val id = rightExpr.asInstanceOf[LongValue].getValue.toInt
           val success = table.delete(id)
           if (success) "Deleted 1 row." else "Row not found."
 
-        // -------------------------------------------------------
-        // UPDATE (Read-Modify-Write)
-        // -------------------------------------------------------
         case update: Update =>
            val tableName = update.getTable.getName.toLowerCase
            val table = tables.get(tableName)
            if (table == null) return s"Error: Table '$tableName' not found."
-           
            val where = update.getWhere
-           if (where == null || !where.isInstanceOf[EqualsTo]) {
-             return "Error: UPDATE only supports 'WHERE id = value'."
-           }
-
+           if (where == null || !where.isInstanceOf[EqualsTo]) return "Error: UPDATE only supports 'WHERE id = value'."
            val eq = where.asInstanceOf[EqualsTo]
            val rightExpr = eq.getRightExpression
-           if (!rightExpr.isInstanceOf[LongValue]) {
-             return "Error: UPDATE only supports integer IDs."
-           }
-           
+           if (!rightExpr.isInstanceOf[LongValue]) return "Error: UPDATE only supports integer IDs."
            val id = rightExpr.asInstanceOf[LongValue].getValue.toInt
            val oldRowOpt = table.getRow(id)
            if (oldRowOpt.isEmpty) return "Row not found."
            val row = oldRowOpt.get
-           
            val cols = update.getColumns.asScala
            val exprs = update.getExpressions.asScala
-           
            for (i <- cols.indices) {
               val colName = cols(i).getColumnName
               val newVal = exprs(i).asInstanceOf[LongValue].getValue.toInt
               val colIdx = table.columnOrder.indexOf(colName)
-              if (colIdx != -1) {
-                  row(colIdx) = newVal
-              }
+              if (colIdx != -1) row(colIdx) = newVal
            }
-           
            table.delete(id)
            table.insertRow(row)
            "Updated 1 row."
