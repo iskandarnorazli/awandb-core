@@ -38,7 +38,7 @@ class AwanTable(
   val wal = new Wal(dataDir)
   val blockManager = new BlockManager(dataDir, enableIndex)
   val columns = new LinkedHashMap[String, NativeColumn]()
-  private val columnOrder = new ListBuffer[String]()
+  val columnOrder = new ListBuffer[String]()
   
   // [PERFORMANCE] Pre-allocated Buffer
   val resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
@@ -87,6 +87,101 @@ class AwanTable(
   }
 
   // ---------------------------------------------------------
+  // NEW: Row Access for UPDATE / SELECT
+  // ---------------------------------------------------------
+
+  /**
+   * Retrieves a full row by ID.
+   * Used by UPDATE to perform Read-Modify-Write.
+   */
+  def getRow(id: Int): Option[Array[Any]] = {
+    rwLock.readLock().lock()
+    try {
+      val loc = primaryIndex.get(id)
+      if (loc == null) return None
+
+      val result = new Array[Any](columns.size)
+      var colIdx = 0
+      
+      for (colName <- columnOrder) {
+        val col = columns(colName)
+        
+        if (loc.blockPtr == 0) {
+           // RAM READ
+           if (col.isString) {
+             result(colIdx) = col.deltaStringBuffer(loc.rowId)
+           } else {
+             result(colIdx) = col.deltaIntBuffer(loc.rowId)
+           }
+        } else {
+           // DISK READ (Using NativeBridge)
+           val colPtr = NativeBridge.getColumnPtr(loc.blockPtr, colIdx)
+           val stride = NativeBridge.getColumnStride(loc.blockPtr, colIdx)
+           // Calc exact memory address of the cell
+           val cellPtr = NativeBridge.getOffsetPointer(colPtr, loc.rowId * stride.toLong)
+           
+           if (col.isString) {
+             // TODO: String Disk Read support. For now return placeholder.
+             result(colIdx) = "N/A (Disk)"
+           } else {
+             // Read single int
+             val tempBuf = new Array[Int](1)
+             NativeBridge.copyToScala(cellPtr, tempBuf, 1) // Treats ptr as start of array of 1
+             result(colIdx) = tempBuf(0)
+           }
+        }
+        colIdx += 1
+      }
+      Some(result)
+    } finally {
+      rwLock.readLock().unlock()
+    }
+  }
+
+  /**
+   * Scans ALL rows (RAM + Disk).
+   * Used by SELECT *.
+   */
+  def scanAll(): Iterator[Array[Any]] = {
+      // 1. RAM Iterator
+      val ramIter = (0 until columns.values.head.deltaIntBuffer.length).iterator.collect {
+         case i if !ramDeleted.get(i) =>
+            // Reconstruct Row
+            val row = new Array[Any](columns.size)
+            var c = 0
+            for(colName <- columnOrder) {
+               val col = columns(colName)
+               if(col.isString) row(c) = col.deltaStringBuffer(i)
+               else row(c) = col.deltaIntBuffer(i)
+               c += 1
+            }
+            row
+      }
+
+      // 2. Disk Iterator
+      val diskIter = blockManager.getLoadedBlocks.iterator.flatMap { blockPtr =>
+          val rowCount = NativeBridge.getRowCount(blockPtr)
+          (0 until rowCount).iterator.collect {
+             case i if !blockManager.isDeleted(blockPtr, i) =>
+                 val row = new Array[Any](columns.size)
+                 var c = 0
+                 for(colName <- columnOrder) {
+                     val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
+                     val stride = NativeBridge.getColumnStride(blockPtr, c)
+                     val cellPtr = NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
+                     val temp = new Array[Int](1)
+                     NativeBridge.copyToScala(cellPtr, temp, 1)
+                     row(c) = temp(0) // Assume Int for MVP
+                     c += 1
+                 }
+                 row
+          }
+      }
+      
+      ramIter ++ diskIter
+  }
+
+  // ---------------------------------------------------------
   // CRUD OPERATIONS
   // ---------------------------------------------------------
 
@@ -109,16 +204,8 @@ class AwanTable(
     }
   }
 
-  def update(id: Int, changes: Map[String, Any]): Boolean = {
-    rwLock.writeLock().lock()
-    try {
-      if (!primaryIndex.containsKey(id)) return false
-      delete(id)
-      true 
-    } finally {
-      rwLock.writeLock().unlock()
-    }
-  }
+  // Legacy update stub (redirects to delete, handled by SQLHandler now)
+  def update(id: Int, changes: Map[String, Any]): Boolean = delete(id)
 
   // ---------------------------------------------------------
   // WRITE PATH
@@ -449,23 +536,40 @@ class AwanTable(
 
     val colIdx = 0
     val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-       if (blockManager.isClean(blockPtr)) {
+       val bitset = blockManager.getDeletionBitSet(blockPtr)
+       
+       if (bitset == null || bitset.isEmpty) {
+           // FAST CLEAN PATH
            NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
        } else {
+           // FAST DIRTY PATH: Push Bitmask to AVX
            val rowCount = NativeBridge.getRowCount(blockPtr)
-           val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
-           val data = new Array[Int](rowCount)
-           NativeBridge.copyToScala(colPtr, data, rowCount)
            
-           var localCount = 0
-           var i = 0
-           while (i < rowCount) {
-             if (!blockManager.isDeleted(blockPtr, i)) {
-                if (data(i) > threshold) localCount += 1
-             }
-             i += 1
+           // Extract bytes from BitSet (Warning: toByteArray drops trailing zeros!)
+           val rawBytes = bitset.toByteArray 
+           
+           // We MUST pad the byte array to match the rowCount exactly, 
+           // otherwise C++ will read garbage memory for the trailing rows.
+           val requiredBytes = (rowCount + 7) / 8
+           val paddedBytes = if (rawBytes.length == requiredBytes) rawBytes else rawBytes.padTo(requiredBytes, 0.toByte)
+           
+           // allocate native memory (allocMainStore uses 4-byte Int chunks)
+           val intsNeeded = (requiredBytes + 3) / 4
+           val paddedInts = new Array[Int](intsNeeded)
+           
+           // Convert byte[] to int[] (Little Endian to match BitSet)
+           java.nio.ByteBuffer.wrap(paddedBytes.padTo(intsNeeded * 4, 0.toByte))
+               .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+               .asIntBuffer().get(paddedInts)
+               
+           val bitmaskPtr = NativeBridge.allocMainStore(intsNeeded)
+           
+           try {
+               NativeBridge.loadData(bitmaskPtr, paddedInts)
+               NativeBridge.avxScanBlockWithDeletions(blockPtr, colIdx, threshold, bitmaskPtr)
+           } finally {
+               NativeBridge.freeMainStore(bitmaskPtr)
            }
-           localCount
        }
     })
     ramCount + diskCount
@@ -549,6 +653,118 @@ class AwanTable(
       }
     }
     finalMap.toMap
+  }
+
+  // Fast In-Place Update for Integers
+  def updateCellNative(id: Int, colName: String, newValue: Int): Boolean = {
+    rwLock.writeLock().lock()
+    try {
+      val loc = primaryIndex.get(id)
+      if (loc == null) return false
+      
+      val colIdx = columnOrder.indexOf(colName)
+      if (colIdx == -1) return false
+
+      if (loc.blockPtr == 0) {
+        // RAM Update
+        val col = columns(colName)
+        col.deltaIntBuffer(loc.rowId) = newValue
+        true
+      } else {
+        // NATIVE DISK/RAM Update (In-Place C++)
+        NativeBridge.updateCell(loc.blockPtr, colIdx, loc.rowId, newValue)
+      }
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
+  // Add this inside class AwanTable
+  def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1) return Iterator.empty
+
+    // 1. RAM Filter
+    val ramIter = (0 until columns(colName).deltaIntBuffer.length).iterator.collect {
+       case i if !ramDeleted.get(i) =>
+         val v = columns(colName).deltaIntBuffer(i)
+         val matchFound = opType match {
+           case 0 => v == targetVal
+           case 1 => v > targetVal
+           case 2 => v >= targetVal
+           case 3 => v < targetVal
+           case 4 => v <= targetVal
+           case _ => false
+         }
+         if (matchFound) {
+           val row = new Array[Any](columns.size)
+           var c = 0
+           for(cn <- columnOrder) {
+               val col = columns(cn)
+               if(col.isString) row(c) = col.deltaStringBuffer(i)
+               else row(c) = col.deltaIntBuffer(i)
+               c += 1
+           }
+           row
+         } else null
+    }.filter(_ != null)
+
+    // 2. Disk Filter (Predicate Pushdown)
+    val snapshotBlocks = blockManager.getLoadedBlocks.toList
+    
+    val diskIter = snapshotBlocks.flatMap { blockPtr =>
+       val rowCount = NativeBridge.getRowCount(blockPtr)
+       val outIndicesPtr = NativeBridge.allocMainStore(rowCount) // Temp buffer for Row IDs
+       
+       val bitset = blockManager.getDeletionBitSet(blockPtr)
+       var bitmaskPtr: Long = 0
+       
+       try {
+           if (bitset != null && !bitset.isEmpty) {
+               val rawBytes = bitset.toByteArray
+               val requiredBytes = (rowCount + 7) / 8
+               val paddedBytes = if (rawBytes.length == requiredBytes) rawBytes else rawBytes.padTo(requiredBytes, 0.toByte)
+               val intsNeeded = (requiredBytes + 3) / 4
+               val paddedInts = new Array[Int](intsNeeded)
+               java.nio.ByteBuffer.wrap(paddedBytes.padTo(intsNeeded * 4, 0.toByte))
+                   .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                   .asIntBuffer().get(paddedInts)
+               bitmaskPtr = NativeBridge.allocMainStore(intsNeeded)
+               NativeBridge.loadData(bitmaskPtr, paddedInts)
+           }
+           
+           // THE MAGIC JUMP: C++ does the heavy lifting
+           val matchCount = NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
+           
+           if (matchCount == 0) {
+               Iterator.empty
+           } else {
+               val matchingIndices = new Array[Int](matchCount)
+               NativeBridge.copyToScala(outIndicesPtr, matchingIndices, matchCount)
+               
+               // Reconstruct ONLY the matched rows
+               matchingIndices.map { i =>
+                 val row = new Array[Any](columns.size)
+                 var c = 0
+                 for(cn <- columnOrder) {
+                     val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
+                     val stride = NativeBridge.getColumnStride(blockPtr, c)
+                     val cellPtr = NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
+                     val temp = new Array[Int](1)
+                     NativeBridge.copyToScala(cellPtr, temp, 1)
+                     row(c) = temp(0)
+                     c += 1
+                 }
+                 row
+               }.toIterator
+           }
+       } finally {
+           NativeBridge.freeMainStore(outIndicesPtr)
+           if (bitmaskPtr != 0) NativeBridge.freeMainStore(bitmaskPtr)
+       }
+    }.iterator
+
+    ramIter ++ diskIter
   }
 
   def close(): Unit = {

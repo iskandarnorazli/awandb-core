@@ -13,10 +13,6 @@
  * limitations under the License.
 */
 
-/*
- * Copyright 2026 Mohammad Iskandar Sham Bin Norazli Sham
- */
-
 package org.awandb.core.query
 
 import org.awandb.core.jni.NativeBridge
@@ -49,8 +45,23 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
       // Copy Keys: Batch -> TempBuffer
       NativeBridge.memcpy(batch.keysPtr, NativeBridge.getOffsetPointer(tempKeys, offset), batch.count * 4L)
       
-      // Copy Values (Payloads): Batch -> TempBuffer
-      NativeBridge.memcpy(batch.valuesPtr, NativeBridge.getOffsetPointer(tempPayloads, payloadOffset), batch.count * 8L)
+      // [FIX] Widen 32-bit Payloads to 64-bit for the Hash Map
+      if (batch.valueWidthBytes == 4) {
+         val ints = new Array[Int](batch.count)
+         NativeBridge.copyToScala(batch.valuesPtr, ints, batch.count)
+         
+         // 2 ints = 1 Long (Little Endian memory layout)
+         val widened = new Array[Int](batch.count * 2)
+         var i = 0
+         while (i < batch.count) {
+            widened(i * 2) = ints(i) // Lower 32 bits
+            widened(i * 2 + 1) = if (ints(i) < 0) -1 else 0 // Upper 32 bits (Sign extension)
+            i += 1
+         }
+         NativeBridge.loadData(NativeBridge.getOffsetPointer(tempPayloads, payloadOffset), widened)
+      } else {
+         NativeBridge.memcpy(batch.valuesPtr, NativeBridge.getOffsetPointer(tempPayloads, payloadOffset), batch.count * 8L)
+      }
       
       totalInput += batch.count
       batch = child.next()

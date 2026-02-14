@@ -15,7 +15,7 @@ run / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 Test / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 
 // Ensure tests run sequentially to avoid JNI memory race conditions
-Test / parallelExecution := false
+parallelExecution in Test := false
 
 // --- Dependencies ---
 val arrowVersion = "15.0.0"

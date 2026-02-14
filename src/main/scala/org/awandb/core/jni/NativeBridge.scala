@@ -128,6 +128,13 @@ class NativeBridge {
   // --- Materialised Operator ---
   @native def batchReadNative(basePtr: Long, indicesPtr: Long, count: Int, outPtr: Long): Unit
   @native def batchReadIntToLongNative(basePtr: Long, indicesPtr: Long, count: Int, outPtr: Long): Unit
+
+  // --- SMART ENGINES (Predicate Pushdown with Deletions) ---
+
+  @native def avxScanBlockWithDeletionsNative(blockPtr: Long, colIdx: Int, threshold: Int, deletedBitmaskPtr: Long): Int
+  @native def updateCellNative(blockPtr: Long, colIdx: Int, rowId: Int, newValue: Int): Boolean
+
+  @native def avxFilterBlockNative(blockPtr: Long, colIdx: Int, opType: Int, targetVal: Int, outIndicesPtr: Long, deletedBitmaskPtr: Long): Int
 }
 
 // -----------------------------------------------------------
@@ -390,4 +397,19 @@ object NativeBridge {
   def joinProbe(mapPtr: Long, probeKeysPtr: Long, count: Int, outPayloadsPtr: Long, outIndicesPtr: Long): Int = 
       instance.joinProbeNative(mapPtr, probeKeysPtr, count, outPayloadsPtr, outIndicesPtr)
   def joinDestroy(mapPtr: Long): Unit = instance.joinDestroyNative(mapPtr)
+
+  def avxScanBlockWithDeletions(blockPtr: Long, colIdx: Int, threshold: Int, deletedBitmaskPtr: Long): Int = {
+    if (blockPtr == 0) return 0
+    instance.avxScanBlockWithDeletionsNative(blockPtr, colIdx, threshold, deletedBitmaskPtr)
+  }
+
+  def updateCell(blockPtr: Long, colIdx: Int, rowId: Int, newValue: Int): Boolean = {
+    if (blockPtr == 0) return false
+    instance.updateCellNative(blockPtr, colIdx, rowId, newValue)
+  }
+
+  def avxFilterBlock(blockPtr: Long, colIdx: Int, opType: Int, targetVal: Int, outIndicesPtr: Long, deletedBitmaskPtr: Long): Int = {
+    if (blockPtr == 0) return 0
+    instance.avxFilterBlockNative(blockPtr, colIdx, opType, targetVal, outIndicesPtr, deletedBitmaskPtr)
+  }
 }

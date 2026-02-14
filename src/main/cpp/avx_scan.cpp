@@ -162,4 +162,215 @@ extern "C" {
             out[i] = (int64_t)base[indices[i]];
         }
     }
+
+    // ==========================================================
+    // DIRTY SCAN: AVX2 WITH DELETION BITMASK PUSHDOWN
+    // ==========================================================
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanBlockWithDeletionsNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint threshold, jlong deletedBitmaskPtr
+    ) {
+        if (blockPtr == 0) return 0;
+
+        uint8_t* basePtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)basePtr;
+        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
+        ColumnHeader& col = colHeaders[colIdx];
+        
+        if (col.data_offset == 0) return 0; 
+        
+        int32_t* data = (int32_t*)(basePtr + col.data_offset);
+        uint8_t* bitmask = (uint8_t*)deletedBitmaskPtr; // 1 bit per row (1 = deleted)
+        int rows = header->row_count;
+        int matchCount = 0;
+
+        if (col.type == TYPE_INT) {
+            // Zone Map Pruning
+            if (col.max_int <= threshold) return 0;
+
+            __m256i vThresh = _mm256_set1_epi32(threshold);
+            int i = 0;
+
+#ifdef ARCH_X86
+            // Process 32 rows at a time
+            int limit = rows - 32;
+            for (; i <= limit; i += 32) {
+                __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
+                __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
+                __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
+                __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+
+                int m0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v0, vThresh)));
+                int m1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v1, vThresh)));
+                int m2 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v2, vThresh)));
+                int m3 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v3, vThresh)));
+
+                // Combine 4x 8-bit masks into one 32-bit mask representing matches
+                uint32_t matchMask = (m0) | (m1 << 8) | (m2 << 16) | (m3 << 24);
+                
+                // Read 32 bits from the deletion bitmask
+                uint32_t delMask = 0;
+                if (bitmask != nullptr) {
+                    // i is a multiple of 32, so (i >> 3) is always aligned to bytes
+                    delMask = *(uint32_t*)(bitmask + (i >> 3));
+                }
+
+                // Keep only matches that are NOT deleted
+                uint32_t validMask = matchMask & (~delMask);
+                matchCount += _mm_popcnt_u32(validMask);
+            }
+#endif
+            // Scalar Tail (or ARM Fallback)
+            for (; i < rows; i++) {
+                if (data[i] > threshold) {
+                    bool isDeleted = false;
+                    if (bitmask != nullptr) {
+                        isDeleted = (bitmask[i >> 3] & (1 << (i & 7))) != 0;
+                    }
+                    if (!isDeleted) matchCount++;
+                }
+            }
+        }
+        return matchCount;
+    }
+
+    // ==========================================================
+    // FAST RANDOM UPDATE (In-Place Memory Mutation)
+    // ==========================================================
+    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_updateCellNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint rowId, jint newValue
+    ) {
+        if (blockPtr == 0) return JNI_FALSE;
+        uint8_t* basePtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)basePtr;
+        
+        if (colIdx < 0 || colIdx >= (int)header->column_count) return JNI_FALSE;
+        if (rowId < 0 || rowId >= (int)header->row_count) return JNI_FALSE;
+
+        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
+        ColumnHeader& col = colHeaders[colIdx];
+        if (col.data_offset == 0) return JNI_FALSE;
+
+        if (col.type == TYPE_INT) {
+            int32_t* data = (int32_t*)(basePtr + col.data_offset);
+            data[rowId] = newValue;
+            
+            // Expand Zone Map if necessary
+            if (newValue < col.min_int) col.min_int = newValue;
+            if (newValue > col.max_int) col.max_int = newValue;
+
+            return JNI_TRUE;
+        }
+        return JNI_FALSE;
+    }
+
+    // ==========================================================
+    // PREDICATE PUSHDOWN: GENERIC AVX2 FILTER
+    // opType -> 0: ==, 1: >, 2: >=, 3: <, 4: <=
+    // ==========================================================
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxFilterBlockNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint opType, jint targetVal, jlong outIndicesPtr, jlong deletedBitmaskPtr
+    ) {
+        if (blockPtr == 0 || outIndicesPtr == 0) return 0;
+
+        uint8_t* basePtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)basePtr;
+        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
+        ColumnHeader& col = colHeaders[colIdx];
+        
+        if (col.data_offset == 0) return 0; 
+        
+        int32_t* data = (int32_t*)(basePtr + col.data_offset);
+        int32_t* outIndices = (int32_t*)outIndicesPtr;
+        uint8_t* bitmask = (uint8_t*)deletedBitmaskPtr;
+        int rows = header->row_count;
+        int matchCount = 0;
+
+        if (col.type == TYPE_INT) {
+            // Zone Map Pruning (Instant Rejection)
+            if (opType == 0 && (targetVal < col.min_int || targetVal > col.max_int)) return 0; 
+            if (opType == 1 && col.max_int <= targetVal) return 0; 
+            if (opType == 2 && col.max_int < targetVal) return 0; 
+            if (opType == 3 && col.min_int >= targetVal) return 0; 
+            if (opType == 4 && col.min_int > targetVal) return 0; 
+
+            __m256i vTarget = _mm256_set1_epi32(targetVal);
+            int i = 0;
+
+#ifdef ARCH_X86
+            int limit = rows - 32;
+            for (; i <= limit; i += 32) {
+                __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
+                __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
+                __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
+                __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+
+                __m256i cmp0, cmp1, cmp2, cmp3;
+                if (opType == 0) { // EQ
+                    cmp0 = _mm256_cmpeq_epi32(v0, vTarget);
+                    cmp1 = _mm256_cmpeq_epi32(v1, vTarget);
+                    cmp2 = _mm256_cmpeq_epi32(v2, vTarget);
+                    cmp3 = _mm256_cmpeq_epi32(v3, vTarget);
+                } else if (opType == 1) { // GT
+                    cmp0 = _mm256_cmpgt_epi32(v0, vTarget);
+                    cmp1 = _mm256_cmpgt_epi32(v1, vTarget);
+                    cmp2 = _mm256_cmpgt_epi32(v2, vTarget);
+                    cmp3 = _mm256_cmpgt_epi32(v3, vTarget);
+                } else if (opType == 2) { // GTE (v0 > target - 1)
+                    __m256i vT = _mm256_set1_epi32(targetVal - 1);
+                    cmp0 = _mm256_cmpgt_epi32(v0, vT);
+                    cmp1 = _mm256_cmpgt_epi32(v1, vT);
+                    cmp2 = _mm256_cmpgt_epi32(v2, vT);
+                    cmp3 = _mm256_cmpgt_epi32(v3, vT);
+                } else if (opType == 3) { // LT (target > v0)
+                    cmp0 = _mm256_cmpgt_epi32(vTarget, v0);
+                    cmp1 = _mm256_cmpgt_epi32(vTarget, v1);
+                    cmp2 = _mm256_cmpgt_epi32(vTarget, v2);
+                    cmp3 = _mm256_cmpgt_epi32(vTarget, v3);
+                } else { // LTE (~(v0 > target))
+                    cmp0 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v0, vTarget), _mm256_setzero_si256());
+                    cmp1 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v1, vTarget), _mm256_setzero_si256());
+                    cmp2 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v2, vTarget), _mm256_setzero_si256());
+                    cmp3 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v3, vTarget), _mm256_setzero_si256());
+                }
+
+                int m0 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp0));
+                int m1 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp1));
+                int m2 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp2));
+                int m3 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp3));
+
+                uint32_t matchMask = (m0) | (m1 << 8) | (m2 << 16) | (m3 << 24);
+                uint32_t delMask = (bitmask != nullptr) ? *(uint32_t*)(bitmask + (i >> 3)) : 0;
+                uint32_t validMask = matchMask & (~delMask);
+                
+                // Fast extraction of matching indices
+                while (validMask) {
+                    unsigned long tz;
+#ifdef _MSC_VER
+                    // MSVC (Windows) implementation
+                    _BitScanForward(&tz, validMask);
+#else
+                    // GCC/Clang (Linux/Mac) implementation
+                    tz = __builtin_ctz(validMask); 
+#endif
+                    outIndices[matchCount++] = i + tz;
+                    validMask &= (validMask - 1);      // Clear lowest set bit
+                }
+            }
+#endif
+            for (; i < rows; i++) {
+                bool match = false;
+                if (opType == 0) match = (data[i] == targetVal);
+                else if (opType == 1) match = (data[i] > targetVal);
+                else if (opType == 2) match = (data[i] >= targetVal);
+                else if (opType == 3) match = (data[i] < targetVal);
+                else if (opType == 4) match = (data[i] <= targetVal);
+
+                if (match) {
+                    bool isDeleted = (bitmask != nullptr) && ((bitmask[i >> 3] & (1 << (i & 7))) != 0);
+                    if (!isDeleted) outIndices[matchCount++] = i;
+                }
+            }
+        }
+        return matchCount;
+    }
 }

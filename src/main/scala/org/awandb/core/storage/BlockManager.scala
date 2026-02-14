@@ -231,6 +231,10 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     }
   }
 
+  def getDeletionBitSet(blockPtr: Long): java.util.BitSet = {
+    deletionBitmaps.get(blockPtr)
+  }
+
   def markDeleted(blockPtr: Long, rowId: Int): Unit = {
     deletionBitmaps.computeIfAbsent(blockPtr, _ => new java.util.BitSet()).set(rowId)
   }
