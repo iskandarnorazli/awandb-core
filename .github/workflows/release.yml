@@ -67,7 +67,8 @@ jobs:
         shell: bash
         # [FIX] -J-Xmx4G prevents OutOfMemory errors on 5M row tests
         # [FIX] 'set Test / parallelExecution := false' prevents JNI thread collisions
-        run: sbt -J-Xmx4G -Djava.library.path=${{ matrix.lib_path }} "set Test / parallelExecution := false" test
+        # [FIX] 'fork := true' ensures a pristine JVM memory space for JNI
+        run: sbt -J-Xmx4G -Djava.library.path=${{ matrix.lib_path }} "set Test / parallelExecution := false" "set Test / fork := true" test
 
       - name: Build JVM JAR (No Embedded Natives)
         shell: bash

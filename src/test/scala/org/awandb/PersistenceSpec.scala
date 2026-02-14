@@ -25,6 +25,7 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import java.io.{File, FileInputStream}
 import java.nio.{ByteBuffer, ByteOrder}
+import org.awandb.core.sql.SQLHandler
 
 class PersistenceSpec extends AnyFlatSpec with Matchers {
 
@@ -32,6 +33,7 @@ class PersistenceSpec extends AnyFlatSpec with Matchers {
   val BLOCK_FILE = new File(TEST_DIR, "mixed_block.udb").getAbsolutePath
 
   def cleanUp(): Unit = {
+    SQLHandler.tables.clear()
     val dir = new File(TEST_DIR)
     if (dir.exists()) {
       dir.listFiles().foreach(_.delete())

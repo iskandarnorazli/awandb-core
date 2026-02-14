@@ -65,6 +65,9 @@ class FilterAndProjectionSpec extends AnyFunSuite with BeforeAndAfterAll {
 
   override def afterAll(): Unit = {
     if (table != null) table.close()
+
+    SQLHandler.tables.clear()
+    
     val dir = new File(dataDir)
     if (dir.exists()) deleteRecursively(dir)
   }
