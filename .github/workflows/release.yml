@@ -63,12 +63,10 @@ jobs:
           echo "✅ Artifacts deployed to lib/Release:"
           ls -R lib/Release/
 
-      - name: Run Scala Tests (Sequential & High Memory)
+      - name: Run Scala Tests
         shell: bash
-        # [FIX] -J-Xmx4G prevents OutOfMemory errors on 5M row tests
-        # [FIX] 'set Test / parallelExecution := false' prevents JNI thread collisions
-        # [FIX] 'fork := true' ensures a pristine JVM memory space for JNI
-        run: sbt -J-Xmx4G -Djava.library.path=${{ matrix.lib_path }} "set Test / parallelExecution := false" "set Test / fork := true" test
+        # Uses the strict per-suite JVM isolation defined in build.sbt
+        run: sbt -Djava.library.path=${{ matrix.lib_path }} test
 
       - name: Build JVM JAR (No Embedded Natives)
         shell: bash

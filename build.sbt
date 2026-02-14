@@ -1,21 +1,44 @@
 name := "AwanDB"
-version := "0.1.0-alpha" // Updated to match your release tag
+version := "0.1.0-alpha"
 scalaVersion := "3.3.5"
 
 // --- Run Configuration ---
 fork := true
 run / connectInput := true 
 
-// [CRITICAL] Default main class (Flight Server)
-Compile / mainClass := Some("org.awandb.server.AwanFlightServer")
+// Default main class (Standalone Server)
+Compile / mainClass := Some("org.awandb.server.AwanServer")
 
-// Native Library Path Support
-// We look in 'lib/Release' for local dev and 'src/main/resources/native' for the embedded logic
+// Local Development Native Library Path 
+// (CI/CD passes this dynamically, but this allows local `sbt run` and `sbt test` to work)
 run / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 Test / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 
-// Ensure tests run sequentially to avoid JNI memory race conditions
-parallelExecution in Test := false
+// ---------------------------------------------------------------------------
+// JNI TEST ISOLATION CONFIGURATION
+// Forces SBT to spawn a brand new, pristine JVM for every single test suite.
+// This prevents C++ memory leaks, double-frees, and static state bleed.
+// ---------------------------------------------------------------------------
+Test / fork := true
+Test / parallelExecution := false
+Test / testGrouping := {
+  val originalSettings = (Test / definedTests).value
+  // Capture the absolute path to your project root
+  val baseDir = baseDirectory.value.getAbsolutePath
+  
+  originalSettings.map { test =>
+    Tests.Group(
+      name = test.name,
+      tests = Seq(test),
+      runPolicy = Tests.SubProcess(
+        ForkOptions().withRunJVMOptions(Vector(
+          "-Xmx4G", // Keep the generous heap
+          s"-Djava.library.path=$baseDir/lib/Release" // [FIX] Re-inject the native library path!
+        ))
+      )
+    )
+  }
+}
 
 // --- Dependencies ---
 val arrowVersion = "15.0.0"
@@ -24,10 +47,10 @@ libraryDependencies ++= Seq(
   // Testing
   "org.scalatest" %% "scalatest" % "3.2.17" % Test,
   
-  // Parallel Collections (Required for MorselExec)
+  // Parallel Collections (Required for Scala-side grouping/sorting)
   "org.scala-lang.modules" %% "scala-parallel-collections" % "1.0.4",
   
-  // SQL Parsing
+  // SQL Parsing (ANSI SQL AST generation)
   "com.github.jsqlparser" % "jsqlparser" % "4.7",
 
   // --- Apache Arrow Flight (High-Speed Networking) ---
@@ -36,39 +59,6 @@ libraryDependencies ++= Seq(
   "org.apache.arrow" % "flight-core" % arrowVersion,
   "org.apache.arrow" % "flight-grpc" % arrowVersion,
   
-  // --- Logging (Essential for GraalVM/Netty debugging) ---
+  // --- Logging ---
   "org.slf4j" % "slf4j-simple" % "2.0.9"
-)
-
-// --- Assembly (Fat JAR) Configuration ---
-// This ensures that the DLL, SO, and DYLIB files built by GitHub are all included
-assembly / assemblyMergeStrategy := {
-  case PathList("native", xs @ _*) => MergeStrategy.first // Keep our native engines
-  case PathList("META-INF", xs @ _*) =>
-    xs map {_.toLowerCase} match {
-      case "services" :: xs => MergeStrategy.filterDistinctLines
-      case _ => MergeStrategy.discard
-    }
-  case "module-info.class" => MergeStrategy.discard
-  case x => MergeStrategy.first
-}
-
-// --- GraalVM Native Image Configuration ---
-enablePlugins(NativeImagePlugin)
-
-nativeImageVersion := "21.0.2"
-nativeImageJvm := "graalvm-java21" 
-
-nativeImageOptions ++= Seq(
-  "--no-fallback",
-  "--allow-incomplete-classpath",
-  "--enable-url-protocols=http,https",
-  "-H:+JNI",                      
-  "-H:+ReportExceptionStackTraces",
-  // Essential for JSqlParser and Arrow to work in a binary
-  "--initialize-at-build-time=org.slf4j",
-  "--initialize-at-run-time=io.netty",   
-  "--initialize-at-run-time=org.apache.arrow.memory.NettyAllocationManager",
-  // Allow the engine to see its own native methods
-  "-H:IncludeResources=native/.*" 
 )
