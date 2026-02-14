@@ -7,7 +7,7 @@ on:
 
 jobs:
   build_and_test:
-    name: Build & Test (${{ matrix.os }})
+    name: Build & Package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -16,12 +16,15 @@ jobs:
           - os: ubuntu-latest
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
             lib_path: "build"
+            archive_name: "awandb-linux-x86_64.tar.gz"
           - os: windows-latest
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
             lib_path: "build/Release"
+            archive_name: "awandb-windows-x64.zip"
           - os: macos-latest
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' -DCMAKE_CXX_FLAGS='-O3'"
             lib_path: "build"
+            archive_name: "awandb-macos-universal.tar.gz"
 
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +52,6 @@ jobs:
           cmake ../src/main/cpp ${{ matrix.cmake_flags }}
           cmake --build . --config Release
 
-      # [NEW STEP] Deploy binaries using 'find' to handle inconsistent build paths
       - name: Deploy Native Binaries for Test
         shell: bash
         run: |
@@ -57,13 +59,10 @@ jobs:
           echo "Searching for artifacts in build/..."
           
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            # Windows puts it in build/Release/Release/
             find build -name "awan_engine_core.dll" -print -exec cp {} lib/Release/ \;
           elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            # Mac usually puts it in build/Release/
             find build -name "*.dylib" -print -exec cp {} lib/Release/ \;
           else
-            # Linux usually puts it in build/Release/
             find build -name "*.so" -print -exec cp {} lib/Release/ \;
           fi
           
@@ -72,52 +71,67 @@ jobs:
 
       - name: Run Scala Tests
         shell: bash
-        run: |
-          # [FIX] Removed '../' because in CI, we are already at the repo root.
-          # This forces NativeBridge to look in the build folder we just created.
-          sbt -Djava.library.path=${{ matrix.lib_path }} test
+        run: sbt -Djava.library.path=${{ matrix.lib_path }} test
 
-      - name: Upload Artifact
+      - name: Build JVM JAR (No Embedded Natives)
+        shell: bash
+        # Using standard 'package' instead of 'assembly' since we don't need a fat JAR anymore
+        run: sbt package
+
+      - name: Package OS-Specific Release Archive
+        shell: bash
+        run: |
+          # 1. Structure the Distribution Directory
+          mkdir -p awandb/lib
+          mkdir -p awandb/bin
+          
+          # 2. Copy the Native Library & Compiled Scala JAR
+          cp lib/Release/* awandb/lib/
+          cp target/scala-*/awandb*.jar awandb/lib/awandb.jar
+          
+          # 3. Create Standalone Server Scripts
+          echo '#!/bin/bash' > awandb/bin/awandb-server.sh
+          echo 'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' >> awandb/bin/awandb-server.sh
+          echo 'java -Djava.library.path="$DIR/../lib" -cp "$DIR/../lib/awandb.jar" org.awandb.server.AwanServer "$@"' >> awandb/bin/awandb-server.sh
+          chmod +x awandb/bin/awandb-server.sh
+
+          echo '@echo off' > awandb/bin/awandb-server.bat
+          echo 'set DIR=%~dp0' >> awandb/bin/awandb-server.bat
+          echo 'java -Djava.library.path="%DIR%..\lib" -cp "%DIR%..\lib\awandb.jar" org.awandb.server.AwanServer %*' >> awandb/bin/awandb-server.bat
+
+          # 4. Compress Archive
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z a ${{ matrix.archive_name }} awandb/
+          else
+            tar -czvf ${{ matrix.archive_name }} awandb/
+          fi
+
+      - name: Upload OS Archive
         uses: actions/upload-artifact@v4
         with:
-          name: native-lib-${{ matrix.os }}
-          # We already gathered the correct files here in the previous step
-          path: lib/Release/*
+          name: release-${{ matrix.os }}
+          path: ${{ matrix.archive_name }}
           if-no-files-found: error
 
-  package_jar:
+  package_and_release:
     needs: build_and_test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-          cache: 'sbt'
-
-      - name: Install SBT
-        run: |
-          echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | sudo tee /etc/apt/sources.list.d/sbt.list
-          curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | sudo apt-key add
-          sudo apt-get update
-          sudo apt-get install sbt
-
-      - name: Download All Native Libs
+      - name: Download Built Archives
         uses: actions/download-artifact@v4
         with:
-          path: src/main/resources/native/
-          pattern: native-lib-*
+          path: release-artifacts/
+          pattern: release-*
           merge-multiple: true
 
-      - name: Verify Native Libs
-        run: ls -R src/main/resources/native/
+      - name: Verify Archives
+        run: ls -lh release-artifacts/
 
-      - name: Build SBT Assembly
-        run: sbt 'set test in assembly := {}' assembly
-
-      - name: Release
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: target/scala-3.3.5/AwanDB-assembly-*.jar
+          files: release-artifacts/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
