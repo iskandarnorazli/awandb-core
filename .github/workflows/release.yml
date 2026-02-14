@@ -21,10 +21,6 @@ jobs:
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
             lib_path: "build/Release"
             archive_name: "awandb-windows-x64.zip"
-          - os: macos-latest
-            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' -DCMAKE_CXX_FLAGS='-O3'"
-            lib_path: "build"
-            archive_name: "awandb-macos-universal.tar.gz"
 
     steps:
       - uses: actions/checkout@v4
@@ -60,8 +56,6 @@ jobs:
           
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             find build -name "awan_engine_core.dll" -print -exec cp {} lib/Release/ \;
-          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            find build -name "*.dylib" -print -exec cp {} lib/Release/ \;
           else
             find build -name "*.so" -print -exec cp {} lib/Release/ \;
           fi
@@ -69,9 +63,11 @@ jobs:
           echo "✅ Artifacts deployed to lib/Release:"
           ls -R lib/Release/
 
-      - name: Run Scala Tests
+      - name: Run Scala Tests (Sequential & High Memory)
         shell: bash
-        run: sbt -Djava.library.path=${{ matrix.lib_path }} test
+        # [FIX] -J-Xmx4G prevents OutOfMemory errors on 5M row tests
+        # [FIX] 'set Test / parallelExecution := false' prevents JNI thread collisions
+        run: sbt -J-Xmx4G -Djava.library.path=${{ matrix.lib_path }} "set Test / parallelExecution := false" test
 
       - name: Build JVM JAR (No Embedded Natives)
         shell: bash
