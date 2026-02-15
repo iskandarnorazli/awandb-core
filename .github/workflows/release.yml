@@ -24,11 +24,16 @@ jobs:
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
             lib_path: "build/Release"
             archive_name: "awandb-windows-x64.zip"
+          # [NEW] Apple Silicon (M1/M2/M3)
           - os: macos-latest
-            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' -DCMAKE_CXX_FLAGS='-O3'"
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
             lib_path: "build"
-            archive_name: "awandb-macos-universal.tar.gz"
-
+            archive_name: "awandb-macos-arm64.tar.gz"
+          # [NEW] Older Intel Macs
+          - os: macos-13
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
+            lib_path: "build"
+            archive_name: "awandb-macos-x86_64.tar.gz"
     steps:
       - uses: actions/checkout@v4
 

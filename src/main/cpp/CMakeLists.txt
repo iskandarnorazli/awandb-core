@@ -6,18 +6,35 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================================================
-# 1. ARCHITECTURE FLAGS (Unchanged)
+# 1. ARCHITECTURE FLAGS & SIMD DETECTION
 # =========================================================
 if(MSVC)
     if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
         message(STATUS "Build Mode: Windows x64 (AVX2 Enabled)")
         add_compile_options(/O2 /arch:AVX2 /Oi /GL)
+        add_compile_definitions(ARCH_X86)
     else()
+        message(STATUS "Build Mode: Windows ARM/Generic")
         add_compile_options(/O2 /Oi /GL)
     endif()
 else()
-    # Linux/Mac
-    add_compile_options(-O3 -march=native -fPIC)
+    # Linux / macOS
+    if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "(x86_64)|(amd64)|(AMD64)")
+        message(STATUS "Build Mode: POSIX x86_64 (AVX2 Enabled)")
+        # [FIX] Explicitly request AVX2 instead of using the dangerous -march=native
+        add_compile_options(-O3 -mavx2 -mfma -fPIC)
+        add_compile_definitions(ARCH_X86)
+        
+    elseif("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "(arm64)|(aarch64)|(ARM64)")
+        message(STATUS "Build Mode: POSIX ARM64 (NEON Enabled)")
+        # [FIX] Safe ARM flags for Apple Silicon & Linux ARM
+        add_compile_options(-O3 -fPIC)
+        add_compile_definitions(ARCH_ARM)
+        
+    else()
+        message(STATUS "Build Mode: POSIX Generic (Scalar Fallback)")
+        add_compile_options(-O3 -fPIC)
+    endif()
 endif()
 
 # =========================================================
