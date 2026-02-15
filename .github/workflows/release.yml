@@ -24,6 +24,10 @@ jobs:
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
             lib_path: "build/Release"
             archive_name: "awandb-windows-x64.zip"
+          - os: macos-latest
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES='x86_64;arm64' -DCMAKE_CXX_FLAGS='-O3'"
+            lib_path: "build"
+            archive_name: "awandb-macos-universal.tar.gz"
 
     steps:
       - uses: actions/checkout@v4
@@ -34,14 +38,18 @@ jobs:
           java-version: '21'
           cache: 'sbt'
 
-      - name: Install SBT (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Install SBT (Ubuntu/macOS)
+        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
         run: |
-          echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | sudo tee /etc/apt/sources.list.d/sbt.list
-          echo "deb https://repo.scala-sbt.org/scalasbt/debian /" | sudo tee /etc/apt/sources.list.d/sbt_old.list
-          curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | sudo apt-key add
-          sudo apt-get update
-          sudo apt-get install sbt
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            echo "deb https://repo.scala-sbt.org/scalasbt/debian all main" | sudo tee /etc/apt/sources.list.d/sbt.list
+            echo "deb https://repo.scala-sbt.org/scalasbt/debian /" | sudo tee /etc/apt/sources.list.d/sbt_old.list
+            curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x2EE0EA64E40A89B84B2DF73499E82A75642AC823" | sudo apt-key add
+            sudo apt-get update
+            sudo apt-get install sbt
+          else
+            brew install sbt
+          fi
 
       - name: Build C++ Engine
         shell: bash
@@ -59,6 +67,8 @@ jobs:
           
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             find build -name "awan_engine_core.dll" -print -exec cp {} lib/Release/ \;
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            find build -name "*.dylib" -print -exec cp {} lib/Release/ \;
           else
             find build -name "*.so" -print -exec cp {} lib/Release/ \;
           fi
