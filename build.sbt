@@ -25,7 +25,7 @@ Test / testGrouping := {
   val originalSettings = (Test / definedTests).value
   // Capture the absolute path to your project root
   val baseDir = baseDirectory.value.getAbsolutePath
-  
+
   originalSettings.map { test =>
     Tests.Group(
       name = test.name,
@@ -62,3 +62,10 @@ libraryDependencies ++= Seq(
   // --- Logging ---
   "org.slf4j" % "slf4j-simple" % "2.0.9"
 )
+
+// --- Assembly (Fat JAR) Configuration ---
+assembly / assemblyMergeStrategy := {
+  case PathList("META-INF", xs @ _*) => MergeStrategy.discard
+  case "module-info.class" => MergeStrategy.discard
+  case x => MergeStrategy.first
+}

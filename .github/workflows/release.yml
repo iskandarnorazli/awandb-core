@@ -85,10 +85,10 @@ jobs:
             exit 1
           fi
 
-      - name: Build JVM JAR (No Embedded Natives)
+      - name: Build JVM Fat JAR
         shell: bash
-        # Using standard 'package' instead of 'assembly' since we don't need a fat JAR anymore
-        run: sbt package
+        # [FIX] Use assembly to bundle Arrow, Netty, and Scala libraries
+        run: sbt assembly
 
       - name: Package OS-Specific Release Archive
         shell: bash
@@ -97,19 +97,22 @@ jobs:
           mkdir -p awandb/lib
           mkdir -p awandb/bin
           
-          # 2. Copy the Native Library & Compiled Scala JAR
+          # 2. Copy the Native Library & Compiled Scala Fat JAR
           cp lib/Release/* awandb/lib/
-          cp target/scala-*/awandb*.jar awandb/lib/awandb.jar
+          # [FIX] Look for the AwanDB-assembly JAR instead of the thin JAR
+          cp target/scala-*/AwanDB-assembly-*.jar awandb/lib/awandb.jar
           
           # 3. Create Standalone Server Scripts
           echo '#!/bin/bash' > awandb/bin/awandb-server.sh
           echo 'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' >> awandb/bin/awandb-server.sh
-          echo 'java -Djava.library.path="$DIR/../lib" -cp "$DIR/../lib/awandb.jar" org.awandb.server.AwanServer "$@"' >> awandb/bin/awandb-server.sh
+          # [FIX] Class name corrected to AwanFlightServer
+          echo 'java -Djava.library.path="$DIR/../lib" -cp "$DIR/../lib/awandb.jar" org.awandb.server.AwanFlightServer "$@"' >> awandb/bin/awandb-server.sh
           chmod +x awandb/bin/awandb-server.sh
 
           echo '@echo off' > awandb/bin/awandb-server.bat
           echo 'set DIR=%~dp0' >> awandb/bin/awandb-server.bat
-          echo 'java -Djava.library.path="%DIR%..\lib" -cp "%DIR%..\lib\awandb.jar" org.awandb.server.AwanServer %*' >> awandb/bin/awandb-server.bat
+          # [FIX] Class name corrected to AwanFlightServer
+          echo 'java -Djava.library.path="%DIR%..\lib" -cp "%DIR%..\lib\awandb.jar" org.awandb.server.AwanFlightServer %*' >> awandb/bin/awandb-server.bat
 
           # 4. Compress Archive
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
