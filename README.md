@@ -130,10 +130,10 @@ If you downloaded a release archive (e.g., `awandb-linux-x86_64.tar.gz` or `awan
 
 ```bash
 # On Linux / macOS
-./bin/awandb-server.sh
+./bin/awandb-server.sh --port {{Port Number}} --data-dir {{Data Directory}}
 
 # On Windows
-.\bin\awandb-server.bat
+.\bin\awandb-server.bat --port {{Port Number}} --data-dir {{Data Directory}}
 ````
 
 **2. Connect from a Client:**
