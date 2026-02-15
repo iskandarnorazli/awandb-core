@@ -115,14 +115,12 @@ jobs:
           # 3. Create Standalone Server Scripts
           echo '#!/bin/bash' > awandb/bin/awandb-server.sh
           echo 'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' >> awandb/bin/awandb-server.sh
-          # [FIX] Class name corrected to AwanFlightServer
-          echo 'java -Djava.library.path="$DIR/../lib" -cp "$DIR/../lib/awandb.jar" org.awandb.server.AwanFlightServer "$@"' >> awandb/bin/awandb-server.sh
+          echo 'java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -Djava.library.path="$DIR/../lib" -cp "$DIR/../lib/awandb.jar" org.awandb.server.AwanFlightServer "$@"' >> awandb/bin/awandb-server.sh
           chmod +x awandb/bin/awandb-server.sh
 
           echo '@echo off' > awandb/bin/awandb-server.bat
           echo 'set DIR=%~dp0' >> awandb/bin/awandb-server.bat
-          # [FIX] Class name corrected to AwanFlightServer
-          echo 'java -Djava.library.path="%DIR%..\lib" -cp "%DIR%..\lib\awandb.jar" org.awandb.server.AwanFlightServer %*' >> awandb/bin/awandb-server.bat
+          echo 'java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -Djava.library.path="%DIR%..\lib" -cp "%DIR%..\lib\awandb.jar" org.awandb.server.AwanFlightServer %*' >> awandb/bin/awandb-server.bat
 
           # 4. Compress Archive
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
