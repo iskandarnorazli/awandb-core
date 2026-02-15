@@ -29,11 +29,6 @@ jobs:
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
             lib_path: "build"
             archive_name: "awandb-macos-arm64.tar.gz"
-          # [NEW] Older Intel Macs
-          - os: macos-13
-            cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
-            lib_path: "build"
-            archive_name: "awandb-macos-x86_64.tar.gz"
     steps:
       - uses: actions/checkout@v4
 

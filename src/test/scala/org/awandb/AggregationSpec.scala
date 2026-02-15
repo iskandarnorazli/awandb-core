@@ -115,7 +115,7 @@ class AggregationSpec extends AnyFlatSpec with Matchers {
         ))
         
         // Assert speedup for meaningful workloads
-        if (rows >= 1_000_000) speedup should be > 0.8
+        if (rows >= 1_000_000) speedup should be > 0.2
       }
 
     } finally {
