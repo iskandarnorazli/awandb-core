@@ -683,7 +683,7 @@ class AwanTable(
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Iterator.empty
 
-    // 1. RAM Filter
+    // 1. RAM Filter (Unchanged)
     val ramIter = (0 until columns(colName).deltaIntBuffer.length).iterator.collect {
        case i if !ramDeleted.get(i) =>
          val v = columns(colName).deltaIntBuffer(i)
@@ -737,24 +737,39 @@ class AwanTable(
            if (matchCount == 0) {
                Iterator.empty
            } else {
+               // [THE FIX] Bulk Columnar Gather!
+               // 1. First, pull the exact matched row indices into Scala
                val matchingIndices = new Array[Int](matchCount)
                NativeBridge.copyToScala(outIndicesPtr, matchingIndices, matchCount)
                
-               // [FIX] Bypassing getRow() and fetching directly from native memory
-               matchingIndices.map { i =>
-                 val row = new Array[Any](columns.size)
-                 var c = 0
-                 for(cn <- columnOrder) {
-                     val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
-                     var stride = NativeBridge.getColumnStride(blockPtr, c)
-                     if (stride == 0) stride = 4 // Fallback protection
-                     val cellPtr = NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
-                     val temp = new Array[Int](1)
-                     NativeBridge.copyToScala(cellPtr, temp, 1)
-                     row(c) = temp(0)
-                     c += 1
-                 }
-                 row
+               // 2. Allocate Scala arrays to hold the fully extracted columns
+               val colsData = new Array[Array[Int]](columnOrder.size)
+               
+               // 3. For each column, do ONE massive JNI fetch
+               for (c <- columnOrder.indices) {
+                   colsData(c) = new Array[Int](matchCount)
+                   val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
+                   
+                   // Allocate a temporary native buffer for the C++ gather kernel
+                   val tempValuesPtr = NativeBridge.allocMainStore(matchCount)
+                   
+                   // Use the blazingly fast C++ AVX gather kernel
+                   NativeBridge.batchRead(colPtr, outIndicesPtr, matchCount, tempValuesPtr)
+                   
+                   // Copy the entire column to Scala in one swoop
+                   NativeBridge.copyToScala(tempValuesPtr, colsData(c), matchCount)
+                   
+                   // Free the temporary native buffer
+                   NativeBridge.freeMainStore(tempValuesPtr)
+               }
+               
+               // 4. Transpose the columnar arrays into rows purely in Scala (Zero JNI overhead)
+               (0 until matchCount).map { i =>
+                   val row = new Array[Any](columnOrder.size)
+                   for (c <- columnOrder.indices) {
+                       row(c) = colsData(c)(i)
+                   }
+                   row
                }.toIterator
            }
        } finally {
