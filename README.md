@@ -122,11 +122,19 @@ AwanDB can be deployed as a dedicated database server, allowing external microse
 
 **1. Start the Server:**
 
-```bash
-# Launch the pre-compiled AwanDB server binary
-./awandb-server --port 5432 --data-dir /var/lib/awandb
+If you downloaded a release archive (e.g., `awandb-linux-x86_64.tar.gz` or `awandb-windows-x64.zip`):
 
-```
+1. Extract the archive.
+2. Navigate to the extracted folder.
+3. Run the standalone server using the provided wrapper scripts (which automatically link the C++ engine to the JVM):
+
+```bash
+# On Linux / macOS
+./bin/awandb-server.sh
+
+# On Windows
+.\bin\awandb-server.bat
+````
 
 **2. Connect from a Client:**
 
