@@ -5,8 +5,10 @@ scalaVersion := "3.3.5"
 // --- Run Configuration ---
 fork := true
 run / connectInput := true 
+// 2. Unlock the internal NIO modules that Arrow requires
 Test / javaOptions ++= Seq(
-  "--add-opens=java.base/java.nio=ALL-UNNAMED"
+  "--add-opens=java.base/java.nio=ALL-UNNAMED",
+  "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED"
 )
 
 // Default main class (Standalone Server)
