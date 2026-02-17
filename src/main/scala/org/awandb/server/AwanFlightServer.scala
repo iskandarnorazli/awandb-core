@@ -64,10 +64,16 @@ object AwanFlightServer {
     val allocator = new RootAllocator()
     val location = Location.forGrpcInsecure("0.0.0.0", port)
     
-    // Wire up the producer
-    val producer = new AwanFlightProducer(allocator, location)
+    // 1. Initialize the new Flight SQL Producer
+    val producer = new AwanFlightSqlProducer(allocator, location)
 
-    val server = FlightServer.builder(allocator, location, producer).build()
+    // 2. Initialize the Auth Handler
+    val authHandler = new org.awandb.server.auth.AwanAuthHandler()
+
+    // 3. Build the server with Auth Enabled
+    val server = FlightServer.builder(allocator, location, producer)
+      .headerAuthenticator(authHandler) // [FIX] Pass the handler directly!
+      .build()
 
     try {
       server.start()

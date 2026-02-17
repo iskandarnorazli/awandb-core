@@ -58,6 +58,7 @@ libraryDependencies ++= Seq(
   "org.apache.arrow" % "arrow-memory-netty" % arrowVersion,
   "org.apache.arrow" % "flight-core" % arrowVersion,
   "org.apache.arrow" % "flight-grpc" % arrowVersion,
+  "org.apache.arrow" % "flight-sql" % arrowVersion,
   
   // --- Logging ---
   "org.slf4j" % "slf4j-simple" % "2.0.9"

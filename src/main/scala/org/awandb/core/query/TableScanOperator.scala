@@ -42,88 +42,90 @@ class TableScanOperator(
   }
 
   override def next(): VectorBatch = {
-    // 1. Reset Batch
     batch.count = 0
     var rowsFilled = 0
     
-    // We track the active block to enforce the Late Materialization constraint
-    // (A batch generally shouldn't span multiple blocks if downstream needs blockPtr)
-    var activeBlockPtr: Long = 0
+    var currentBatchBlockPtr: Long = 0
+    var currentBatchIsClean: Boolean = false // [NEW] Cache the map lookup
 
-    // 2. Loop until batch is full or we run out of blocks
     while (rowsFilled < batchSize && currentBlockIdx < blocks.length) {
       val blockPtr = blocks(currentBlockIdx)
       
-      // Safety check: Skip null blocks
       if (blockPtr == 0) {
           currentBlockIdx += 1
           currentRowInBlock = 0
       } else {
         
-        // Initialize active block for this batch
-        if (activeBlockPtr == 0) {
-            activeBlockPtr = blockPtr
-            batch.blockPtr = activeBlockPtr
-            // Note: With deletion filtering, startRowInBlock is less useful 
-            // as the batch is no longer contiguous, but we set it for reference.
+        // [FIX] Initialize batch tracking and do the HashMap lookup exactly ONCE
+        if (currentBatchBlockPtr == 0) {
+            currentBatchBlockPtr = blockPtr
+            batch.blockPtr = currentBatchBlockPtr
             batch.startRowInBlock = currentRowInBlock 
+            
+            // Query the ConcurrentHashMap only once per 4096-row batch
+            currentBatchIsClean = blockManager.isClean(blockPtr) 
         }
 
-        // [LATE MAT CONSTRAINT] If we hit a new block, stop and return what we have.
-        if (blockPtr != activeBlockPtr) {
+        if (blockPtr != currentBatchBlockPtr) {
             batch.count = rowsFilled
             return batch
         }
 
         val totalRows = NativeBridge.getRowCount(blockPtr)
-        
-        // Resolve Column Pointers
         val keyColBase = NativeBridge.getColumnPtr(blockPtr, keyColIdx)
         val valColBase = NativeBridge.getColumnPtr(blockPtr, valColIdx)
         
-        // Resolve Strides (Handle Compression)
         var keyStride = NativeBridge.getColumnStride(blockPtr, keyColIdx)
         if (keyStride == 0) keyStride = 4
         
         var valStride = NativeBridge.getColumnStride(blockPtr, valColIdx)
         if (valStride == 0) valStride = 4
 
-        // [CRITICAL LOOP] Row-by-Row Scan with Deletion Check
-        while (currentRowInBlock < totalRows && rowsFilled < batchSize) {
-           
-           // 1. Check Tombstone (Bitmap)
-           if (!blockManager.isDeleted(blockPtr, currentRowInBlock)) {
-               
-               // 2. Row is ALIVE. Copy Key.
-               val srcKey = NativeBridge.getOffsetPointer(keyColBase, currentRowInBlock * keyStride.toLong)
-               val dstKey = NativeBridge.getOffsetPointer(batch.keysPtr, rowsFilled * 4L)
-               
-               keyStride match {
-                 case 4 => NativeBridge.memcpy(srcKey, dstKey, 4)
-                 case 1 => NativeBridge.unpack8To32(srcKey, dstKey, 1)
-                 case 2 => NativeBridge.unpack16To32(srcKey, dstKey, 1)
-                 case _ => NativeBridge.memcpy(srcKey, dstKey, 4)
-               }
+        // [FIX] Use the cached boolean instead of calling the BlockManager again
+        if (currentBatchIsClean && keyStride == 4 && valStride == 4) {
+            val rowsToCopy = math.min(batchSize - rowsFilled, totalRows - currentRowInBlock)
+            
+            val srcKey = NativeBridge.getOffsetPointer(keyColBase, currentRowInBlock * 4L)
+            val dstKey = NativeBridge.getOffsetPointer(batch.keysPtr, rowsFilled * 4L)
+            NativeBridge.memcpy(srcKey, dstKey, rowsToCopy * 4L)
+            
+            val srcVal = NativeBridge.getOffsetPointer(valColBase, currentRowInBlock * 4L)
+            val dstVal = NativeBridge.getOffsetPointer(batch.valuesPtr, rowsFilled * 4L)
+            NativeBridge.memcpy(srcVal, dstVal, rowsToCopy * 4L)
+            
+            rowsFilled += rowsToCopy
+            currentRowInBlock += rowsToCopy
+            
+        } else {
+            while (currentRowInBlock < totalRows && rowsFilled < batchSize) {
+               if (!blockManager.isDeleted(blockPtr, currentRowInBlock)) {
+                   
+                   val srcKey = NativeBridge.getOffsetPointer(keyColBase, currentRowInBlock * keyStride.toLong)
+                   val dstKey = NativeBridge.getOffsetPointer(batch.keysPtr, rowsFilled * 4L)
+                   
+                   keyStride match {
+                     case 4 => NativeBridge.memcpy(srcKey, dstKey, 4)
+                     case 1 => NativeBridge.unpack8To32(srcKey, dstKey, 1)
+                     case 2 => NativeBridge.unpack16To32(srcKey, dstKey, 1)
+                     case _ => NativeBridge.memcpy(srcKey, dstKey, 4)
+                   }
 
-               // 3. Copy Value.
-               val srcVal = NativeBridge.getOffsetPointer(valColBase, currentRowInBlock * valStride.toLong)
-               val dstVal = NativeBridge.getOffsetPointer(batch.valuesPtr, rowsFilled * 4L) // Values are always 4 bytes here (Int)
-               
-               valStride match {
-                 case 4 => NativeBridge.memcpy(srcVal, dstVal, 4)
-                 case 1 => NativeBridge.unpack8To32(srcVal, dstVal, 1)
-                 case 2 => NativeBridge.unpack16To32(srcVal, dstVal, 1)
-                 case _ => NativeBridge.memcpy(srcVal, dstVal, 4)
+                   val srcVal = NativeBridge.getOffsetPointer(valColBase, currentRowInBlock * valStride.toLong)
+                   val dstVal = NativeBridge.getOffsetPointer(batch.valuesPtr, rowsFilled * 4L)
+                   
+                   valStride match {
+                     case 4 => NativeBridge.memcpy(srcVal, dstVal, 4)
+                     case 1 => NativeBridge.unpack8To32(srcVal, dstVal, 1)
+                     case 2 => NativeBridge.unpack16To32(srcVal, dstVal, 1)
+                     case _ => NativeBridge.memcpy(srcVal, dstVal, 4)
+                   }
+                   
+                   rowsFilled += 1
                }
-               
-               rowsFilled += 1
-           }
-           
-           // Move to next row in block regardless of whether we copied it or not
-           currentRowInBlock += 1
+               currentRowInBlock += 1
+            }
         }
         
-        // Check if block is exhausted
         if (currentRowInBlock >= totalRows) {
           currentBlockIdx += 1
           currentRowInBlock = 0
@@ -132,7 +134,6 @@ class TableScanOperator(
     }
     
     if (rowsFilled == 0) return null
-    
     batch.count = rowsFilled
     batch
   }

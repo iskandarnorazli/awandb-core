@@ -251,22 +251,33 @@ object SQLHandler {
            val tableName = update.getTable.getName.toLowerCase
            val table = tables.get(tableName)
            if (table == null) return s"Error: Table '$tableName' not found."
+           
            val where = update.getWhere
            if (where == null || !where.isInstanceOf[EqualsTo]) return "Error: UPDATE only supports 'WHERE id = value'."
+           
            val eq = where.asInstanceOf[EqualsTo]
            val rightExpr = eq.getRightExpression
            if (!rightExpr.isInstanceOf[LongValue]) return "Error: UPDATE only supports integer IDs."
+           
            val id = rightExpr.asInstanceOf[LongValue].getValue.toInt
            val oldRowOpt = table.getRow(id)
-           if (oldRowOpt.isEmpty) return "Row not found."
+           if (oldRowOpt.isEmpty) return "Error: Row not found."
+           
            val row = oldRowOpt.get
            val cols = update.getColumns.asScala
            val exprs = update.getExpressions.asScala
+           
            for (i <- cols.indices) {
               val colName = cols(i).getColumnName
-              val newVal = exprs(i).asInstanceOf[LongValue].getValue.toInt
               val colIdx = table.columnOrder.indexOf(colName)
-              if (colIdx != -1) row(colIdx) = newVal
+              if (colIdx != -1) {
+                  // [FIX] Safely handle both Integers and Strings
+                  exprs(i) match {
+                      case l: LongValue => row(colIdx) = l.getValue.toInt
+                      case s: StringValue => row(colIdx) = s.getValue
+                      case _ => // Ignore unsupported types for now
+                  }
+              }
            }
            table.delete(id)
            table.insertRow(row)
