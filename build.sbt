@@ -5,6 +5,9 @@ scalaVersion := "3.3.5"
 // --- Run Configuration ---
 fork := true
 run / connectInput := true 
+Test / javaOptions ++= Seq(
+  "--add-opens=java.base/java.nio=ALL-UNNAMED"
+)
 
 // Default main class (Standalone Server)
 Compile / mainClass := Some("org.awandb.server.AwanServer")
