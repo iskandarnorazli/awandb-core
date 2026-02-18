@@ -65,7 +65,7 @@ object AwanFlightServer {
     val location = Location.forGrpcInsecure("0.0.0.0", port)
     
     // 1. Initialize the new Flight SQL Producer
-    val producer = new AwanFlightSqlProducer(allocator, location)
+    val producer = new AwanFlightSqlProducer(allocator, location, defaultTable)
 
     // 2. Initialize the Auth Handler
     val authHandler = new org.awandb.server.auth.AwanAuthHandler()

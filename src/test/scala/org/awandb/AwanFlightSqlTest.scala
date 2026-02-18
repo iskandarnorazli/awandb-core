@@ -47,7 +47,9 @@ class AwanFlightSqlTest extends AnyFunSuite with BeforeAndAfterAll {
     // 3. Start the Secure Arrow Flight SQL Server
     allocator = new RootAllocator()
     val location = Location.forGrpcInsecure("127.0.0.1", port)
-    val producer = new AwanFlightSqlProducer(allocator, location)
+    
+    // [FIX] Inject the testTable into the producer constructor
+    val producer = new AwanFlightSqlProducer(allocator, location, testTable)
     val authHandler = new AwanAuthHandler()
 
     server = FlightServer.builder(allocator, location, producer)
@@ -185,6 +187,42 @@ class AwanFlightSqlTest extends AnyFunSuite with BeforeAndAfterAll {
 
     // Since our parser formats the output as "Found Rows: \n", we just check it doesn't contain the user
     assert(!foundData.contains("UpdatedUser"))
+
+    stream.close(); root.close(); client.close(); clientAllocator.close()
+  }
+
+  // --- Native Network JSON Ingestion ---
+
+  test("7. Custom RPC: Should ingest JSON payload via doAction bypassing SQL") {
+    val clientAllocator = new RootAllocator()
+    val client = FlightClient.builder(clientAllocator, Location.forGrpcInsecure("127.0.0.1", port)).build()
+    val validAuth = new CredentialCallOption(new BasicAuthCredentialWriter("admin", "admin"))
+
+    // 1. Send the JSON payload via the custom Action endpoint
+    val jsonPayload = """[{"id": 99, "username": "JsonUser"}]"""
+    val action = new Action("IngestJson:users", jsonPayload.getBytes("UTF-8"))
+    
+    val results = client.doAction(action, validAuth)
+    var responseStr = ""
+    while (results.hasNext) {
+      responseStr += new String(results.next().getBody, "UTF-8")
+    }
+    
+    // Ensure the server returned the correct insertion count
+    assert(responseStr.contains("\"inserted\": 1"))
+
+    // 2. Read the data back using standard SQL to verify it landed in the columnar table
+    val sqlClient = new FlightSqlClient(client)
+    val flightInfo = sqlClient.execute("SELECT * FROM users", validAuth)
+    val stream = client.getStream(flightInfo.getEndpoints.get(0).getTicket, validAuth)
+    val root = stream.getRoot
+    var foundData = ""
+    while (stream.next()) {
+      val resultVector = root.getVector("query_result").asInstanceOf[org.apache.arrow.vector.VarCharVector]
+      foundData += new String(resultVector.get(0), "UTF-8")
+    }
+
+    assert(foundData.contains("JsonUser"))
 
     stream.close(); root.close(); client.close(); clientAllocator.close()
   }

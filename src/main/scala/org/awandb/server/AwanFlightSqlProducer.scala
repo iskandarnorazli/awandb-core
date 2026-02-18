@@ -9,8 +9,10 @@ import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, Schema}
 import org.awandb.core.sql.SQLHandler
 import scala.jdk.CollectionConverters._
+import java.nio.charset.StandardCharsets
+import org.awandb.core.engine.EngineManager
 
-class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) extends FlightSqlProducer {
+class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location, val targetTable: org.awandb.core.engine.AwanTable) extends FlightSqlProducer {
 
   // ========================================================================
   // 1. EXECUTE QUERY (SELECT) - The Read Pipeline
@@ -19,7 +21,7 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
   override def getFlightInfoStatement(command: CommandStatementQuery, context: FlightProducer.CallContext, descriptor: FlightDescriptor): FlightInfo = {
     val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
     
-    // [FIX] Pack a TicketStatementQuery into the Ticket (Required by Arrow Spec)
+    // Pack a TicketStatementQuery into the Ticket (Required by Arrow Spec)
     val ticketMsg = TicketStatementQuery.newBuilder()
       .setStatementHandle(com.google.protobuf.ByteString.copyFromUtf8(command.getQuery))
       .build()
@@ -42,7 +44,7 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
 
       val resultString = SQLHandler.execute(sql)
       
-      // [FIX] Convert silent SQL strings into hard network exceptions
+      // Convert silent SQL strings into hard network exceptions
       if (resultString.startsWith("Error:") || resultString.startsWith("SQL Error:")) {
         throw new IllegalArgumentException(resultString)
       }
@@ -85,13 +87,9 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
           
           val resultString = SQLHandler.execute(sql)
           
-          // [FIX] Convert silent SQL strings into hard network exceptions
           if (resultString.startsWith("Error:") || resultString.startsWith("SQL Error:")) {
             throw new IllegalArgumentException(resultString)
           }
-
-          // [FIX] Removed the blocking while(flightStream.next()) loop!
-          // We do not wait for data the client isn't going to send.
 
           val updateResult = DoPutUpdateResult.newBuilder().setRecordCount(1L).build()
           val resultBytes = updateResult.toByteArray
@@ -113,6 +111,43 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
             listener.onError(CallStatus.INTERNAL.withDescription(e.getMessage).toRuntimeException)
         }
       }
+    }
+  }
+
+  // =========================================================================
+  // CUSTOM RPC ENDPOINTS (Bypassing SQL Parser for Native JSON Ingestion)
+  // =========================================================================
+  override def doAction(
+      context: FlightProducer.CallContext, 
+      action: Action, 
+      listener: FlightProducer.StreamListener[org.apache.arrow.flight.Result]
+  ): Unit = {
+    
+    val actionType = action.getType
+    
+    if (actionType.startsWith("IngestJson:")) {
+      try {
+        // Parse the raw bytes directly into the Shredder using the injected table
+        val jsonPayload = new String(action.getBody, StandardCharsets.UTF_8)
+        val insertedRows = org.awandb.core.ingest.JsonShredder.ingest(jsonPayload, targetTable)
+        
+        // Return success response to the client
+        val resultBytes = s"""{"inserted": $insertedRows}""".getBytes(StandardCharsets.UTF_8)
+        listener.onNext(new org.apache.arrow.flight.Result(resultBytes))
+        listener.onCompleted()
+        
+      } catch {
+        case e: Exception => 
+          listener.onError(
+            CallStatus.INTERNAL
+              .withDescription(s"JSON Ingestion failed: ${e.getMessage}")
+              .withCause(e)
+              .toRuntimeException
+          )
+      }
+    } else {
+      // Vital: Fallback to standard Arrow Flight SQL actions (like query cancellation)
+      super.doAction(context, action, listener)
     }
   }
 
