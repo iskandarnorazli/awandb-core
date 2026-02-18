@@ -25,11 +25,13 @@ Test / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 // Forces SBT to spawn a brand new, pristine JVM for every single test suite.
 // This prevents C++ memory leaks, double-frees, and static state bleed.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// JNI TEST ISOLATION CONFIGURATION
+// ---------------------------------------------------------------------------
 Test / fork := true
 Test / parallelExecution := false
 Test / testGrouping := {
   val originalSettings = (Test / definedTests).value
-  // Capture the absolute path to your project root
   val baseDir = baseDirectory.value.getAbsolutePath
 
   originalSettings.map { test =>
@@ -38,8 +40,12 @@ Test / testGrouping := {
       tests = Seq(test),
       runPolicy = Tests.SubProcess(
         ForkOptions().withRunJVMOptions(Vector(
-          "-Xmx4G", // Keep the generous heap
-          s"-Djava.library.path=$baseDir/lib/Release" // [FIX] Re-inject the native library path!
+          "-Xmx4G", 
+          s"-Djava.library.path=$baseDir/lib/Release",
+          // [FIX] Arrow Native Memory Access Flags MUST be in this Vector!
+          "--add-opens=java.base/java.nio=ALL-UNNAMED",
+          "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+          "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
         ))
       )
     )
