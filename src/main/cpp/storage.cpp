@@ -87,6 +87,15 @@ extern "C" {
         env->ReleaseIntArrayElements(jData, scalaData, 0);
     }
 
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadDataLongNative(JNIEnv* env, jobject obj, jlong ptr, jlongArray jData) {
+        if (ptr == 0 || jData == nullptr) return;
+        jlong* scalaData = env->GetLongArrayElements(jData, nullptr);
+        jsize length = env->GetArrayLength(jData);
+        // Copy FROM Scala TO C++
+        std::memcpy((void*)ptr, scalaData, (size_t)length * sizeof(int64_t));
+        env->ReleaseLongArrayElements(jData, scalaData, 0);
+    }
+
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaNative(JNIEnv* env, jobject obj, jlong srcPtr, jintArray dstArray, jint len) {
         if (srcPtr == 0) return;
         int* cppData = (int*)srcPtr;

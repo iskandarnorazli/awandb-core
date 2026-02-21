@@ -655,6 +655,79 @@ class AwanTable(
     finalMap.toMap
   }
 
+  /**
+   * High-Performance Fused Filter & Group By
+   * AVX scans the filter column, and upon a match, immediately gathers the key/val 
+   * and hashes them into the map. Zero intermediate array allocations.
+   *
+   * opTypes: 0 (=), 1 (>), 2 (>=), 3 (<), 4 (<=)
+   */
+  def executeFilteredGroupBy(
+      keyCol: String, 
+      valCol: String, 
+      filterCol: String, 
+      opType: Int, 
+      targetVal: Int
+  ): Map[Int, Long] = {
+    
+    val keyIdx = columnOrder.indexOf(keyCol)
+    val valIdx = columnOrder.indexOf(valCol)
+    val filterIdx = columnOrder.indexOf(filterCol)
+
+    if (keyIdx == -1 || valIdx == -1 || filterIdx == -1) {
+      throw new IllegalArgumentException(s"Invalid columns for Filtered Group By: $keyCol, $valCol, $filterCol")
+    }
+
+    // 1. Create the shared Native HashMap 
+    // Heuristic: Pre-allocate capacity. Since it's filtered, we expect fewer rows than the total count.
+    val capacityHint = 10000 // Safe default, C++ map will auto-resize if needed
+    val mapPtr = NativeBridge.aggregateCreateMap(capacityHint)
+
+    var totalAggregatedRows = 0
+
+    // 2. The Fused Loop: Stream blocks directly through the AVX Filter -> HashMap pipeline
+    val blocks = blockManager.getLoadedBlocks // Assuming this returns Seq[Long] of block pointers
+    for (blockPtr <- blocks) {
+      // Pass the deletion bitmask if your blockManager tracks lock-free deletes
+      val bitmaskPtr = 0L 
+      
+      totalAggregatedRows += NativeBridge.avxFilteredAggregate(
+        blockPtr, 
+        filterIdx, opType, targetVal, 
+        keyIdx, valIdx, 
+        mapPtr, bitmaskPtr
+      )
+    }
+
+    // If no rows matched the filter, clean up and return empty map
+    if (totalAggregatedRows == 0) {
+      NativeBridge.freeAggregationResult(mapPtr)
+      return Map.empty
+    }
+
+    // 3. Export the Results
+    // We allocate worst-case output arrays (if every matched row had a unique key)
+    val outKeysPtr = NativeBridge.allocMainStore(totalAggregatedRows)
+    val outValsPtr = NativeBridge.allocMainStore(totalAggregatedRows * 2) // Longs take 2 slots (8 bytes)
+
+    // aggregateExport writes the distinct keys/vals and returns the exact distinct count
+    val uniqueCount = NativeBridge.aggregateExport(mapPtr, outKeysPtr, outValsPtr)
+
+    val scalaKeys = new Array[Int](uniqueCount)
+    val scalaVals = new Array[Long](uniqueCount)
+
+    NativeBridge.copyToScala(outKeysPtr, scalaKeys, uniqueCount)
+    NativeBridge.copyToScalaLong(outValsPtr, scalaVals, uniqueCount)
+
+    // 4. Clean up Native Memory
+    NativeBridge.freeMainStore(outKeysPtr)
+    NativeBridge.freeMainStore(outValsPtr)
+    NativeBridge.freeAggregationResult(mapPtr)
+
+    // 5. Package and return the results
+    scalaKeys.zip(scalaVals).toMap
+  }
+
   // Fast In-Place Update for Integers
   def updateCellNative(id: Int, colName: String, newValue: Int): Boolean = {
     rwLock.writeLock().lock()
@@ -779,6 +852,123 @@ class AwanTable(
     }.iterator
 
     ramIter ++ diskIter
+  }
+
+  /**
+   * High-Performance Star Schema Query (Fused Join + Aggregate)
+   * e.g., SELECT dim.groupCol, SUM(fact.sumCol) FROM fact JOIN dim ON fact.probeCol = dim.buildCol
+   *
+   * @param dimTable The Dimension Table (Build Side)
+   * @param buildCol The Primary Key in Dim Table
+   * @param groupCol The Attribute in Dim Table to Group By
+   * @param probeCol The Foreign Key in Fact Table (This table)
+   * @param sumCol   The Measure in Fact Table to Sum (This table)
+   */
+  def executeStarQuery(
+      dimTable: AwanTable, 
+      buildCol: String, 
+      groupCol: String, 
+      probeCol: String, 
+      sumCol: String
+  ): Map[Int, Long] = {
+
+    val buildIdx = dimTable.columnOrder.indexOf(buildCol)
+    val groupIdx = dimTable.columnOrder.indexOf(groupCol)
+    val probeIdx = this.columnOrder.indexOf(probeCol)
+    val sumIdx = this.columnOrder.indexOf(sumCol)
+
+    if (Seq(buildIdx, groupIdx, probeIdx, sumIdx).contains(-1)) {
+      throw new IllegalArgumentException("Invalid columns specified for Star Query.")
+    }
+
+    // ---------------------------------------------------------
+    // PHASE 1: Build the Join Map (from Dimension Table)
+    // ---------------------------------------------------------
+    val dimBlocks = dimTable.blockManager.getLoadedBlocks
+    
+    // Calculate total rows in the dimension table dynamically
+    var totalDimRows = 0
+    for (b <- dimBlocks) {
+      totalDimRows += NativeBridge.getRowCount(b)
+    }
+
+    val dimKeys = new Array[Int](totalDimRows)
+    val dimPayloads = new Array[Long](totalDimRows)
+    var dimOffset = 0
+    
+    for (blockPtr <- dimBlocks) {
+      val rowsInBlock = NativeBridge.getRowCount(blockPtr)
+      val keyPtr = NativeBridge.getColumnPtr(blockPtr, buildIdx)
+      val payloadPtr = NativeBridge.getColumnPtr(blockPtr, groupIdx)
+      
+      val tempKeys = new Array[Int](rowsInBlock)
+      val tempPayloads = new Array[Int](rowsInBlock) // Assume INT payloads for now
+      
+      NativeBridge.copyToScala(keyPtr, tempKeys, rowsInBlock)
+      NativeBridge.copyToScala(payloadPtr, tempPayloads, rowsInBlock)
+      
+      for (i <- 0 until rowsInBlock) {
+        dimKeys(dimOffset + i) = tempKeys(i)
+        dimPayloads(dimOffset + i) = tempPayloads(i).toLong
+      }
+      dimOffset += rowsInBlock
+    }
+
+    // Allocate native arrays for the builder
+    val nativeDimKeysPtr = NativeBridge.allocMainStore(totalDimRows)
+    val nativeDimPayloadsPtr = NativeBridge.allocMainStore(totalDimRows * 2) 
+    
+    NativeBridge.loadData(nativeDimKeysPtr, dimKeys)
+    
+    // [FIXED] Properly load the 64-bit payloads into C++ memory
+    NativeBridge.loadDataLong(nativeDimPayloadsPtr, dimPayloads) 
+
+    // Create the C++ Join Map
+    val joinMapPtr = NativeBridge.joinBuild(nativeDimKeysPtr, nativeDimPayloadsPtr, totalDimRows)
+
+    // ---------------------------------------------------------
+    // PHASE 2: Pipelined Probe & Aggregate (on Fact Table)
+    // ---------------------------------------------------------
+    val capacityHint = if (totalDimRows > 0) totalDimRows else 10000
+    val aggMapPtr = NativeBridge.aggregateCreateMap(capacityHint)
+    var totalAggregated = 0
+
+    // Stream the Fact blocks directly into the C++ God Kernel
+    for (blockPtr <- this.blockManager.getLoadedBlocks) {
+      totalAggregated += NativeBridge.joinProbeAndAggregate(
+        blockPtr, probeIdx, sumIdx, joinMapPtr, aggMapPtr, 0L
+      )
+    }
+
+    // ---------------------------------------------------------
+    // PHASE 3: Export Results & Cleanup
+    // ---------------------------------------------------------
+    var resultMap = Map.empty[Int, Long]
+
+    if (totalAggregated > 0) {
+      val outKeysPtr = NativeBridge.allocMainStore(totalAggregated)
+      val outValsPtr = NativeBridge.allocMainStore(totalAggregated * 2)
+
+      val uniqueCount = NativeBridge.aggregateExport(aggMapPtr, outKeysPtr, outValsPtr)
+
+      val scalaKeys = new Array[Int](uniqueCount)
+      val scalaVals = new Array[Long](uniqueCount)
+      NativeBridge.copyToScala(outKeysPtr, scalaKeys, uniqueCount)
+      NativeBridge.copyToScalaLong(outValsPtr, scalaVals, uniqueCount)
+
+      resultMap = scalaKeys.zip(scalaVals).toMap
+
+      NativeBridge.freeMainStore(outKeysPtr)
+      NativeBridge.freeMainStore(outValsPtr)
+    }
+
+    // Free all native memory
+    NativeBridge.freeMainStore(nativeDimKeysPtr)
+    NativeBridge.freeMainStore(nativeDimPayloadsPtr)
+    NativeBridge.joinDestroy(joinMapPtr)
+    NativeBridge.freeAggregationResult(aggMapPtr)
+
+    resultMap
   }
 
   def close(): Unit = {

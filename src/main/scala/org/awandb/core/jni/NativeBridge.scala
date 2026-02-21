@@ -151,6 +151,27 @@ class NativeBridge {
   // --- MULTI-MODE & STATE TRANSITION ---
   @native def setBlockModeNative(blockPtr: Long, newMode: Int): Unit
   @native def fsyncBlockNative(blockPtr: Long, path: String): Boolean
+
+  @native def avxFilteredAggregateNative(
+      blockPtr: Long, 
+      filterColIdx: Int, opType: Int, targetVal: Int,
+      keyColIdx: Int, valColIdx: Int,
+      mapPtr: Long, deletedBitmaskPtr: Long
+  ): Int
+
+  @native def aggregateCreateMapNative(capacityHint: Int): Long
+  
+  @native def avxAggregateNative(
+      blockPtr: Long, keyColIdx: Int, valColIdx: Int, 
+      mapPtr: Long, deletedBitmaskPtr: Long
+  ): Int
+
+  @native def joinProbeAndAggregateNative(
+      blockPtr: Long, probeKeyColIdx: Int, sumValColIdx: Int,
+      joinMapPtr: Long, aggMapPtr: Long, deletedBitmaskPtr: Long
+  ): Int
+
+  @native def loadDataLongNative(ptr: Long, data: Array[Long]): Unit
 }
 
 // -----------------------------------------------------------
@@ -463,6 +484,42 @@ object NativeBridge {
   def setRowCount(blockPtr: Long, rowCount: Int): Unit = {
     if (blockPtr != 0) {
       instance.setRowCountNative(blockPtr, rowCount)
+    }
+  }
+
+  def avxFilteredAggregate(
+      blockPtr: Long, 
+      filterColIdx: Int, opType: Int, targetVal: Int,
+      keyColIdx: Int, valColIdx: Int,
+      mapPtr: Long, deletedBitmaskPtr: Long
+  ): Int = {
+    if (blockPtr == 0 || mapPtr == 0) return 0
+    instance.avxFilteredAggregateNative(
+        blockPtr, filterColIdx, opType, targetVal, 
+        keyColIdx, valColIdx, mapPtr, deletedBitmaskPtr
+    )
+  }
+
+  def aggregateCreateMap(capacityHint: Int): Long = instance.aggregateCreateMapNative(capacityHint)
+
+  def avxAggregate(blockPtr: Long, keyColIdx: Int, valColIdx: Int, mapPtr: Long, deletedBitmaskPtr: Long): Int = {
+    if (blockPtr == 0 || mapPtr == 0) return 0
+    instance.avxAggregateNative(blockPtr, keyColIdx, valColIdx, mapPtr, deletedBitmaskPtr)
+  }
+
+  def joinProbeAndAggregate(
+      blockPtr: Long, probeKeyColIdx: Int, sumValColIdx: Int,
+      joinMapPtr: Long, aggMapPtr: Long, deletedBitmaskPtr: Long
+  ): Int = {
+    if (blockPtr == 0 || joinMapPtr == 0 || aggMapPtr == 0) return 0
+    instance.joinProbeAndAggregateNative(
+      blockPtr, probeKeyColIdx, sumValColIdx, joinMapPtr, aggMapPtr, deletedBitmaskPtr
+    )
+  }
+
+  def loadDataLong(ptr: Long, data: Array[Long]): Unit = {
+    if (ptr != 0 && data != null) {
+      instance.loadDataLongNative(ptr, data)
     }
   }
 }

@@ -79,22 +79,92 @@ object SQLHandler {
           val leftTable = tables.get(leftTableName)
           if (leftTable == null) return s"Error: Table '$leftTableName' not found."
 
-          // 1. CHECK FOR GROUP BY
+          // ====================================================================
+          // ROUTER: JOINS & AGGREGATIONS
+          // ====================================================================
+          val joins = plain.getJoins
           val groupBy = plain.getGroupBy
-          if (groupBy != null) {
-            val keyCol = groupBy.getGroupByExpressionList.getExpressions.get(0).asInstanceOf[Column].getColumnName
+
+          // --------------------------------------------------------------------
+          // PATH 1: STAR SCHEMA (JOIN + GROUP BY)
+          // Uses the Fused Join-Aggregate C++ God Kernel
+          // --------------------------------------------------------------------
+          if (joins != null && !joins.isEmpty && groupBy != null) {
+            val join = joins.get(0)
+            val rightTableName = join.getRightItem.asInstanceOf[Table].getName.toLowerCase
+            val rightTable = tables.get(rightTableName)
+            if (rightTable == null) return s"Error: Dimension Table '$rightTableName' not found."
+
+            // Parse ON Clause (e.g., ON fact.dim_id = dim.id)
+            val onExpr = join.getOnExpressions.iterator().next().asInstanceOf[EqualsTo]
+            val leftJoinCol = onExpr.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+            val rightJoinCol = onExpr.getRightExpression.asInstanceOf[Column].getColumnName.toLowerCase
+
+            // Parse GROUP BY Clause (The Dimension Attribute)
+            val groupCol = groupBy.getGroupByExpressionList.getExpressions.get(0).asInstanceOf[Column].getColumnName.toLowerCase
+
+            // Parse SELECT SUM() Clause (The Fact Measure)
+            var sumCol = ""
+            for (item <- plain.getSelectItems.asScala) {
+               val expr = item.getExpression
+               if (expr != null && expr.isInstanceOf[Function]) {
+                  val func = expr.asInstanceOf[Function]
+                  if (func.getName.equalsIgnoreCase("sum")) {
+                     sumCol = func.getParameters.getExpressions.get(0).asInstanceOf[Column].getColumnName.toLowerCase
+                  }
+               }
+            }
+            if (sumCol.isEmpty) return "Error: Star queries require a SUM(column) aggregate."
+
+            try {
+              val resultMap = leftTable.executeStarQuery(rightTable, rightJoinCol, groupCol, leftJoinCol, sumCol)
+              
+              if (resultMap.isEmpty) return s"\n   STAR QUERY Results: (Empty)\n"
+              val sb = new StringBuilder()
+              sb.append(s"\n   STAR QUERY Results ($groupCol | SUM($sumCol)):\n")
+              resultMap.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
+              return sb.toString()
+            } catch {
+              case e: Exception => return s"Error executing Star Query: ${e.getMessage}"
+            }
+          }
+          
+          // --------------------------------------------------------------------
+          // PATH 2: PURE AGGREGATION (GROUP BY only)
+          // Uses the Fused Filter-Aggregate C++ Kernel
+          // --------------------------------------------------------------------
+          else if (groupBy != null) {
+            val keyCol = groupBy.getGroupByExpressionList.getExpressions.get(0).asInstanceOf[Column].getColumnName.toLowerCase
             var valCol = ""
             for (item <- plain.getSelectItems.asScala) {
                val expr = item.getExpression
                if (expr != null && expr.isInstanceOf[Function]) {
                   val func = expr.asInstanceOf[Function]
                   if (func.getName.equalsIgnoreCase("sum")) {
-                     valCol = func.getParameters.getExpressions.get(0).asInstanceOf[Column].getColumnName
+                     valCol = func.getParameters.getExpressions.get(0).asInstanceOf[Column].getColumnName.toLowerCase
                   }
                }
             }
             if (valCol.isEmpty) return "Error: GROUP BY currently requires a SUM(column) aggregate."
-            val resultMap = leftTable.executeGroupBy(keyCol, valCol)
+
+            val grpWhere = plain.getWhere 
+            val resultMap = if (grpWhere == null) {
+              leftTable.executeGroupBy(keyCol, valCol)
+            } else {
+              try {
+                grpWhere match { 
+                  case eq: EqualsTo => leftTable.executeFilteredGroupBy(keyCol, valCol, eq.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase, 0, eq.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+                  case gt: GreaterThan => leftTable.executeFilteredGroupBy(keyCol, valCol, gt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase, 1, gt.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+                  case gte: GreaterThanEquals => leftTable.executeFilteredGroupBy(keyCol, valCol, gte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase, 2, gte.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+                  case lt: MinorThan => leftTable.executeFilteredGroupBy(keyCol, valCol, lt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase, 3, lt.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+                  case lte: MinorThanEquals => leftTable.executeFilteredGroupBy(keyCol, valCol, lte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase, 4, lte.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+                  case _ => throw new RuntimeException("Unsupported WHERE clause operator in GROUP BY.")
+                }
+              } catch {
+                case e: RuntimeException => return s"Error: ${e.getMessage}"
+              }
+            }
+
             if (resultMap.isEmpty) return s"   GROUP BY Results: (Empty)"
             val sb = new StringBuilder()
             sb.append(s"\n   GROUP BY Results ($keyCol | SUM($valCol)):\n")
@@ -102,17 +172,19 @@ object SQLHandler {
             return sb.toString()
           }
 
-          // 2. CHECK FOR JOIN
-          val joins = plain.getJoins
-          if (joins != null && !joins.isEmpty) {
+          // --------------------------------------------------------------------
+          // PATH 3: PURE JOIN (No Aggregation)
+          // Uses Volcano Materialized Execution
+          // --------------------------------------------------------------------
+          else if (joins != null && !joins.isEmpty) {
             val join = joins.get(0)
             val rightTableName = join.getRightItem.asInstanceOf[Table].getName.toLowerCase
             val rightTable = tables.get(rightTableName)
             if (rightTable == null) return s"Error: Join Table '$rightTableName' not found."
 
             val onExpr = join.getOnExpressions.iterator().next().asInstanceOf[EqualsTo]
-            val leftJoinCol = onExpr.getLeftExpression.asInstanceOf[Column].getColumnName
-            val rightJoinCol = onExpr.getRightExpression.asInstanceOf[Column].getColumnName
+            val leftJoinCol = onExpr.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+            val rightJoinCol = onExpr.getRightExpression.asInstanceOf[Column].getColumnName.toLowerCase
 
             val leftKeyIdx = leftTable.columnOrder.indexOf(leftJoinCol)
             val leftPayloadIdx = if (leftTable.columnOrder.length > 2) 2 else 0 

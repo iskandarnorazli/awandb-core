@@ -151,4 +151,100 @@ extern "C" {
     ) {
         if (mapPtr != 0) delete (NativeJoinMap*)mapPtr;
     }
+
+    // ---------------------------------------------------------
+    // PROXY STRUCT FOR AGGREGATION
+    // (Matches memory layout of NativeHashMap in aggregation.cpp)
+    // ---------------------------------------------------------
+    struct NativeHashMapProxy {
+        int* keys;
+        int64_t* values;
+        uint8_t* occupied;
+        size_t capacity;
+        size_t mask;
+        size_t size;
+
+        inline void aggregate_single(int key, int val) {
+            uint32_t k = (uint32_t)key;
+            k ^= k >> 16; k *= 0x85ebca6b; k ^= k >> 13; k *= 0xc2b2ae35; k ^= k >> 16;
+            size_t idx = k & mask;
+
+            while (true) {
+                if (!occupied[idx]) {
+                    occupied[idx] = 1;
+                    keys[idx] = key;
+                    values[idx] = val;
+                    size++;
+                    break;
+                }
+                if (keys[idx] == key) {
+                    values[idx] += val;
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+    };
+
+    // ==========================================================
+    // OPERATOR FUSION: Join Probe -> Gather -> Hash Aggregate
+    // Executed entirely in CPU Cache
+    // ==========================================================
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_joinProbeAndAggregateNative(
+        JNIEnv* env, jobject obj, 
+        jlong blockPtr,         // The Fact Table Block
+        jint probeKeyColIdx,    // The Foreign Key column (e.g., dim_id)
+        jint sumValColIdx,      // The Measure column (e.g., price)
+        jlong joinMapPtr,       // Pre-built NativeJoinMap (Dim Table)
+        jlong aggMapPtr,        // Pre-built NativeHashMap (Results)
+        jlong deletedBitmaskPtr // Optional lock-free deletion mask
+    ) {
+        if (blockPtr == 0 || joinMapPtr == 0 || aggMapPtr == 0) return 0;
+
+        uint8_t* basePtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)basePtr;
+        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
+        
+        int32_t* probeKeys = (int32_t*)(basePtr + colHeaders[probeKeyColIdx].data_offset);
+        int32_t* sumVals = (int32_t*)(basePtr + colHeaders[sumValColIdx].data_offset);
+        
+        NativeJoinMap* joinMap = (NativeJoinMap*)joinMapPtr;
+        NativeHashMapProxy* aggMap = (NativeHashMapProxy*)aggMapPtr;
+        uint8_t* bitmask = (uint8_t*)deletedBitmaskPtr;
+        
+        int rows = header->row_count;
+        int matchedAndAggregated = 0;
+
+        // The Fused Pipeline Loop
+        for (int i = 0; i < rows; i++) {
+            bool isDeleted = (bitmask != nullptr) && ((bitmask[i >> 3] & (1 << (i & 7))) != 0);
+            if (isDeleted) continue;
+
+            int probeKey = probeKeys[i];
+            
+            // 1. PROBE JOIN MAP
+            uint32_t k = (uint32_t)probeKey;
+            k ^= k >> 16; k *= 0x85ebca6b; k ^= k >> 13; k *= 0xc2b2ae35; k ^= k >> 16;
+            size_t idx = k & joinMap->mask;
+
+            while (joinMap->occupied[idx]) {
+                if (joinMap->keys[idx] == probeKey) {
+                    // MATCH FOUND! 
+                    // 2. Extract Category (Payload) from Join Map
+                    int category = (int)joinMap->payloads[idx];
+                    
+                    // 3. Extract Price from Fact Table Block
+                    int price = sumVals[i];
+                    
+                    // 4. Immediately Hash Aggregate
+                    aggMap->aggregate_single(category, price);
+                    matchedAndAggregated++;
+                    break; 
+                }
+                idx = (idx + 1) & joinMap->mask;
+            }
+        }
+        
+        return matchedAndAggregated;
+    }
 }
