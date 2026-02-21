@@ -135,6 +135,22 @@ class NativeBridge {
   @native def updateCellNative(blockPtr: Long, colIdx: Int, rowId: Int, newValue: Int): Boolean
 
   @native def avxFilterBlockNative(blockPtr: Long, colIdx: Int, opType: Int, targetVal: Int, outIndicesPtr: Long, deletedBitmaskPtr: Long): Int
+
+  // --- Continuous ETL Piping
+  @native def tailReadPipeNative(
+      blockPtr: Long, 
+      colIdx: Int, 
+      startRowOffset: Int, 
+      maxRowsToRead: Int, 
+      outDataPtr: Long
+  ): Int
+
+  // [NEW] Helper for Testing (to simulate ingestion)
+  @native def setRowCountNative(blockPtr: Long, rowCount: Int): Unit
+
+  // --- MULTI-MODE & STATE TRANSITION ---
+  @native def setBlockModeNative(blockPtr: Long, newMode: Int): Unit
+  @native def fsyncBlockNative(blockPtr: Long, path: String): Boolean
 }
 
 // -----------------------------------------------------------
@@ -411,5 +427,42 @@ object NativeBridge {
   def avxFilterBlock(blockPtr: Long, colIdx: Int, opType: Int, targetVal: Int, outIndicesPtr: Long, deletedBitmaskPtr: Long): Int = {
     if (blockPtr == 0) return 0
     instance.avxFilterBlockNative(blockPtr, colIdx, opType, targetVal, outIndicesPtr, deletedBitmaskPtr)
+  }
+
+  // =========================================================
+  // MULTI-MODE & STATE TRANSITION
+  // =========================================================
+  
+  def setBlockMode(blockPtr: Long, newMode: Int): Unit = {
+    if (blockPtr != 0) {
+      instance.setBlockModeNative(blockPtr, newMode)
+    }
+  }
+
+  def fsyncBlock(blockPtr: Long, path: String): Boolean = {
+    if (blockPtr == 0) return false
+    instance.fsyncBlockNative(blockPtr, path)
+  }
+
+  // =========================================================
+  // CONTINUOUS ETL PIPING
+  // =========================================================
+
+  def tailReadPipe(
+      blockPtr: Long, 
+      colIdx: Int, 
+      startRowOffset: Int, 
+      maxRowsToRead: Int, 
+      outDataPtr: Long
+  ): Int = {
+    if (blockPtr == 0 || outDataPtr == 0) return 0
+    instance.tailReadPipeNative(blockPtr, colIdx, startRowOffset, maxRowsToRead, outDataPtr)
+  }
+
+  // Helper for Testing (to simulate ingestion updating the header)
+  def setRowCount(blockPtr: Long, rowCount: Int): Unit = {
+    if (blockPtr != 0) {
+      instance.setRowCountNative(blockPtr, rowCount)
+    }
   }
 }

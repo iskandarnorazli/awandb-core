@@ -28,18 +28,49 @@ import org.awandb.core.engine.AwanTable
 import org.awandb.core.query.{HashJoinBuildOperator, HashJoinProbeOperator, TableScanOperator}
 import org.awandb.core.jni.NativeBridge
 import scala.jdk.CollectionConverters._ 
+import org.awandb.core.pipeline.PipeManager
+import scala.util.matching.Regex
 
 object SQLHandler {
 
   val tables = new java.util.concurrent.ConcurrentHashMap[String, AwanTable]()
+
+  // Regex for continuous ETL piping
+  val CreatePipePattern: Regex = """(?i)CREATE\s+PIPE\s+(\w+)\s+AS\s+SELECT\s+\*\s+FROM\s+(\w+)\s+INTO\s+(\w+)""".r
 
   def register(name: String, table: AwanTable): Unit = {
     tables.put(name.toLowerCase, table)
   }
 
   def execute(sql: String): String = {
+    val trimmedSql = sql.trim
+    
+    // ====================================================================
+    // 1. FAST-PATH DDL INTERCEPTORS (Bypassing JSqlParser)
+    // ====================================================================
+    trimmedSql match {
+      case CreatePipePattern(pipeName, sourceName, destName) =>
+        val sourceTable = tables.get(sourceName.toLowerCase)
+        val destTable = tables.get(destName.toLowerCase)
+        
+        if (sourceTable == null) return s"Error: Source table '$sourceName' not found."
+        if (destTable == null) return s"Error: Destination table '$destName' not found."
+        
+        try {
+          PipeManager.startPipe(pipeName, sourceTable, destTable)
+          return s"Status: Pipe '$pipeName' created and running in background."
+        } catch {
+          case e: Exception => return s"Error starting pipe: ${e.getMessage}"
+        }
+        
+      case _ => // Fall through to standard JSqlParser execution
+    }
+
+    // ====================================================================
+    // 2. STANDARD ANSI SQL EXECUTION
+    // ====================================================================
     try {
-      val statement = CCJSqlParserUtil.parse(sql)
+      val statement = CCJSqlParserUtil.parse(trimmedSql)
 
       statement match {
         case select: Select =>

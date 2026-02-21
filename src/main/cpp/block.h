@@ -28,6 +28,12 @@
 const uint32_t BLOCK_MAGIC = 0x4E415741;
 const uint32_t BLOCK_VERSION = 1;
 
+enum EngineMode : uint32_t {
+    MODE_CACHE  = 0, // Pure RAM, no WAL
+    MODE_NORMAL = 1, // Async WAL, grouped commits
+    MODE_STRICT = 2  // Sync fsync per transaction
+};
+
 // 1. The Main Block Header (64-byte aligned)
 struct BlockHeader {
     uint32_t magic_number;       // "AWAN"
@@ -35,8 +41,12 @@ struct BlockHeader {
     uint32_t row_count;          // Rows in this block
     uint32_t column_count;       // Columns stored here
     
-    // Future Proofing
-    uint64_t reserved[6];        
+    // --- NEW: Multi-Mode Tracking ---
+    uint32_t engine_mode;        // EngineMode enum
+    uint32_t sync_status;        // 0 = DIRTY (RAM only), 1 = SYNCED (On Disk)
+    
+    // Future Proofing (Adjusted to maintain 64-byte alignment)
+    uint64_t reserved[5];        
 };
 
 // Enum for Column Data Types

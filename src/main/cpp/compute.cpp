@@ -550,4 +550,53 @@ extern "C" {
         }
         return matchCount;
     }
+
+    // ==========================================================
+    // 6. CONTINUOUS PIPING (ETL Tail Reader)
+    // ==========================================================
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_tailReadPipeNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint startRowOffset, jint maxRowsToRead, jlong outDataPtr
+    ) {
+        if (blockPtr == 0 || outDataPtr == 0) return 0;
+        
+        uint8_t* rawPtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)rawPtr;
+        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
+        
+        // Safety check: Column index bounds
+        if (colIdx < 0 || colIdx >= (int)header->column_count) return 0;
+        
+        ColumnHeader& col = colHeaders[colIdx];
+
+        // 1. Calculate how many rows are actually available to read
+        // The reader only sees up to 'header->row_count'. 
+        // Writers must update row_count LAST to ensure data validity.
+        int availableRows = (int)header->row_count - startRowOffset;
+        
+        if (availableRows <= 0) return 0; // No new data yet
+
+        // 2. Determine batch size (don't overflow the output buffer)
+        int rowsToRead = (availableRows < maxRowsToRead) ? availableRows : maxRowsToRead;
+
+        // 3. Fast Copy (Type specific)
+        if (col.type == 0) { // TYPE_INT
+            int32_t* srcData = (int32_t*)(rawPtr + col.data_offset);
+            int32_t* dstData = (int32_t*)outDataPtr;
+            
+            // Pointer arithmetic to jump to the start offset
+            std::memcpy(dstData, srcData + startRowOffset, rowsToRead * sizeof(int32_t));
+        }
+        // Add other types (FLOAT, LONG) here as needed...
+        
+        return rowsToRead;
+    }
+
+    // Helper to manually set row count (Simulating ingestion for tests)
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_setRowCountNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint rowCount
+    ) {
+        if (blockPtr == 0) return;
+        BlockHeader* header = (BlockHeader*)blockPtr;
+        header->row_count = (uint32_t)rowCount;
+    }
 }

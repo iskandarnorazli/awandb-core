@@ -19,6 +19,13 @@
 #include <limits>
 #include <cstring> // for memcpy, memset
 
+// --- NEW INCLUDES FOR STRICT MODE FSYNC ---
+#ifdef _WIN32
+    #include <io.h>     // For _commit and _fileno on Windows
+#else
+    #include <unistd.h> // For fsync and fileno on POSIX (Linux/Mac)
+#endif
+
 extern "C" {
 
     // --- Block Management ---
@@ -239,5 +246,65 @@ extern "C" {
         out[0] = colHeaders[colIdx].min_int;
         out[1] = colHeaders[colIdx].max_int;
         env->ReleasePrimitiveArrayCritical(outMinMax, out, 0);
+    }
+
+    // ---------------------------------------------------------
+    // MULTI-MODE & STATE TRANSITION STUBS
+    // ---------------------------------------------------------
+
+    // Set the mode of a live block (CACHE -> NORMAL -> STRICT)
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_setBlockModeNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint newMode
+    ) {
+        if (blockPtr == 0) return;
+        BlockHeader* header = (BlockHeader*)blockPtr;
+        header->engine_mode = (uint32_t)newMode;
+        
+        // If moving from STRICT/NORMAL down to CACHE, we might mark it dirty 
+        // to indicate it no longer relies on disk state.
+        if (newMode == 0) { // MODE_CACHE
+            header->sync_status = 0; 
+        }
+    }
+
+    // Force a synchronous disk flush for STRICT mode
+    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_fsyncBlockNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jstring path
+    ) {
+        if (blockPtr == 0) return JNI_FALSE;
+        
+        // Re-use your existing saveColumn logic, but with an explicit fsync/fflush
+        // to guarantee hardware-level durability for STRICT mode.
+        const char* filename = env->GetStringUTFChars(path, nullptr);
+        FILE* file = fopen(filename, "wb");
+        if (!file) {
+            env->ReleaseStringUTFChars(path, filename);
+            return JNI_FALSE;
+        }
+
+        // Calculate size based on your existing logic in getBlockSize
+        BlockHeader* header = (BlockHeader*)blockPtr;
+        size_t metaSize = sizeof(BlockHeader) + (header->column_count * sizeof(ColumnHeader));
+        size_t padding = (metaSize % 256 != 0) ? (256 - (metaSize % 256)) : 0;
+        ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
+        ColumnHeader* lastCol = &colHeaders[header->column_count - 1];
+        size_t totalSize = lastCol->data_offset + lastCol->data_length;
+
+        fwrite((void*)blockPtr, 1, totalSize, file);
+        
+        // [CRITICAL for STRICT MODE] 
+        fflush(file); 
+#ifdef _WIN32
+        _commit(_fileno(file));
+#else
+        fsync(fileno(file));
+#endif
+        fclose(file);
+        
+        // Mark as synced
+        header->sync_status = 1;
+        
+        env->ReleaseStringUTFChars(path, filename);
+        return JNI_TRUE;
     }
 }
