@@ -24,6 +24,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.BeforeAndAfterAll
 import org.awandb.core.engine.AwanTable
 import java.io.File
+import org.awandb.TestHelpers.given
 
 class SortAndLimitSpec extends AnyFunSuite with BeforeAndAfterAll {
 

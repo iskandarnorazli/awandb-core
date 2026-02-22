@@ -40,25 +40,35 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       val sql = ticket.getStatementHandle.toStringUtf8
       println(s"[Network] 🟢 Executing SELECT: $sql")
 
-      val resultString = SQLHandler.execute(sql)
+      // [FIX 3] Receive the structured SQLResult
+      val result = SQLHandler.execute(sql)
       
-      // [FIX] Convert silent SQL strings into hard network exceptions
-      if (resultString.startsWith("Error:") || resultString.startsWith("SQL Error:")) {
-        throw new IllegalArgumentException(resultString)
+      // [FIX 3] Hard failure on actual boolean error
+      if (result.isError) {
+        throw new IllegalArgumentException(result.message)
       }
 
       val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
       root = VectorSchemaRoot.create(schema, allocator)
-      val resultVector = root.getVector("query_result").asInstanceOf[VarCharVector]
+      
+      // [BUG FIX 1] Check affectedRows directly to see if result set is empty
+      if (result.affectedRows == 0L) {
+        // [EMPTY PATH] Safely close stream without sending data payloads
+        root.setRowCount(0)
+        listener.start(root) // Sends the Schema only
+        listener.completed()
+      } else {
+        // [DATA PATH] Send the row payload
+        val resultVector = root.getVector("query_result").asInstanceOf[VarCharVector]
+        resultVector.allocateNew()
+        resultVector.setSafe(0, result.message.getBytes("UTF-8"))
+        resultVector.setValueCount(1)
+        root.setRowCount(1)
 
-      resultVector.allocateNew()
-      resultVector.setSafe(0, resultString.getBytes("UTF-8"))
-      resultVector.setValueCount(1)
-      root.setRowCount(1)
-
-      listener.start(root)
-      listener.putNext()
-      listener.completed()
+        listener.start(root)
+        listener.putNext()
+        listener.completed()
+      }
 
     } catch {
       case e: net.sf.jsqlparser.parser.ParseException =>
@@ -81,19 +91,18 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       override def run(): Unit = {
         try {
           val sql = command.getQuery
-          println(s"[Network] 🟡 Executing MUTATION: $sql")
+          println(s"[Network] 🟢 Executing MUTATION: $sql")
           
-          val resultString = SQLHandler.execute(sql)
+          // [FIX 3] Receive the structured SQLResult
+          val result = SQLHandler.execute(sql)
           
-          // [FIX] Convert silent SQL strings into hard network exceptions
-          if (resultString.startsWith("Error:") || resultString.startsWith("SQL Error:")) {
-            throw new IllegalArgumentException(resultString)
+          // [FIX 3] Hard failure on actual boolean error, no brittle string matching
+          if (result.isError) {
+            throw new IllegalArgumentException(result.message)
           }
 
-          // [FIX] Removed the blocking while(flightStream.next()) loop!
-          // We do not wait for data the client isn't going to send.
-
-          val updateResult = DoPutUpdateResult.newBuilder().setRecordCount(1L).build()
+          // [FIX 2] Inject the ACTUAL affected row count back to the ORM!
+          val updateResult = DoPutUpdateResult.newBuilder().setRecordCount(result.affectedRows).build()
           val resultBytes = updateResult.toByteArray
           
           val arrowBuf = allocator.buffer(resultBytes.length)

@@ -85,7 +85,7 @@ object MainApp extends App {
       // Standard SQL Commands
       else {
         val result = SQLHandler.execute(cmd)
-        println(s">> $result")
+        println(s">> ${result.message}")
       }
     }
   }

@@ -44,7 +44,8 @@ class AwanFlightProducer(allocator: BufferAllocator, location: Location) extends
       println(s"[Network] Executing Incoming SQL: $sql")
 
       // 2. Execute via the Native Volcano Pipeline
-      val resultString = SQLHandler.execute(sql)
+      // [FIX] Capture the structured SQLResult object
+      val result = SQLHandler.execute(sql)
 
       // 3. Package the native result into a zero-copy Apache Arrow Vector
       val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
@@ -52,7 +53,10 @@ class AwanFlightProducer(allocator: BufferAllocator, location: Location) extends
       val resultVector = root.getVector("query_result").asInstanceOf[VarCharVector]
 
       resultVector.allocateNew()
-      resultVector.setSafe(0, resultString.getBytes("UTF-8"))
+      
+      // [FIX] Extract the .message string from the result before converting to bytes
+      resultVector.setSafe(0, result.message.getBytes("UTF-8"))
+      
       resultVector.setValueCount(1)
       root.setRowCount(1)
 

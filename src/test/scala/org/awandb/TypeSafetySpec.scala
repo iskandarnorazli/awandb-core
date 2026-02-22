@@ -21,6 +21,7 @@ import org.scalatest.BeforeAndAfterAll
 import org.awandb.core.engine.AwanTable
 import org.awandb.core.sql.SQLHandler
 import java.io.File
+import org.awandb.TestHelpers.given
 
 class TypeSafetySpec extends AnyFunSuite with BeforeAndAfterAll {
 

@@ -21,6 +21,7 @@ import org.scalatest.BeforeAndAfterAll
 import org.awandb.core.engine.AwanTable
 import org.awandb.core.sql.SQLHandler
 import java.io.File
+import org.awandb.TestHelpers.given
 
 class AdvancedSQLSpec extends AnyFunSuite with BeforeAndAfterAll {
 
@@ -94,14 +95,13 @@ class AdvancedSQLSpec extends AnyFunSuite with BeforeAndAfterAll {
   // -------------------------------------------------------------------------
 
   test("2. Security: Should reject classic OR 1=1 injection") {
-    // Attempt to bypass the WHERE clause
-    val maliciousQuery = s"UPDATE $tableName SET price = 0 WHERE id = 99 OR 1=1"
+    // Malicious user attempts to bypass the ID check
+    val maliciousQuery = s"UPDATE $tableName SET price = 0 WHERE id = 101 OR 1=1"
     val res = SQLHandler.execute(maliciousQuery)
     
-    // Because we strictly pattern match on `EqualsTo` in SQLHandler, 
-    // JSqlParser will parse this as an `OrExpression` and it will fall through to our default error.
-    assert(res.contains("Unsupported SQL statement") || res.contains("UPDATE only supports 'WHERE id = value'"), 
-      s"Engine accepted malicious query! Response: $res")
+    // [FIX] The engine now supports complex OR clauses, but will safely reject the "1=1" AST
+    assert(res.contains("Left side of condition must be a column"), 
+      s"Engine accepted malicious query or threw wrong error! Response: $res")
       
     // Verify the price wasn't actually changed to 0
     val check = SQLHandler.execute(s"SELECT * FROM $tableName WHERE id = 99")
