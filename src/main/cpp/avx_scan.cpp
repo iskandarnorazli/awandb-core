@@ -289,7 +289,7 @@ extern "C" {
     }
 
     // ==========================================================
-    // FAST RANDOM UPDATE (In-Place Memory Mutation)
+    // FAST RANDOM UPDATE & DELTA APPEND (In-Place Memory Mutation)
     // ==========================================================
     JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_updateCellNative(
         JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint rowId, jint newValue
@@ -299,18 +299,44 @@ extern "C" {
         BlockHeader* header = (BlockHeader*)basePtr;
         
         if (colIdx < 0 || colIdx >= (int)header->column_count) return JNI_FALSE;
-        if (rowId < 0 || rowId >= (int)header->row_count) return JNI_FALSE;
+        
+        // Allow appending new rows by expanding the boundary dynamically
+        if (rowId >= (int)header->row_count) {
+            header->row_count = rowId + 1; // Auto-expand for Deltastore
+        }
 
         ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
         ColumnHeader& col = colHeaders[colIdx];
         if (col.data_offset == 0) return JNI_FALSE;
 
-        if (col.type == TYPE_INT) {
+        if (col.type == 0 /* TYPE_INT */) {
             int32_t* data = (int32_t*)(basePtr + col.data_offset);
             data[rowId] = newValue;
             
-            if (newValue < col.min_int) col.min_int = newValue;
-            if (newValue > col.max_int) col.max_int = newValue;
+            // Inline Zone Map Maintenance (Phase 4 Pushdown - Cross Platform)
+            int32_t currentMin = col.min_int;
+            while (newValue < currentMin) {
+#ifdef _MSC_VER
+                // MSVC Windows Atomic CAS
+                int32_t prev = _InterlockedCompareExchange((volatile long*)&col.min_int, newValue, currentMin);
+                if (prev == currentMin) break; // Success
+                currentMin = prev;             // Failed, update and retry
+#else
+                // GCC / Clang Atomic CAS
+                if (__atomic_compare_exchange_n(&col.min_int, &currentMin, newValue, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+#endif
+            }
+
+            int32_t currentMax = col.max_int;
+            while (newValue > currentMax) {
+#ifdef _MSC_VER
+                int32_t prev = _InterlockedCompareExchange((volatile long*)&col.max_int, newValue, currentMax);
+                if (prev == currentMax) break; 
+                currentMax = prev;             
+#else
+                if (__atomic_compare_exchange_n(&col.max_int, &currentMax, newValue, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+#endif
+            }
 
             return JNI_TRUE;
         }

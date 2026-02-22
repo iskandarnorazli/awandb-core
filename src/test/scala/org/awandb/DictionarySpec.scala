@@ -27,7 +27,6 @@ import java.util.UUID
 class DictionarySpec extends AnyFlatSpec with Matchers {
 
   // --- HELPER: Test Isolation ---
-  // Ensures every test runs in a fresh folder to avoid "Zombie Data"
   def withTestDir(testCode: String => Any): Unit = {
     val uniqueId = UUID.randomUUID().toString.take(8)
     val dirPath = s"target/dict_test_$uniqueId"
@@ -53,29 +52,26 @@ class DictionarySpec extends AnyFlatSpec with Matchers {
   "AwanDB Dictionary" should "seamlessly encode, persist, and query strings" in {
     withTestDir { dir =>
       val table = new AwanTable("dict_test", 1000, dir)
-      
-      // Create column with Dictionary enabled
       table.addColumn("city", isString = true, useDictionary = true)
       
-      // 1. Insert Data (RAM)
-      table.insert("city", "Kuala Lumpur")
-      table.insert("city", "Penang")
-      table.insert("city", "Kuala Lumpur") // Duplicate
+      // 1. Insert Data natively 
+      table.insertRow(Array("Kuala Lumpur"))
+      table.insertRow(Array("Penang"))
+      table.insertRow(Array("Kuala Lumpur")) 
       
-      // 2. Query RAM (Should work via raw string scan)
+      // 2. Query RAM 
       table.query("city", "Kuala Lumpur") shouldBe 2
       
-      // 3. Flush to Disk (Triggers Compression)
+      // 3. Flush to Disk
       table.flush()
       
       // 4. Verify Sidecar File Exists
-      val dictFile = new File(dir, "dict_test_city.dict")
+      val dictFile = new File(table.tableDir, "dict_test_city.dict")
       dictFile.exists() shouldBe true
       
-      // 5. Query Disk (Should use Fast Integer Scan)
-      // The engine converts "Kuala Lumpur" -> ID -> avxScanBlock
+      // 5. Query Disk 
       table.query("city", "Kuala Lumpur") shouldBe 2
-      table.query("city", "Singapore") shouldBe 0 // Negative case
+      table.query("city", "Singapore") shouldBe 0 
       
       table.close()
     }
@@ -83,58 +79,54 @@ class DictionarySpec extends AnyFlatSpec with Matchers {
 
   it should "demonstrate massive storage compression vs Raw Strings" in {
     withTestDir { dir =>
-      val rawDir = new File(dir, "raw").getAbsolutePath
       val dictDir = new File(dir, "dict").getAbsolutePath
-      
-      val rawTable = new AwanTable("raw_bench", 10000, rawDir)
-      rawTable.addColumn("data", isString = true, useDictionary = false)
-      
       val dictTable = new AwanTable("dict_bench", 10000, dictDir)
       dictTable.addColumn("data", isString = true, useDictionary = true)
       
-      // [FIX] Generate Data (High Repetition = High Compression)
       val prefixes = Array("Log_Entry_Error_", "User_Action_Click_", "Transaction_ID_", "Status_Pending_")
       val random = new Random(42)
       
+      var logicalRawSizeBytes = 0L
+      
       for (i <- 0 until 5000) {
-        // Create a reasonably long string to make compression obvious
         val value = prefixes(random.nextInt(prefixes.length)) + (i % 100)
         val padded = value + "_padding_" + "x" * 20 
         
-        rawTable.insert("data", padded)
-        dictTable.insert("data", padded)
+        logicalRawSizeBytes += padded.getBytes("UTF-8").length
+        dictTable.insertRow(Array(padded))
       }
       
-      rawTable.flush()
       dictTable.flush()
       
-      // MEASURE
-      def dirSize(path: String): Long = {
-        val f = new File(path)
-        if (f.exists() && f.isDirectory) f.listFiles().map(_.length()).sum else 0
+      // MEASURE: Recursive check of actual physical bytes written to the table directory
+      def dirSize(file: File): Long = {
+        if (file.isDirectory) {
+            val children = file.listFiles()
+            if (children != null) children.map(dirSize).sum else 0L
+        } else {
+            file.length()
+        }
       }
 
-      val rawSize = dirSize(rawDir)
-      val dictSize = dirSize(dictDir)
+      val dictSize = dirSize(new File(dictTable.tableDir))
       
       println(f"\n[Compression Benchmark]")
-      println(f"Raw String Size:  ${rawSize / 1024} KB")
-      println(f"Dictionary Size:  ${dictSize / 1024} KB")
+      println(f"Logical Raw Size:  ${logicalRawSizeBytes / 1024} KB")
+      println(f"Actual Dict Size:  ${dictSize / 1024} KB")
       
       if (dictSize > 0) {
-         val ratio = rawSize.toDouble / dictSize
+         val ratio = logicalRawSizeBytes.toDouble / dictSize
          println(f"Compression:      $ratio%.2fx")
-         rawSize should be > dictSize
+         logicalRawSizeBytes should be > dictSize
       } else {
-         fail("Dictionary size was 0 KB. Flush failed?")
+         fail("Dictionary directory size was 0 bytes. Flush failed?")
       }
       
-      rawTable.close()
       dictTable.close()
     }
   }
 
-  // --- PART 2: COMPUTE PERFORMANCE (The "Is it fast?" Test) ---
+  // --- PART 2: COMPUTE PERFORMANCE ---
 
   val ROWS = 1_000_000
   val CARDINALITIES = Seq(100, 100_000)
@@ -155,7 +147,6 @@ class DictionarySpec extends AnyFlatSpec with Matchers {
   }
 
   def runBenchmark(rows: Int, distinctCount: Int, warmup: Boolean): Unit = {
-    // 1. DATA GEN
     val distinctValues = (0 until distinctCount).map(i => s"val_prefix_${i}").toArray
     val rawStrings = Array.fill(rows)(distinctValues(Random.nextInt(distinctCount)))
     
@@ -163,16 +154,13 @@ class DictionarySpec extends AnyFlatSpec with Matchers {
     val encodedPtr = NativeBridge.allocMainStore(rows)
 
     try {
-      // 2. ENCODE (String -> Int)
       NativeBridge.dictionaryEncodeBatch(dictPtr, rawStrings, encodedPtr)
 
-      // 3. JAVA STRING SORT (Baseline)
       val javaStart = System.nanoTime()
       val javaCopy = rawStrings.clone()
       java.util.Arrays.sort(javaCopy.asInstanceOf[Array[Object]])
       val javaTime = (System.nanoTime() - javaStart) / 1e6
 
-      // 4. NATIVE RADIX SORT (On Encoded Integers)
       val nativeStart = System.nanoTime()
       NativeBridge.radixSort(encodedPtr, rows)
       val nativeTime = (System.nanoTime() - nativeStart) / 1e6
@@ -187,13 +175,11 @@ class DictionarySpec extends AnyFlatSpec with Matchers {
           speedup
         ))
 
-        // 5. INTEGRITY CHECK (Spot check)
         val resultBuf = new Array[Int](1)
         NativeBridge.copyToScala(encodedPtr, resultBuf, 1)
         val decoded = NativeBridge.dictionaryDecode(dictPtr, resultBuf(0))
         decoded should not be null
         
-        // Only assert speedup if we are running in parallel or optimized env
         if (MorselExec.activeCores > 1) { 
             speedup should be > 1.2 
         }

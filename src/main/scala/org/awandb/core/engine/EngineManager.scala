@@ -56,6 +56,27 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
   // 1. High-Speed Command Queue (Inserts, Queries)
   private val queue = new LinkedBlockingQueue[EngineCommand]()
   private val running = new AtomicBoolean(false)
+
+  private val lastFlushTime = new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+
+  private val autoFlusher = new Thread(new Runnable {
+    override def run(): Unit = {
+      while (running.get()) {
+        Thread.sleep(1000) 
+        
+        val currentRamRows = table.getRamRowCount() 
+        val timeSinceLastFlush = System.currentTimeMillis() - lastFlushTime.get()
+        
+        if (currentRamRows >= 100_000 || timeSinceLastFlush >= 5000) {
+           if (currentRamRows > 0) {
+               submitFlush() 
+           }
+           lastFlushTime.set(System.currentTimeMillis())
+        }
+      }
+    }
+  })
+  autoFlusher.setDaemon(true)
   
   // Metrics
   val processedCount = new AtomicLong(0)
@@ -133,29 +154,26 @@ class EngineManager(table: AwanTable, governor: EngineGovernor = NoOpGovernor) e
   private def handleBatchInsertInt(firstVal: Int): Unit = {
     if (!governor.canAcceptInsert("default_tenant")) return 
 
-    // Assume default integer column "val" for simple single-column tests
-    // In a real app, the command would carry the column name
-    table.insert("val", firstVal)
-    processedCount.incrementAndGet()
-    governor.recordUsage(1, 4)
+    val batch = new ArrayBuffer[Int]()
+    batch.append(firstVal)
     
-    // [WRITE FUSION] Drain Integers
-    var ops = 0
-    while (!queue.isEmpty && ops < 1000) {
+    var ops = 1
+    while (!queue.isEmpty && ops < 10000) { // Vectorize up to 10k!
       val nextCmd = queue.peek()
       if (nextCmd != null && nextCmd.isInstanceOf[InsertIntCommand]) {
         val insertCmd = queue.poll().asInstanceOf[InsertIntCommand]
-        
         if (governor.canAcceptInsert("default_tenant")) {
-            table.insert("val", insertCmd.value)
-            processedCount.incrementAndGet()
-            governor.recordUsage(1, 4)
+            batch.append(insertCmd.value)
         }
         ops += 1
       } else {
-        return // Break batch on type switch
+        ops = 10000 // Break batch
       }
     }
+    
+    table.insertBatch(batch.toArray)
+    processedCount.addAndGet(batch.length)
+    governor.recordUsage(batch.length, batch.length * 4)
   }
 
   private def handleBatchInsertString(firstVal: String): Unit = {

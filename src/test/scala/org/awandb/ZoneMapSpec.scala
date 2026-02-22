@@ -26,8 +26,17 @@ class ZoneMapSpec extends AnyFlatSpec with Matchers {
   val TEST_DIR = "data/zone_map_test"
   
   def cleanDir(dirPath: String): Unit = {
+    def deleteRecursively(file: File): Unit = {
+      if (file.exists()) {
+        if (file.isDirectory) {
+          val children = file.listFiles()
+          if (children != null) children.foreach(deleteRecursively)
+        }
+        file.delete()
+      }
+    }
     val dir = new File(dirPath)
-    if (dir.exists()) { dir.listFiles().foreach(_.delete()); dir.delete() }
+    deleteRecursively(dir)
   }
 
   "AwanDB Optimizer" should "skip blocks based on Zone Maps (Min/Max)" in {

@@ -29,11 +29,17 @@ class MaterializationSpec extends AnyFlatSpec with Matchers {
   val BASE_TEST_DIR = new File("data/materialize_test").getAbsolutePath
 
   def cleanUp(dirPath: String): Unit = {
-    val dir = new File(dirPath)
-    if (dir.exists()) {
-      dir.listFiles().foreach(_.delete())
-      dir.delete()
+    def deleteRecursively(file: File): Unit = {
+      if (file.exists()) {
+        if (file.isDirectory) {
+          val children = file.listFiles()
+          if (children != null) children.foreach(deleteRecursively)
+        }
+        file.delete()
+      }
     }
+    val dir = new File(dirPath)
+    deleteRecursively(dir)
     dir.mkdirs()
   }
 

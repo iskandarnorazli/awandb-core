@@ -27,11 +27,18 @@ class DAGSpec extends AnyFlatSpec with Matchers {
   val TEST_DIR = new File("data/dag_spec_debug").getAbsolutePath
 
   def cleanUp(): Unit = {
-    val dir = new File(TEST_DIR)
-    if (dir.exists()) {
-      dir.listFiles().foreach(_.delete())
-      dir.delete()
+    def deleteRecursively(file: File): Unit = {
+      if (file.exists()) {
+        if (file.isDirectory) {
+          val children = file.listFiles()
+          if (children != null) children.foreach(deleteRecursively)
+        }
+        file.delete()
+      }
     }
+    val dir = new File(TEST_DIR)
+    deleteRecursively(dir)
+    dir.mkdirs()
   }
 
   // --- TEST 1: BASELINE (The "Happy Path") ---

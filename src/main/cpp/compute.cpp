@@ -599,4 +599,29 @@ extern "C" {
         BlockHeader* header = (BlockHeader*)blockPtr;
         header->row_count = (uint32_t)rowCount;
     }
+
+    // ==========================================================
+    // NATIVE DELTASTORE: LOCK-FREE DELETIONS
+    // ==========================================================
+    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_deleteRowNative(
+        JNIEnv* env, jobject obj, jlong bitmaskPtr, jint rowId
+    ) {
+        if (bitmaskPtr == 0 || rowId < 0) return JNI_FALSE;
+        
+        // The bitmask is an array of bytes. 
+        // We find the correct byte (rowId / 8) and the correct bit (rowId % 8).
+        uint8_t* bitmask = (uint8_t*)bitmaskPtr;
+        size_t byteIndex = rowId >> 3;
+        uint8_t bitMask = 1 << (rowId & 7);
+
+        // Atomic OR operation to flip the bit without locking the whole table
+        // This allows concurrent reads while deletes are happening!
+#ifdef _WIN32
+        _InterlockedOr8((volatile char*)&bitmask[byteIndex], bitMask);
+#else
+        __atomic_fetch_or(&bitmask[byteIndex], bitMask, __ATOMIC_SEQ_CST);
+#endif
+
+        return JNI_TRUE;
+    }
 }

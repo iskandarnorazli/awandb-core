@@ -172,6 +172,7 @@ class NativeBridge {
   ): Int
 
   @native def loadDataLongNative(ptr: Long, data: Array[Long]): Unit
+  @native def deleteRowNative(bitmaskPtr: Long, rowId: Int): Boolean
 }
 
 // -----------------------------------------------------------
@@ -521,5 +522,10 @@ object NativeBridge {
     if (ptr != 0 && data != null) {
       instance.loadDataLongNative(ptr, data)
     }
+  }
+
+  def deleteRow(bitmaskPtr: Long, rowId: Int): Boolean = {
+    if (bitmaskPtr == 0) return false
+    instance.deleteRowNative(bitmaskPtr, rowId)
   }
 }

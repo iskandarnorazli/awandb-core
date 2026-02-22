@@ -94,13 +94,18 @@ class NativeColumn(val name: String, val isString: Boolean = false, val useDicti
   }
 
   // -----------------------------------------------------------
-  // QUERY HELPER (Required for DAGSpec)
+  // QUERY HELPER (Thread-Safe Dictionary Access)
   // -----------------------------------------------------------
   
-  def getDictId(value: String): Int = {
-    if (dictionaryPtr == 0) return -1
-    // dictionaryEncode returns the ID (creating it if missing, but existing keys are stable)
+  def getDictId(value: String): Int = this.synchronized {
+    if (dictionaryPtr == 0L) dictionaryPtr = NativeBridge.dictionaryCreate()
     NativeBridge.dictionaryEncode(dictionaryPtr, value)
+  }
+
+  def getDictStr(id: Int): String = this.synchronized {
+    if (dictionaryPtr == 0L) return ""
+    val str = NativeBridge.dictionaryDecode(dictionaryPtr, id)
+    if (str == null) "" else str
   }
 
   // -----------------------------------------------------------

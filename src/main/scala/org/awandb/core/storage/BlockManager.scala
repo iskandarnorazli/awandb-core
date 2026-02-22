@@ -29,76 +29,66 @@ trait StorageRouter {
   def initialize(): Unit
 }
 
-class SimpleStorageRouter(val dataDir: String) extends StorageRouter {
-  override def initialize(): Unit = new File(dataDir).mkdirs()
+class SimpleStorageRouter(val dataDir: String, val prefix: String = "") extends StorageRouter {
+  // If a prefix (table name) is provided, append an underscore. Otherwise, leave blank.
+  private val p = if (prefix.nonEmpty) s"${prefix}_" else ""
+  
+  override def initialize(): Unit = new java.io.File(dataDir).mkdirs()
   override def getDataDir: String = dataDir
-  override def getPathForBlock(blockId: Int): String = f"$dataDir/block_$blockId%05d.udb"
-  override def getPathForFilter(blockId: Int): String = f"$dataDir/block_$blockId%05d.cuckoo"
-  override def getPathForBitmap(blockId: Int): String = f"$dataDir/block_$blockId%05d.del" 
+  
+  // [FIXED] Prefixes files with Table Name to prevent cross-table memory hijacking!
+  override def getPathForBlock(blockId: Int): String = f"$dataDir/${p}block_$blockId%05d.udb"
+  override def getPathForFilter(blockId: Int): String = f"$dataDir/${p}block_$blockId%05d.cuckoo"
+  override def getPathForBitmap(blockId: Int): String = f"$dataDir/${p}block_$blockId%05d.del" 
 }
 
 // ==================================================================================
 // THREAD-SAFE BLOCK MANAGER (Lazy Indexing + Deletion Vectors)
 // ==================================================================================
 
-class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
+class BlockManager(val router: StorageRouter, val enableIndex: Boolean = true) {
   
-  def this(dataDir: String, enableIndex: Boolean = true) = 
-    this(new SimpleStorageRouter(dataDir), enableIndex)
+  // [FIXED] Removed the default `= true` to satisfy the Scala compiler.
+  // Overloaded constructors cannot share default arguments with the primary constructor.
+  def this(dataDir: String, enableIndex: Boolean) = 
+    this(new SimpleStorageRouter(dataDir, ""), enableIndex)
+
+  // Added a single-argument auxiliary constructor for any legacy tests 
+  // that still just pass a directory string.
+  def this(dataDir: String) = 
+    this(new SimpleStorageRouter(dataDir, ""), true)
 
   private val blockCounter = new java.util.concurrent.atomic.AtomicInteger(0)
   
-  private val loadedBlocks = new CopyOnWriteArrayList[Long]() 
-  private val loadedFilters = new ConcurrentHashMap[Int, Long]() 
-  private val pendingIndexes = new ConcurrentLinkedQueue[java.lang.Integer]()
-  private val deletionBitmaps = new ConcurrentHashMap[Long, java.util.BitSet]()
+  private val loadedBlocks = new java.util.concurrent.CopyOnWriteArrayList[Long]() 
+  private val loadedFilters = new java.util.concurrent.ConcurrentHashMap[Int, Long]() 
+  private val pendingIndexes = new java.util.concurrent.ConcurrentLinkedQueue[java.lang.Integer]()
+  private val deletionBitmaps = new java.util.concurrent.ConcurrentHashMap[Long, java.util.BitSet]()
 
   router.initialize()
 
   /**
    * RECOVERY: Loads blocks, filters, and [NEW] deletion bitmaps.
    */
-  def recover(): Unit = {
-    val dir = new File(router.getDataDir)
-    if (!dir.exists() || !dir.isDirectory) return
-
-    loadedBlocks.clear()
-    loadedFilters.clear()
-    deletionBitmaps.clear()
-
-    val files = dir.listFiles().filter(f => f.isFile && f.getName.endsWith(".udb") && f.getName.startsWith("block_"))
-    val sortedFiles = files.sortBy(_.getName)
-
-    println(s"[BlockManager] Recovering ${sortedFiles.length} blocks...")
-
-    var maxId = -1
-    for (file <- sortedFiles) {
-      val ptr = NativeBridge.loadBlockFromFile(file.getAbsolutePath)
-      if (ptr != 0) {
-          loadedBlocks.add(ptr)
-          val blockIdx = loadedBlocks.size() - 1
-          
-          // Load Deletions for this block immediately
-          loadBitmap(blockIdx, ptr)
-
-          val name = file.getName
-          val idPart = name.stripPrefix("block_").stripSuffix(".udb")
-          val id = scala.util.Try(idPart.toInt).getOrElse(0)
-          if (id > maxId) maxId = id
-          
-          if (enableIndex) {
-              val filterPath = router.getPathForFilter(id)
-              if (new File(filterPath).exists()) {
-                  val filterPtr = NativeBridge.cuckooLoad(filterPath)
-                  if (filterPtr != 0) loadedFilters.put(blockIdx, filterPtr)
-              } else {
-                  pendingIndexes.offer(blockIdx)
-              }
-          }
+    def recover(): Unit = {
+    var i = 0
+    var recovering = true
+    while (recovering) {
+      val path = router.getPathForBlock(i) 
+      val file = new java.io.File(path)
+      if (file.exists()) {
+         // [FIXED] Actually load the Native C++ Blocks and Bitmaps!
+         val ptr = NativeBridge.loadBlockFromFile(path)
+         if (ptr != 0L) {
+             loadedBlocks.add(ptr)
+             loadBitmap(i, ptr)
+         }
+         i += 1
+      } else {
+         recovering = false
       }
     }
-    blockCounter.set(maxId + 1)
-    println(s"[BlockManager] Recovery Complete. Next Block ID: ${blockCounter.get()}")
+    println(s"[BlockManager] Recovery Complete. Next Block ID: $i")
   }
 
   /**
@@ -212,6 +202,11 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
       }
       idx += 1
     }
+  }
+
+  def addLoadedBlock(blockPtr: Long): Unit = {
+    // Assuming you have a collection like `loadedBlocks: ArrayBuffer[Long]`
+    loadedBlocks.add(blockPtr)
   }
 
   private def loadBitmap(blockIdx: Int, blockPtr: Long): Unit = {

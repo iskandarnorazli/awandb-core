@@ -327,6 +327,7 @@ object SQLHandler {
           val tableName = insert.getTable.getName.toLowerCase
           val table = tables.get(tableName)
           if (table == null) return s"Error: Table '$tableName' not found."
+          
           val valuesObj = insert.getValues
           val scalaExprs = valuesObj.getExpressions.asScala
           val values = scalaExprs.map {
@@ -334,20 +335,30 @@ object SQLHandler {
             case s: StringValue => s.getValue
             case _ => 0
           }.toArray[Any]
-          table.insertRow(values)
-          "Inserted 1 row."
+          
+          // [FIXED] Catch the strict schema validation errors from Native insertRow!
+          try {
+            table.insertRow(values)
+            "Inserted 1 row."
+          } catch {
+            case e: IllegalArgumentException => s"Error: ${e.getMessage}"
+            case e: Exception => s"Error: ${e.getMessage}"
+          }
 
         case delete: Delete =>
           val tableName = delete.getTable.getName.toLowerCase
           val table = tables.get(tableName)
           if (table == null) return s"Error: Table '$tableName' not found."
+          
           val where = delete.getWhere
           if (where == null || !where.isInstanceOf[EqualsTo]) return "Error: DELETE only supports 'WHERE id = value'."
+          
           val eq = where.asInstanceOf[EqualsTo]
           val rightExpr = eq.getRightExpression
           if (!rightExpr.isInstanceOf[LongValue]) return "Error: DELETE only supports integer IDs."
+          
           val id = rightExpr.asInstanceOf[LongValue].getValue.toInt
-          val success = table.delete(id)
+          val success = table.delete(id) // Now an O(1) lock-free operation!
           if (success) "Deleted 1 row." else "Row not found."
 
         case update: Update =>
@@ -363,28 +374,24 @@ object SQLHandler {
            if (!rightExpr.isInstanceOf[LongValue]) return "Error: UPDATE only supports integer IDs."
            
            val id = rightExpr.asInstanceOf[LongValue].getValue.toInt
-           val oldRowOpt = table.getRow(id)
-           if (oldRowOpt.isEmpty) return "Error: Row not found."
            
-           val row = oldRowOpt.get
            val cols = update.getColumns.asScala
            val exprs = update.getExpressions.asScala
            
+           // [FIXED] Build a Map of changes to pass to the Native C++ Mutator
+           var changes = Map[String, Any]()
            for (i <- cols.indices) {
               val colName = cols(i).getColumnName
-              val colIdx = table.columnOrder.indexOf(colName)
-              if (colIdx != -1) {
-                  // [FIX] Safely handle both Integers and Strings
-                  exprs(i) match {
-                      case l: LongValue => row(colIdx) = l.getValue.toInt
-                      case s: StringValue => row(colIdx) = s.getValue
-                      case _ => // Ignore unsupported types for now
-                  }
+              exprs(i) match {
+                  case l: LongValue => changes += (colName -> l.getValue.toInt)
+                  case s: StringValue => changes += (colName -> s.getValue)
+                  case _ => // Ignore unsupported types
               }
            }
-           table.delete(id)
-           table.insertRow(row)
-           "Updated 1 row."
+           
+           // Trigger the C++ God Kernel memory overwrite
+           val success = table.update(id, changes)
+           if (success) "Updated 1 row." else "Error: Row not found."
 
         case _ => s"Error: Unsupported SQL statement."
       }

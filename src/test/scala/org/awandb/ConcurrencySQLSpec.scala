@@ -109,20 +109,12 @@ class ConcurrencySQLSpec extends AnyFlatSpec with Matchers {
 
     val startLatch = new java.util.concurrent.CountDownLatch(1)
     
-    // THREAD 1: Updates ID 100 repeatedly (Delete -> Insert)
+    // THREAD 1: Updates ID 100 repeatedly
     val updater = Future {
       startLatch.await()
       for (i <- 1 to 1000) {
+        // We use our new in-place Native Update! No more insert hacks.
         table.update(100, Map("status" -> 1)) 
-        // Note: Our current update() implementation in AwanTable performs a DELETE.
-        // The user must INSERT the new row manually in Phase 6.
-        // So we simulate the SQLHandler logic here:
-        // 1. Delete is already done by table.update() inside the loop? 
-        //    Wait, check AwanTable.update implementation. 
-        //    Ah, currently table.update(id, map) calls delete(id).
-        //    It DOES NOT insert the new row yet.
-        
-        table.insertRow(Array(100, 1)) // Re-insert immediately
       }
       true
     }

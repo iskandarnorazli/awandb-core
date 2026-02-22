@@ -50,8 +50,12 @@ class PersistenceSpec extends AnyFlatSpec with Matchers {
     val strData = Array("apple", "banana", "cherry", "date", "elderberry")
     
     // 1. ALLOCATE & POPULATE
-    // Create block with 2 columns
-    val blockPtr = NativeBridge.createBlock(rowCount, 2)
+    // [FIXED] Over-allocate the C++ block to leave room for the String Pool!
+    val allocationRows = rowCount * 16
+    val blockPtr = NativeBridge.createBlock(allocationRows, 2)
+    
+    // [FIXED] Patch the header back to the logical row count (5) so scans work
+    NativeBridge.setRowCount(blockPtr, rowCount)
     
     // Col 0: Int
     val col0 = NativeBridge.getColumnPtr(blockPtr, 0)
