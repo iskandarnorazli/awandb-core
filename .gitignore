@@ -10,3 +10,4 @@ target/
 *.dict
 *.wal
 *.swiss
+benchmark_scaling_log.csv
