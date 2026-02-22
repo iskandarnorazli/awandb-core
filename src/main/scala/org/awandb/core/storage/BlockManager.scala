@@ -53,6 +53,10 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
   private val pendingIndexes = new ConcurrentLinkedQueue[java.lang.Integer]()
   private val deletionBitmaps = new ConcurrentHashMap[Long, java.util.BitSet]()
 
+  // [NEW] Cache for Native Bitmask Pointers and Dirty Flags
+  private val nativeBitmaps = new ConcurrentHashMap[Long, java.lang.Long]()
+  private val bitmapDirty = new ConcurrentHashMap[Long, java.lang.Boolean]()
+
   router.initialize()
 
   /**
@@ -223,6 +227,7 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
          val ois = new ObjectInputStream(fis)
          val bitset = ois.readObject().asInstanceOf[java.util.BitSet]
          deletionBitmaps.put(blockPtr, bitset)
+         bitmapDirty.put(blockPtr, true) // [NEW] Flag for native sync
          ois.close()
          println(s"[BlockManager] Loaded Deletions for Block $blockIdx")
        } catch {
@@ -231,12 +236,13 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     }
   }
 
-  def getDeletionBitSet(blockPtr: Long): java.util.BitSet = {
-    deletionBitmaps.get(blockPtr)
-  }
-
   def markDeleted(blockPtr: Long, rowId: Int): Unit = {
     deletionBitmaps.computeIfAbsent(blockPtr, _ => new java.util.BitSet()).set(rowId)
+    bitmapDirty.put(blockPtr, true) // [NEW] Flag for native sync
+  }
+
+  def getDeletionBitSet(blockPtr: Long): java.util.BitSet = {
+    deletionBitmaps.get(blockPtr)
   }
 
   def isClean(blockPtr: Long): Boolean = {
@@ -249,11 +255,56 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     if (bits == null) false else bits.get(rowId)
   }
 
+  /**
+   * [NEW] Retrieves the cached Native Bitmask Pointer.
+   * Lazily synchronizes the JVM BitSet to Native Memory only if dirty.
+   */
+  def getNativeDeletionBitmap(blockPtr: Long, rowCount: Int): Long = {
+    val isDirty = bitmapDirty.getOrDefault(blockPtr, false)
+    var ptr = nativeBitmaps.getOrDefault(blockPtr, 0L)
+
+    // Only do work if it's dirty or hasn't been allocated yet
+    if (isDirty || (ptr == 0L && deletionBitmaps.containsKey(blockPtr))) {
+      
+      // Synchronize to prevent multiple threads from allocating native memory for the same block
+      deletionBitmaps.get(blockPtr).synchronized {
+        if (bitmapDirty.getOrDefault(blockPtr, false) || nativeBitmaps.getOrDefault(blockPtr, 0L) == 0L) {
+          val bitset = deletionBitmaps.get(blockPtr)
+          
+          if (bitset != null && !bitset.isEmpty) {
+            val rawBytes = bitset.toByteArray
+            val requiredBytes = (rowCount + 7) / 8
+            val paddedBytes = if (rawBytes.length == requiredBytes) rawBytes else rawBytes.padTo(requiredBytes, 0.toByte)
+            val intsNeeded = (requiredBytes + 3) / 4
+            val paddedInts = new Array[Int](intsNeeded)
+            
+            java.nio.ByteBuffer.wrap(paddedBytes.padTo(intsNeeded * 4, 0.toByte))
+              .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+              .asIntBuffer().get(paddedInts)
+
+            if (ptr == 0L) {
+              ptr = NativeBridge.allocMainStore(intsNeeded)
+              nativeBitmaps.put(blockPtr, ptr)
+            }
+            NativeBridge.loadData(ptr, paddedInts)
+          }
+          bitmapDirty.put(blockPtr, false)
+        }
+      }
+    }
+    ptr
+  }
+
   def close(): Unit = {
     loadedBlocks.asScala.foreach(NativeBridge.freeMainStore)
     loadedBlocks.clear()
     loadedFilters.values().asScala.foreach(NativeBridge.cuckooDestroy)
     loadedFilters.clear()
     deletionBitmaps.clear()
+    
+    // [NEW] Free cached native bitmasks
+    nativeBitmaps.values().asScala.foreach(ptr => if (ptr != 0L) NativeBridge.freeMainStore(ptr))
+    nativeBitmaps.clear()
+    bitmapDirty.clear()
   }
 }

@@ -536,40 +536,17 @@ class AwanTable(
 
     val colIdx = 0
     val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-       val bitset = blockManager.getDeletionBitSet(blockPtr)
+       val rowCount = NativeBridge.getRowCount(blockPtr)
        
-       if (bitset == null || bitset.isEmpty) {
+       // [NEW] Fetch the cached native pointer instantly
+       val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
+       
+       if (bitmaskPtr == 0L) {
            // FAST CLEAN PATH
            NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
        } else {
-           // FAST DIRTY PATH: Push Bitmask to AVX
-           val rowCount = NativeBridge.getRowCount(blockPtr)
-           
-           // Extract bytes from BitSet (Warning: toByteArray drops trailing zeros!)
-           val rawBytes = bitset.toByteArray 
-           
-           // We MUST pad the byte array to match the rowCount exactly, 
-           // otherwise C++ will read garbage memory for the trailing rows.
-           val requiredBytes = (rowCount + 7) / 8
-           val paddedBytes = if (rawBytes.length == requiredBytes) rawBytes else rawBytes.padTo(requiredBytes, 0.toByte)
-           
-           // allocate native memory (allocMainStore uses 4-byte Int chunks)
-           val intsNeeded = (requiredBytes + 3) / 4
-           val paddedInts = new Array[Int](intsNeeded)
-           
-           // Convert byte[] to int[] (Little Endian to match BitSet)
-           java.nio.ByteBuffer.wrap(paddedBytes.padTo(intsNeeded * 4, 0.toByte))
-               .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-               .asIntBuffer().get(paddedInts)
-               
-           val bitmaskPtr = NativeBridge.allocMainStore(intsNeeded)
-           
-           try {
-               NativeBridge.loadData(bitmaskPtr, paddedInts)
-               NativeBridge.avxScanBlockWithDeletions(blockPtr, colIdx, threshold, bitmaskPtr)
-           } finally {
-               NativeBridge.freeMainStore(bitmaskPtr)
-           }
+           // FAST DIRTY PATH: Use cached Native Pointer directly
+           NativeBridge.avxScanBlockWithDeletions(blockPtr, colIdx, threshold, bitmaskPtr)
        }
     })
     ramCount + diskCount
@@ -715,29 +692,15 @@ class AwanTable(
        val rowCount = NativeBridge.getRowCount(blockPtr)
        val outIndicesPtr = NativeBridge.allocMainStore(rowCount)
        
-       val bitset = blockManager.getDeletionBitSet(blockPtr)
-       var bitmaskPtr: Long = 0
+       // [NEW] Fetch the cached pointer instantly from BlockManager
+       val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
        
        try {
-           if (bitset != null && !bitset.isEmpty) {
-               val rawBytes = bitset.toByteArray
-               val requiredBytes = (rowCount + 7) / 8
-               val paddedBytes = if (rawBytes.length == requiredBytes) rawBytes else rawBytes.padTo(requiredBytes, 0.toByte)
-               val intsNeeded = (requiredBytes + 3) / 4
-               val paddedInts = new Array[Int](intsNeeded)
-               java.nio.ByteBuffer.wrap(paddedBytes.padTo(intsNeeded * 4, 0.toByte))
-                   .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                   .asIntBuffer().get(paddedInts)
-               bitmaskPtr = NativeBridge.allocMainStore(intsNeeded)
-               NativeBridge.loadData(bitmaskPtr, paddedInts)
-           }
-           
            val matchCount = NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
            
            if (matchCount == 0) {
                Iterator.empty
            } else {
-               // [THE FIX] Bulk Columnar Gather!
                // 1. First, pull the exact matched row indices into Scala
                val matchingIndices = new Array[Int](matchCount)
                NativeBridge.copyToScala(outIndicesPtr, matchingIndices, matchCount)
@@ -774,7 +737,7 @@ class AwanTable(
            }
        } finally {
            NativeBridge.freeMainStore(outIndicesPtr)
-           if (bitmaskPtr != 0) NativeBridge.freeMainStore(bitmaskPtr)
+           // [CRITICAL] Do NOT free bitmaskPtr here anymore! BlockManager owns it.
        }
     }.iterator
 
