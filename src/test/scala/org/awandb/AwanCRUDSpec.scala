@@ -18,7 +18,7 @@ package org.awandb
 
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
-import org.awandb.core.engine.{AwanTable, RowLocation}
+import org.awandb.core.engine.AwanTable
 import java.io.File
 
 class AwanCRUDSpec extends AnyFlatSpec with Matchers {

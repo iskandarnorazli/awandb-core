@@ -118,48 +118,66 @@ object SQLHandler {
           // 3. PIPELINE: FILTER -> SORT -> LIMIT -> PROJECT
           // -------------------------------------------------------
           
-          def evaluateExpression(expr: Expression): Seq[Array[Any]] = {
+          // [UPDATED] Evaluates to a primitive Array[Int] of Primary Keys
+          def evaluateExpression(expr: Expression): Array[Int] = {
               expr match {
                  case p: Parenthesis => evaluateExpression(p.getExpression)
+                 
                  case and: AndExpression =>
-                    val leftRows = evaluateExpression(and.getLeftExpression)
-                    val rightIds = evaluateExpression(and.getRightExpression).map(_(0)).toSet
-                    leftRows.filter(r => rightIds.contains(r(0)))
+                    val leftIds = evaluateExpression(and.getLeftExpression)
+                    // Fast Primitive Intersection
+                    val rightIdsSet = evaluateExpression(and.getRightExpression).toSet
+                    leftIds.filter(rightIdsSet.contains)
+                    
                  case or: OrExpression =>
-                    val leftRows = evaluateExpression(or.getLeftExpression)
-                    val rightRows = evaluateExpression(or.getRightExpression)
-                    val leftIds = leftRows.map(_(0)).toSet
-                    leftRows ++ rightRows.filterNot(r => leftIds.contains(r(0)))
+                    val leftIds = evaluateExpression(or.getLeftExpression)
+                    val rightIds = evaluateExpression(or.getRightExpression)
+                    // Fast Primitive Union
+                    (leftIds.toSet ++ rightIds.toSet).toArray
+                    
                  case eq: EqualsTo =>
                     val colName = eq.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
                     val targetVal = eq.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 0, targetVal).toSeq
+                    leftTable.scanFilteredIds(colName, 0, targetVal)
+                    
                  case gt: GreaterThan =>
                     val colName = gt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
                     val targetVal = gt.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 1, targetVal).toSeq
+                    leftTable.scanFilteredIds(colName, 1, targetVal)
+                    
                  case gte: GreaterThanEquals =>
+                     // ... [Keep existing opType 2 mapping] ...
                     val colName = gte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
                     val targetVal = gte.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 2, targetVal).toSeq
+                    leftTable.scanFilteredIds(colName, 2, targetVal)
+                    
                  case lt: MinorThan =>
                     val colName = lt.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
                     val targetVal = lt.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 3, targetVal).toSeq
+                    leftTable.scanFilteredIds(colName, 3, targetVal)
+                    
                  case lte: MinorThanEquals =>
                     val colName = lte.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
                     val targetVal = lte.getRightExpression.asInstanceOf[LongValue].getValue.toInt
-                    leftTable.scanFiltered(colName, 4, targetVal).toSeq
+                    leftTable.scanFilteredIds(colName, 4, targetVal)
+                    
                  case _ => throw new RuntimeException("Unsupported WHERE clause operator.")
               }
           }
 
           val where = plain.getWhere
           var finalRows = if (where == null) {
-              // [FIX] Bypass broken scanAll() by forcing an AVX scan
+              // Bypass broken scanAll() by forcing an AVX scan
               leftTable.scanFiltered(leftTable.columnOrder.head, 2, 0).toSeq
           } else {
-              try { evaluateExpression(where) } 
+              try { 
+                  // [LATE MATERIALIZATION]
+                  // 1. Resolve tree into final surviving Row IDs
+                  val matchedIds = evaluateExpression(where)
+                  
+                  // 2. Fetch payloads only for the survivors via O(1) PK Lookup
+                  matchedIds.flatMap(id => leftTable.getRow(id)).toSeq
+              } 
               catch { case e: RuntimeException => return "Error: " + e.getMessage }
           }
 

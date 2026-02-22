@@ -295,6 +295,9 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     ptr
   }
 
+  // O(1) zero-allocation access to the raw pointer
+  def getBlockPtr(idx: Int): Long = loadedBlocks.get(idx)
+
   def close(): Unit = {
     loadedBlocks.asScala.foreach(NativeBridge.freeMainStore)
     loadedBlocks.clear()

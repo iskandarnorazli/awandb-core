@@ -23,9 +23,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.collection.mutable.{LinkedHashMap, ListBuffer}
 import scala.collection.Seq 
 
-// Location Pointer for Primary Index
-case class RowLocation(blockPtr: Long, rowId: Int)
-
 class AwanTable(
     val name: String, 
     val capacity: Int, 
@@ -47,16 +44,59 @@ class AwanTable(
   
   @volatile private var isClosed = false
 
-  // [INDEX] Primary Key Index (Maps ID -> Location)
-  private val primaryIndex = new ConcurrentHashMap[Int, RowLocation]()
+  // [INDEX] Primary Key Index (Maps ID -> Packed Long (BlockIdx + RowId))
+  // Note: For 100% zero-allocation later, swap this with Agrona's Int2LongConcurrentHashMap
+  private val primaryIndex = new ConcurrentHashMap[Int, java.lang.Long]()
+
+  // ---------------------------------------------------------
+  // BITWISE PACKING HELPERS
+  // ---------------------------------------------------------
+  @inline private def packLocation(blockIdx: Int, rowId: Int): Long = {
+    (blockIdx.toLong << 32) | (rowId & 0xFFFFFFFFL)
+  }
+
+  @inline private def unpackBlockIdx(loc: Long): Int = (loc >> 32).toInt
+  @inline private def unpackRowId(loc: Long): Int = loc.toInt
 
   // [DELETION] RAM Deletion Bitmap (For rows in Delta Buffer)
   private val ramDeleted = new java.util.BitSet()
-  
+
   val engineManager = new EngineManager(this, governor) 
   engineManager.start()
 
   blockManager.recover()
+  rebuildPrimaryIndex() // [NEW] Rebuild the O(1) index from recovered blocks
+
+  // ---------------------------------------------------------
+  // RECOVERY ROUTINE
+  // ---------------------------------------------------------
+  private def rebuildPrimaryIndex(): Unit = {
+    val blocks = blockManager.getLoadedBlocks.toList
+    var blockIdx = 0
+    
+    for (blockPtr <- blocks) {
+      val rowCount = NativeBridge.getRowCount(blockPtr)
+      if (rowCount > 0) {
+        // We know Column 0 is the Primary Key (Int)
+        val colPtr = NativeBridge.getColumnPtr(blockPtr, 0)
+        
+        // Fetch the entire ID column in one massive swoop
+        val ids = new Array[Int](rowCount)
+        NativeBridge.copyToScala(colPtr, ids, rowCount)
+        
+        // Re-populate the ConcurrentHashMap
+        var i = 0
+        while (i < rowCount) {
+          if (!blockManager.isDeleted(blockPtr, i)) {
+            // [FIX] Use packLocation instead of RowLocation case class
+            primaryIndex.put(ids(i), packLocation(blockIdx, i))
+          }
+          i += 1
+        }
+      }
+      blockIdx += 1
+    }
+  }
 
   // ---------------------------------------------------------
   // SCHEMA
@@ -97,8 +137,14 @@ class AwanTable(
   def getRow(id: Int): Option[Array[Any]] = {
     rwLock.readLock().lock()
     try {
-      val loc = primaryIndex.get(id)
-      if (loc == null) return None
+      val packedLoc = primaryIndex.get(id)
+      if (packedLoc == null) return None
+
+      val blockIdx = unpackBlockIdx(packedLoc)
+      val rowId = unpackRowId(packedLoc)
+      
+      // Resolve the physical C++ pointer
+      val blockPtr = if (blockIdx == -1) 0L else blockManager.getBlockPtr(blockIdx)
 
       val result = new Array[Any](columns.size)
       var colIdx = 0
@@ -106,19 +152,19 @@ class AwanTable(
       for (colName <- columnOrder) {
         val col = columns(colName)
         
-        if (loc.blockPtr == 0) {
+        if (blockPtr == 0) {
            // RAM READ
            if (col.isString) {
-             result(colIdx) = col.deltaStringBuffer(loc.rowId)
+             result(colIdx) = col.deltaStringBuffer(rowId)
            } else {
-             result(colIdx) = col.deltaIntBuffer(loc.rowId)
+             result(colIdx) = col.deltaIntBuffer(rowId)
            }
         } else {
            // DISK READ (Using NativeBridge)
-           val colPtr = NativeBridge.getColumnPtr(loc.blockPtr, colIdx)
-           val stride = NativeBridge.getColumnStride(loc.blockPtr, colIdx)
-           // Calc exact memory address of the cell
-           val cellPtr = NativeBridge.getOffsetPointer(colPtr, loc.rowId * stride.toLong)
+           val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+           val stride = NativeBridge.getColumnStride(blockPtr, colIdx)
+           val cellPtr = NativeBridge.getOffsetPointer(colPtr, rowId * stride.toLong)
+           // ... (rest of the method remains identical)
            
            if (col.isString) {
              // TODO: String Disk Read support. For now return placeholder.
@@ -188,13 +234,17 @@ class AwanTable(
   def delete(id: Int): Boolean = {
     rwLock.writeLock().lock()
     try {
-      val loc = primaryIndex.get(id)
-      if (loc == null) return false
+      val packedLoc = primaryIndex.get(id)
+      if (packedLoc == null) return false
 
-      if (loc.blockPtr == 0) {
-        ramDeleted.set(loc.rowId)
+      val blockIdx = unpackBlockIdx(packedLoc)
+      val rowId = unpackRowId(packedLoc)
+      val blockPtr = if (blockIdx == -1) 0L else blockManager.getBlockPtr(blockIdx)
+
+      if (blockPtr == 0) {
+        ramDeleted.set(rowId)
       } else {
-        blockManager.markDeleted(loc.blockPtr, loc.rowId)
+        blockManager.markDeleted(blockPtr, rowId)
       }
       
       primaryIndex.remove(id)
@@ -241,7 +291,8 @@ class AwanTable(
         }
       }
 
-      primaryIndex.put(id, RowLocation(0, currentRamRowId))
+      // Use -1 as the blockIdx to represent RAM
+      primaryIndex.put(id, packLocation(-1, currentRamRowId))
 
     } finally {
       rwLock.writeLock().unlock()
@@ -323,20 +374,19 @@ class AwanTable(
           blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
     
           // 3. Update Index Locations (RAM -> Disk)
-          // [SAFETY] Check if block was actually created
           if (blockManager.getLoadedBlocks.nonEmpty) {
+              val newBlockIdx = blockManager.getLoadedBlocks.size - 1 // [NEW] Get index
               val newBlockPtr = blockManager.getLoadedBlocks.last
               val rowCount = headCol.get.deltaIntBuffer.length
               val firstCol = columns.values.head
               
-              // [FIX] Only migrate index if the ID column is Int-based.
-              // Accessing deltaIntBuffer on a String column is invalid/empty.
               if (!firstCol.isString) {
                   val idColData = firstCol.deltaIntBuffer
                   for (i <- 0 until rowCount) {
                     if (!ramDeleted.get(i)) {
                        val id = idColData(i)
-                       primaryIndex.put(id, RowLocation(newBlockPtr, i))
+                       // [NEW] Pack the Block Index and Row ID
+                       primaryIndex.put(id, packLocation(newBlockIdx, i))
                     } else {
                        primaryIndex.remove(idColData(i))
                        blockManager.markDeleted(newBlockPtr, i)
@@ -636,20 +686,25 @@ class AwanTable(
   def updateCellNative(id: Int, colName: String, newValue: Int): Boolean = {
     rwLock.writeLock().lock()
     try {
-      val loc = primaryIndex.get(id)
-      if (loc == null) return false
+      val packedLoc = primaryIndex.get(id)
+      if (packedLoc == null) return false
+      
+      // [FIX] Unpack the physical location
+      val blockIdx = unpackBlockIdx(packedLoc)
+      val rowId = unpackRowId(packedLoc)
+      val blockPtr = if (blockIdx == -1) 0L else blockManager.getBlockPtr(blockIdx)
       
       val colIdx = columnOrder.indexOf(colName)
       if (colIdx == -1) return false
 
-      if (loc.blockPtr == 0) {
+      if (blockPtr == 0) {
         // RAM Update
         val col = columns(colName)
-        col.deltaIntBuffer(loc.rowId) = newValue
+        col.deltaIntBuffer(rowId) = newValue
         true
       } else {
         // NATIVE DISK/RAM Update (In-Place C++)
-        NativeBridge.updateCell(loc.blockPtr, colIdx, loc.rowId, newValue)
+        NativeBridge.updateCell(blockPtr, colIdx, rowId, newValue)
       }
     } finally {
       rwLock.writeLock().unlock()
@@ -742,6 +797,72 @@ class AwanTable(
     }.iterator
 
     ramIter ++ diskIter
+  }
+
+  /**
+   * [NEW] Late Materialization Filter
+   * Scans a column and returns ONLY the Primary Keys (Row IDs) that match.
+   */
+  def scanFilteredIds(colName: String, opType: Int, targetVal: Int): Array[Int] = {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1) return Array.empty[Int]
+    
+    val idColName = columnOrder.head // Assumes Column 0 is the PK
+
+    // 1. RAM Filter (Primitive Array Loop)
+    val ramIds = new scala.collection.mutable.ArrayBuffer[Int]()
+    val ramCol = columns(colName).deltaIntBuffer
+    val ramIdCol = columns(idColName).deltaIntBuffer
+    
+    var i = 0
+    while (i < ramCol.length) {
+       if (!ramDeleted.get(i)) {
+         val v = ramCol(i)
+         val matchFound = opType match {
+           case 0 => v == targetVal
+           case 1 => v > targetVal
+           case 2 => v >= targetVal
+           case 3 => v < targetVal
+           case 4 => v <= targetVal
+           case _ => false
+         }
+         if (matchFound) ramIds.append(ramIdCol(i))
+       }
+       i += 1
+    }
+
+    // 2. Disk Filter (Predicate Pushdown)
+    val snapshotBlocks = blockManager.getLoadedBlocks.toList
+    
+    val diskIds = snapshotBlocks.flatMap { blockPtr =>
+       val rowCount = NativeBridge.getRowCount(blockPtr)
+       val outIndicesPtr = NativeBridge.allocMainStore(rowCount)
+       val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
+       
+       try {
+           val matchCount = NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
+           
+           if (matchCount == 0) {
+               Array.empty[Int]
+           } else {
+               // ONLY Gather Column 0 (The Primary Key)
+               val idColPtr = NativeBridge.getColumnPtr(blockPtr, 0)
+               val tempValuesPtr = NativeBridge.allocMainStore(matchCount)
+               
+               NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
+               
+               val ids = new Array[Int](matchCount)
+               NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
+               
+               NativeBridge.freeMainStore(tempValuesPtr)
+               ids
+           }
+       } finally {
+           NativeBridge.freeMainStore(outIndicesPtr)
+       }
+    }
+
+    ramIds.toArray ++ diskIds
   }
 
   def close(): Unit = {
