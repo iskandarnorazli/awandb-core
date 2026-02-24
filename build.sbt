@@ -88,9 +88,12 @@ assembly / assemblyMergeStrategy := {
 // ---------------------------------------------------------------------------
 enablePlugins(NativeImagePlugin)
 
-// The class that contains your main() method
-//Compile / nativeImageMainClass := "org.awandb.server.AwanFlightServer"
-Compile / mainClass := Some("org.awandb.server.AwanServer")
+// [FIX 1] Force the plugin to download GraalVM for JDK 21
+nativeImageVersion := "21.0.2"
+nativeImageJvm := "graalvm-java21"
+
+// [FIX 2] Ensure it boots the Flight SQL server, not the old AwanServer
+Compile / mainClass := Some("org.awandb.server.AwanFlightServer")
 
 // Name of the output executable
 nativeImageOutput := file("target") / "native-image" / "awandb-server"
