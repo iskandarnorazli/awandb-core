@@ -170,7 +170,3 @@ AwanDB utilizes a **Hybrid Scan** strategy. Performance varies depending on whet
 
 Copyright (c) 2026 Mohammad Iskandar Sham Bin Norazli Sham & Contributors.
 This project is licensed under the Apache 2.0 License.
-
-```
-
-```
