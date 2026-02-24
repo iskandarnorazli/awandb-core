@@ -7,7 +7,7 @@ AwanDB Core is an open-source, **Hybrid Transactional/Analytical Processing (HTA
 
 ---
 
-## 🚀 Quick Start: Running the Server
+##  Quick Start: Running the Server
 
 AwanDB is distributed as a highly optimized, pre-compiled native executable. Because it relies heavily on exact memory alignment and CPU-specific C++ intrinsics (AVX-512), no Java or compilation environment is required on your host machine.
 
@@ -29,7 +29,7 @@ Extract the archive and run the executable. You can customize the port and data 
 
 ```
 
-### 🔒 Authentication (Basic Auth)
+### Authentication (Basic Auth)
 
 AwanDB strictly enforces authentication. By default, the database is secured using Basic Authentication. You must pass these credentials in the header of every client connection.
 
@@ -38,7 +38,7 @@ AwanDB strictly enforces authentication. By default, the database is secured usi
 
 ---
 
-## 🐍 Connecting & Using AwanDB (Python / Flight SQL)
+## Connecting & Using AwanDB (Python / Flight SQL)
 
 AwanDB communicates entirely over **Apache Arrow Flight SQL**, an ultra-fast RPC protocol. While the example below uses Python (`pyarrow`), any language with a Flight SQL client (Go, Rust, Java, Node.js) will work exactly the same way.
 
@@ -96,7 +96,7 @@ execute_sql("SELECT name, score FROM users WHERE score > 200 ORDER BY score DESC
 
 ---
 
-## 📜 Supported SQL Dialect
+## Supported SQL Dialect
 
 AwanDB features a built-in ANSI SQL parser mapped directly to a Volcano execution model, pushing operations down into native C++ bitmasks.
 
@@ -128,7 +128,7 @@ AwanDB supports complex reporting queries including compound predicates, late ma
 
 ---
 
-## 🧠 Architecture & Project Vision
+## Architecture & Project Vision
 
 > **Why run two databases?**
 > Typically, developers write to a transactional DB (like Postgres) and sync data to an analytical DB (like DuckDB/ClickHouse) for reporting.
@@ -150,7 +150,7 @@ AwanDB supports complex reporting queries including compound predicates, late ma
 
 ---
 
-## 📊 Performance Metrics (Verified)
+## Performance Metrics (Verified)
 
 *Benchmarks run on 1 Million Rows (Transactional Mode).*
 
@@ -166,7 +166,7 @@ AwanDB utilizes a **Hybrid Scan** strategy. Performance varies depending on whet
 
 ---
 
-## 📄 License
+## License
 
 Copyright (c) 2026 Mohammad Iskandar Sham Bin Norazli Sham & Contributors.
 This project is licensed under the Apache 2.0 License.
