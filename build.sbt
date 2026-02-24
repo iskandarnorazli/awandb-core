@@ -113,5 +113,8 @@ nativeImageOptions ++= Seq(
   
   // 3. Initialize specific loggers at build time to prevent reflection crashes
   "--initialize-at-build-time=org.slf4j",
-  "--initialize-at-build-time=scala.reflect"
+  "--initialize-at-build-time=scala.reflect",
+
+  // [FIX] Prevent Netty's SSL utility from executing at build-time and crashing the compiler
+  "--initialize-at-run-time=io.netty.handler.ssl.BouncyCastleAlpnSslUtils"
 )
