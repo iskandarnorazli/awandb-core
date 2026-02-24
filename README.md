@@ -40,61 +40,89 @@ AwanDB strictly enforces authentication. By default, the database is secured usi
 
 ## Connecting & Using AwanDB (Python / Flight SQL)
 
-AwanDB communicates entirely over **Apache Arrow Flight SQL**, an ultra-fast RPC protocol. While the example below uses Python (`pyarrow`), any language with a Flight SQL client (Go, Rust, Java, Node.js) will work exactly the same way.
+AwanDB communicates entirely over **Apache Arrow Flight SQL**, an ultra-fast RPC protocol. While the example below uses Python, any language with a Flight SQL client (Go, Rust, Java, Node.js) will work exactly the same way.
 
 ### Payloads & Responses (Column-Oriented)
-
-Because AwanDB is a columnar database communicating via Arrow, data is strictly transmitted in vectorized batches rather than row-by-row JSON arrays.
-
-* **SQL Queries:** Standard SQL executions currently return a single string-based Arrow Vector named `query_result`. This column contains the formatted query output or execution status messages.
+Because AwanDB is a columnar database communicating via Arrow, data is strictly transmitted in vectorized batches rather than row-by-row JSON arrays. 
+* **SQL Queries:** Standard SQL executions return a single string-based Arrow Vector named `query_result`. This column contains the formatted query output or execution status messages.
 * **Raw Binary Ingestion:** For extreme throughput bypassing the SQL parser entirely, AwanDB can accept raw Apache Arrow `IntVector` streams directly into its columnar memory model via the `DoPut` endpoint.
 
 ### Python Client Example
 
-First, install the required library:
-
+First, install the required Apache Arrow and ADBC libraries:
 ```bash
-pip install pyarrow
+pip install pyarrow adbc-driver-flightsql
 
 ```
 
-Next, connect to the database, authenticate, and run queries:
+Next, run the following script to see both Standard SQL and Raw Binary ingestion in action:
 
 ```python
+import base64
+import pyarrow as pa
 import pyarrow.flight as flight
+from adbc_driver_flightsql import dbapi
 
-# 1. Connect to the AwanDB Server
-client = flight.FlightClient("grpc://127.0.0.1:3000")
+# AwanDB enforces Basic Auth. Encode credentials for the headers.
+auth_str = base64.b64encode(b"admin:admin").decode("utf-8")
+basic_auth_header = f"Basic {auth_str}"
 
-# 2. Authenticate using Basic Auth
-bearer_token = client.authenticate_basic_token("admin", "admin")
-options = flight.FlightCallOptions(headers=[bearer_token])
+# =========================================================
+# PHASE 1: STANDARD FLIGHT SQL (ADBC Driver)
+# =========================================================
+print("-> Connecting via ADBC Flight SQL...")
 
-# 3. Execute SQL via Flight Info & Stream
-def execute_sql(query: str):
-    ticket = flight.Ticket(query.encode('utf-8'))
-    try:
-        # Fetch the stream using the authenticated options
-        reader = client.do_get(ticket, options=options)
-        table = reader.read_all()
-        
-        # AwanDB returns results in a single 'query_result' column
-        result_array = table.column("query_result")
-        for string_scalar in result_array:
-            print(string_scalar.as_py())
-            
-    except flight.FlightError as e:
-        print(f"Database Error: {e}")
+# Connect using standard Python DB-API
+conn = dbapi.connect(
+    "grpc://localhost:3000",
+    db_kwargs={
+        "adbc.flight.sql.rpc.call_header.Authorization": basic_auth_header,
+    }
+)
+cursor = conn.cursor()
 
-# --- Try it out! ---
-execute_sql("CREATE TABLE users (id INT, name STRING, score INT)")
-execute_sql("INSERT INTO users VALUES (1, 'Alice', 250)")
-execute_sql("INSERT INTO users VALUES (2, 'Bob', 900)")
-execute_sql("SELECT name, score FROM users WHERE score > 200 ORDER BY score DESC LIMIT 10")
+# Execute Standard SQL (DDL & DML)
+cursor.execute("CREATE TABLE users (id INT, value INT)")
+print(cursor.fetchall())
+
+cursor.execute("INSERT INTO users VALUES (1, 100)")
+cursor.execute("INSERT INTO users VALUES (2, 200)")
+cursor.execute("UPDATE users SET value = 999 WHERE id = 1")
+
+# Execute Complex Aggregations
+cursor.execute("SELECT COUNT(*) AS total, SUM(value) AS total_val FROM users WHERE value > 150")
+print(cursor.fetchall())
+
+conn.close()
+
+
+# =========================================================
+# PHASE 2: RAW ARROW STREAM (Zero-Copy Binary Ingestion)
+# =========================================================
+print("\n-> Connecting via Raw Flight RPC for High-Speed Ingestion...")
+
+client = flight.FlightClient("grpc://localhost:3000")
+options = flight.FlightCallOptions(headers=[(b"authorization", basic_auth_header.encode("utf-8"))])
+
+# Target an existing table directly by path (bypassing the SQL parser)
+descriptor = flight.FlightDescriptor.for_path("leaderboard")
+schema = pa.schema([('val', pa.int32())])
+
+# Open a DoPut stream
+writer, _ = client.do_put(descriptor, schema, options=options)
+
+# Blast native Arrow RecordBatches directly into memory
+batch = pa.RecordBatch.from_arrays([pa.array([10, 20, 30, 40, 50], type=pa.int32())], schema=schema)
+writer.write_batch(batch)
+writer.close()
+
+print("✅ Data ingested successfully!")
 
 ```
 
----
+```
+
+```
 
 ## Supported SQL Dialect
 
@@ -158,11 +186,11 @@ AwanDB utilizes a **Hybrid Scan** strategy. Performance varies depending on whet
 
 | Workload | Throughput | Bandwidth | Notes |
 | --- | --- | --- | --- |
-| **Seq Scan (Clean)** | **16.1 Billion Rows/s** | **123 GB/s** | Pure AVX-512 Scan (Memory Saturated) |
-| **Rand Read** | **569 Million Ops/s** | **4.3 GB/s** | Point lookups via Primary Index |
-| **Trans. Write** | **2.43 Million Ops/s** | **~19 MB/s** | Full ACID Insert (WAL + Indexing) |
-| **Rand Update** | **690,000 Ops/s** | **~5 MB/s** | Atomic Cycle: Index Lookup → Bitmap Mark → WAL → RAM Insert |
-| **Seq Scan (Dirty)** | **92.8 Million Rows/s** | **707 MB/s** | Correctness Path (Scanning with Deletion Bitmaps) |
+| **Seq Scan (Clean)** | **5.89 Billion Rows/s** | **45 GB/s** | Pure AVX-512 Scan (Memory Saturated) |
+| **Rand Read** | **136 Million Ops/s** | **1 GB/s** | Point lookups via Primary Index |
+| **Trans. Write** | **2.26 Million Ops/s** | **~19 MB/s** | Full ACID Insert (WAL + Indexing) |
+| **Rand Update** | **870,000 Ops/s** | **~6 MB/s** | Atomic Cycle: Index Lookup → Bitmap Mark → WAL → RAM Insert |
+| **Seq Scan (Dirty)** | **176 Million Rows/s** | **1.4 GB/s** | Correctness Path (Scanning with Deletion Bitmaps) |
 
 ---
 
