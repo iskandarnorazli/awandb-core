@@ -99,7 +99,7 @@ Compile / mainClass := Some("org.awandb.server.AwanFlightServer")
 nativeImageOutput := file("target") / "native-image" / "awandb-server"
 
 nativeImageOptions ++= Seq(
-  "--no-fallback", // Force a pure native build (fail if it requires a JVM fallback)
+  "--no-fallback", 
   "-H:+ReportExceptionStackTraces",
   
   // 1. Enable JNI for your C++ Engine
@@ -111,10 +111,10 @@ nativeImageOptions ++= Seq(
   "-J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
   "-J--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
   
-  // 3. Initialize specific loggers at build time to prevent reflection crashes
+  // 3. Initialize specific loggers at build time
   "--initialize-at-build-time=org.slf4j",
   "--initialize-at-build-time=scala.reflect",
 
-  // [FIX] Prevent Netty's SSL utility from executing at build-time and crashing the compiler
-  "--initialize-at-run-time=io.netty.handler.ssl.BouncyCastleAlpnSslUtils"
+  // [FIX] Force all Netty, Arrow, and gRPC components to initialize at runtime
+  "--initialize-at-run-time=io.netty,io.grpc,org.apache.arrow"
 )

@@ -65,7 +65,7 @@ class PersistenceSpec extends AnyFlatSpec with Matchers {
     val success = NativeBridge.saveColumn(blockPtr, size, BLOCK_FILE) 
     success shouldBe true
     
-    NativeBridge.freeMainStore(blockPtr) // Clear RAM
+    //NativeBridge.freeMainStore(blockPtr) // Clear RAM
 
     // 3. BINARY INSPECTION (Basic Sanity Only)
     // We verify the Block Header to ensure the file isn't garbage.
@@ -131,7 +131,7 @@ class PersistenceSpec extends AnyFlatSpec with Matchers {
     // Negative Case
     NativeBridge.avxScanString(loadedPtr, 1, "durian") shouldBe 0
 
-    NativeBridge.freeMainStore(loadedPtr)
+    //NativeBridge.freeMainStore(loadedPtr)
     cleanUp()
   }
 }
