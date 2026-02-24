@@ -79,7 +79,8 @@ class SortAndLimitSpec extends AnyFunSuite with BeforeAndAfterAll {
   private def parseRows(res: String): Array[String] = {
     res.split("\n")
        .map(_.trim)
-       .filter(s => s.nonEmpty && !s.contains("Found Rows:"))
+       // [FIX] Use startsWith to handle dynamic column headers like "Found Rows (score):"
+       .filter(s => s.nonEmpty && !s.startsWith("Found Rows")) 
   }
 
   // -------------------------------------------------------------------------
@@ -109,7 +110,8 @@ class SortAndLimitSpec extends AnyFunSuite with BeforeAndAfterAll {
     val res = SQLHandler.execute(sql)
     
     assert(!res.contains("SQL Error"), "Threw exception on empty table sort")
-    assert(res.contains("Found Rows:"), "Missing output header")
+    // [FIX] Removed the exact colon match
+    assert(res.contains("Found Rows"), "Missing output header") 
   }
 
   // -------------------------------------------------------------------------

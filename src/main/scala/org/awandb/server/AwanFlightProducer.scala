@@ -20,6 +20,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.VarCharVector
 import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, Schema}
+import org.apache.arrow.vector.IntVector
 import org.awandb.core.sql.SQLHandler
 import scala.jdk.CollectionConverters._
 
@@ -70,6 +71,78 @@ class AwanFlightProducer(allocator: BufferAllocator, location: Location) extends
       case e: Exception =>
         println(s"[Network] Error executing query: ${e.getMessage}")
         listener.error(e)
+    }
+  }
+
+  override def acceptPut(
+      context: FlightProducer.CallContext,
+      flightStream: FlightStream,
+      ackStream: FlightProducer.StreamListener[PutResult]
+  ): Runnable = {
+    new Runnable {
+      override def run(): Unit = {
+        try {
+          val descriptor = flightStream.getDescriptor
+          val tableName = if (descriptor.isCommand) {
+              new String(descriptor.getCommand).toLowerCase()
+          } else {
+              descriptor.getPath.get(0).toLowerCase()
+          }
+
+          val table = SQLHandler.tables.get(tableName)
+          if (table == null) {
+              throw CallStatus.NOT_FOUND
+                  .withDescription(s"Table '$tableName' does not exist.")
+                  .toRuntimeException
+          }
+
+          var totalRowsIngested = 0L
+
+          while (flightStream.next()) {
+            val root = flightStream.getRoot
+            val rowCount = root.getRowCount
+
+            if (rowCount > 0) {
+              val vector = root.getVector(0)
+              vector match {
+                case intVector: IntVector =>
+                  val batchData = new Array[Int](rowCount)
+                  var i = 0
+                  while (i < rowCount) {
+                    batchData(i) = intVector.get(i)
+                    i += 1
+                  }
+                  table.insertBatch(batchData)
+                  totalRowsIngested += rowCount
+                  
+                case _ => 
+                  // [FIX] Explicitly clear server memory before aborting
+                  root.clear()
+                  throw CallStatus.INVALID_ARGUMENT
+                    .withDescription("Only IntVector streams are currently supported.")
+                    .toRuntimeException
+              }
+            }
+          }
+
+          ackStream.onNext(PutResult.empty())
+          ackStream.onCompleted()
+
+        } catch {
+          // [FIX] Catch Flight errors first so we don't overwrite their status codes!
+          case fre: FlightRuntimeException =>
+            ackStream.onError(fre)
+          case e: Exception => 
+            println(s"[FlightProducer] DoPut Failed: ${e.getMessage}")
+            ackStream.onError(CallStatus.INTERNAL.withCause(e).withDescription(e.getMessage).toRuntimeException)
+        } finally {
+          try {
+            flightStream.close()
+          } catch {
+            case e: Exception => println(s"[FlightProducer] Error closing stream: ${e.getMessage}")
+          }
+        }
+      }
     }
   }
 }

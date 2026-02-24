@@ -34,7 +34,10 @@ import net.sf.jsqlparser.expression.operators.relational.{
   GreaterThan,
   GreaterThanEquals,
   MinorThan,
-  MinorThanEquals
+  MinorThanEquals,
+  InExpression,
+  LikeExpression,
+  IsNullExpression
 }
 import net.sf.jsqlparser.expression.operators.conditional.{
   AndExpression,
@@ -74,51 +77,110 @@ object SQLHandler {
       val statement = CCJSqlParserUtil.parse(sql)
 
       // [NEW] Lifted and shared WHERE evaluator for Unrestricted DML
-      // [NEW] Lifted and shared WHERE evaluator for Unrestricted DML
-      def evaluateWhere(expr: Expression, table: AwanTable): Array[Int] = {
-          
-          // Helper to safely extract (ColumnName, TargetValue) and prevent ClassCastExceptions
-          def getColAndVal(op: net.sf.jsqlparser.expression.operators.relational.ComparisonOperator): (String, Int) = {
-             if (!op.getLeftExpression.isInstanceOf[Column]) {
-                throw new RuntimeException("Left side of condition must be a column name.")
-             }
-             if (!op.getRightExpression.isInstanceOf[LongValue]) {
-                throw new RuntimeException("Right side of condition must be an integer.")
-             }
-             (op.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase, 
-              op.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
-          }
+          def evaluateWhere(expr: Expression, table: AwanTable): Array[Int] = {
+              
+              // Helper to safely extract (ColumnName, TargetValue) and prevent ClassCastExceptions
+              def getColAndVal(op: net.sf.jsqlparser.expression.operators.relational.ComparisonOperator): (String, Int) = {
+                 if (!op.getLeftExpression.isInstanceOf[Column]) {
+                    throw new RuntimeException("Left side of condition must be a column name.")
+                 }
+                 if (!op.getRightExpression.isInstanceOf[LongValue]) {
+                    throw new RuntimeException("Right side of condition must be an integer.")
+                 }
+                 val colName = op.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                 // [FIX] Explicitly reject missing columns
+                 if (!table.columnOrder.contains(colName)) {
+                     throw new RuntimeException(s"Column '$colName' not found.")
+                 }
+                 (colName, op.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+              }
 
-          expr match {
-             case p: Parenthesis => evaluateWhere(p.getExpression, table)
-             case and: AndExpression =>
-                val leftIds = evaluateWhere(and.getLeftExpression, table)
-                val rightIdsSet = evaluateWhere(and.getRightExpression, table).toSet
-                leftIds.filter(rightIdsSet.contains)
-             case or: OrExpression =>
-                val leftIds = evaluateWhere(or.getLeftExpression, table)
-                val rightIds = evaluateWhere(or.getRightExpression, table)
-                (leftIds.toSet ++ rightIds.toSet).toArray
-                
-             case eq: EqualsTo =>
-                val (colName, targetVal) = getColAndVal(eq)
-                table.scanFilteredIds(colName, 0, targetVal)
-             case gt: GreaterThan =>
-                val (colName, targetVal) = getColAndVal(gt)
-                table.scanFilteredIds(colName, 1, targetVal)
-             case gte: GreaterThanEquals =>
-                val (colName, targetVal) = getColAndVal(gte)
-                table.scanFilteredIds(colName, 2, targetVal)
-             case lt: MinorThan =>
-                val (colName, targetVal) = getColAndVal(lt)
-                table.scanFilteredIds(colName, 3, targetVal)
-             case lte: MinorThanEquals =>
-                val (colName, targetVal) = getColAndVal(lte)
-                table.scanFilteredIds(colName, 4, targetVal)
-                
-             case _ => throw new RuntimeException(s"Unsupported WHERE clause operator: ${expr.getClass.getSimpleName}")
+              expr match {
+                 case p: Parenthesis => evaluateWhere(p.getExpression, table)
+                 case and: AndExpression =>
+                    val leftIds = evaluateWhere(and.getLeftExpression, table)
+                    val rightIdsSet = evaluateWhere(and.getRightExpression, table).toSet
+                    leftIds.filter(rightIdsSet.contains)
+                 case or: OrExpression =>
+                    val leftIds = evaluateWhere(or.getLeftExpression, table)
+                    val rightIds = evaluateWhere(or.getRightExpression, table)
+                    (leftIds.toSet ++ rightIds.toSet).toArray
+                    
+                 case eq: EqualsTo =>
+                    val (colName, targetVal) = getColAndVal(eq)
+                    table.scanFilteredIds(colName, 0, targetVal)
+                 case gt: GreaterThan =>
+                    val (colName, targetVal) = getColAndVal(gt)
+                    table.scanFilteredIds(colName, 1, targetVal)
+                 case gte: GreaterThanEquals =>
+                    val (colName, targetVal) = getColAndVal(gte)
+                    table.scanFilteredIds(colName, 2, targetVal)
+                 case lt: MinorThan =>
+                    val (colName, targetVal) = getColAndVal(lt)
+                    table.scanFilteredIds(colName, 3, targetVal)
+                 case lte: MinorThanEquals =>
+                    val (colName, targetVal) = getColAndVal(lte)
+                    table.scanFilteredIds(colName, 4, targetVal)
+
+                 case in: InExpression =>
+                    val colName = in.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
+                    
+                    // [FIX] Reverting to string extraction to make the IN clause 100% version-agnostic
+                    // and immune to JSqlParser AST breaking changes.
+                    val inStr = in.toString 
+                    val content = inStr.substring(inStr.indexOf('(') + 1, inStr.lastIndexOf(')'))
+                    val targetVals = content.split(",").map(_.trim.replace("'", "")).toSet
+
+                    // Fallback: Fetch all active rows and filter via Scala
+                    val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
+                    val colIdx = table.columnOrder.indexOf(colName)
+                    
+                    allIds.filter { id =>
+                       val rowOpt = table.getRow(id)
+                       rowOpt.isDefined && targetVals.contains(rowOpt.get(colIdx).toString)
+                    }
+
+                 case like: LikeExpression =>
+                    val colName = like.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
+                    
+                    val targetVal = like.getRightExpression.asInstanceOf[StringValue].getValue
+                    
+                    // Convert SQL LIKE ('Al%') to standard Regex ('^Al.*$')
+                    val regexStr = "^" + targetVal.replace("%", ".*").replace("_", ".") + "$"
+                    val regex = regexStr.r
+                    
+                    val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
+                    val colIdx = table.columnOrder.indexOf(colName)
+                    
+                    allIds.filter { id =>
+                       val rowOpt = table.getRow(id)
+                       rowOpt.isDefined && regex.matches(rowOpt.get(colIdx).toString)
+                    }
+
+                 case isNull: IsNullExpression =>
+                    val colName = isNull.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+                    if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
+                    
+                    val isNot = isNull.isNot
+                    
+                    val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
+                    val colIdx = table.columnOrder.indexOf(colName)
+                    
+                    allIds.filter { id =>
+                       val rowOpt = table.getRow(id)
+                       if (rowOpt.isDefined) {
+                           val v = rowOpt.get(colIdx)
+                           // AwanDB pads missing values with empty strings or zeros
+                           val isNullEquivalent = v == null || v == "" || v == 0
+                           if (isNot) !isNullEquivalent else isNullEquivalent
+                       } else false
+                    }
+                    
+                 case _ => throw new RuntimeException(s"Unsupported WHERE clause operator: ${expr.getClass.getSimpleName}")
+              }
           }
-      }
 
       statement match {
         case select: Select =>
@@ -343,67 +405,190 @@ object SQLHandler {
               finalRows = finalRows.take(limitVal)
             }
           }
-
+          
           // --- PROJECT & FORMAT OUTPUT ---
           val requestedColumns = scala.collection.mutable.ArrayBuffer[String]()
+          val requestedHeaders = scala.collection.mutable.ArrayBuffer[String]()
+          
+          // [NEW] Tracking arrays for Aggregation Functions
+          val aggregators = scala.collection.mutable.ArrayBuffer[(String, String)]()
+          var isAggregation = false
+          
           val isAsterisk = plain.getSelectItems.get(0).toString == "*"
-
+          
           if (isAsterisk) {
-            requestedColumns ++= leftTable.columnOrder
+             requestedColumns ++= leftTable.columnOrder
+             requestedHeaders ++= leftTable.columnOrder
           } else {
-            for (item <- plain.getSelectItems.asScala) {
-              val expr = item.getExpression
-              if (expr != null && expr.isInstanceOf[Column]) {
-                requestedColumns.append(
-                  expr.asInstanceOf[Column].getColumnName.toLowerCase
-                )
-              }
-            }
+             for (item <- plain.getSelectItems.asScala) {
+                 val expr = item.getExpression
+                 val alias = if (item.getAlias != null) item.getAlias.getName else null
+
+                 // Detect Aggregate Functions (COUNT, SUM, MAX, MIN, AVG)
+                 if (expr != null && expr.isInstanceOf[Function]) {
+                     isAggregation = true
+                     val func = expr.asInstanceOf[Function]
+                     val funcName = func.getName.toUpperCase
+                     
+                     // [FIX] Safely handle COUNT(*) and AllColumns AST nodes
+                     val param = if (func.isAllColumns) "*" else {
+                         val params = func.getParameters
+                         if (params != null && params.getExpressions != null && params.getExpressions.size() > 0) {
+                             val firstExpr = params.getExpressions.get(0)
+                             firstExpr match {
+                                 case _: net.sf.jsqlparser.statement.select.AllColumns => "*"
+                                 case c: Column => c.getColumnName.toLowerCase
+                                 case _ => "*" // Fallback for raw values or unexpected types
+                             }
+                         } else "*"
+                     }
+                     
+                     requestedHeaders.append(if (alias != null) alias else s"$funcName($param)")
+                     aggregators.append((funcName, param))
+                     
+                 } else if (expr != null && expr.isInstanceOf[Column]) {
+                     val colName = expr.asInstanceOf[Column].getColumnName.toLowerCase
+                     requestedColumns.append(colName)
+                     requestedHeaders.append(if (alias != null) alias else colName)
+                 }
+             }
           }
-
-          val projectionIndices = requestedColumns
-            .map(col => leftTable.columnOrder.indexOf(col))
-            .toArray
-          if (projectionIndices.contains(-1))
-            return SQLResult(
-              true,
-              s"Error: One or more projected columns do not exist."
-            )
-
+          
+          // [NEW] Execute Scalar Aggregations
+          if (isAggregation) {
+             var count = 0L
+             val sums = Array.fill[Long](aggregators.size)(0L)
+             val maxs = Array.fill[Int](aggregators.size)(Int.MinValue)
+             val mins = Array.fill[Int](aggregators.size)(Int.MaxValue)
+             
+             // Single-pass reduction over the filtered rows
+             for (row <- finalRows) {
+                 count += 1
+                 for (i <- aggregators.indices) {
+                     val colName = aggregators(i)._2
+                     val colIdx = leftTable.columnOrder.indexOf(colName)
+                     if (colIdx != -1) {
+                         // MVP: Assume numeric values for aggregation
+                         val v = row(colIdx) match { case n: Int => n; case _ => 0 }
+                         sums(i) += v
+                         if (v > maxs(i)) maxs(i) = v
+                         if (v < mins(i)) mins(i) = v
+                     }
+                 }
+             }
+             
+             // Finalize the values (handling DivByZero and Empty Sets safely)
+             val finalAggRow = aggregators.indices.map { i =>
+                 aggregators(i)._1 match {
+                     case "COUNT" => count.toString
+                     case "SUM" => if (count == 0) "NULL" else sums(i).toString
+                     case "MAX" => if (count == 0) "NULL" else maxs(i).toString
+                     case "MIN" => if (count == 0) "NULL" else mins(i).toString
+                     case "AVG" => if (count == 0) "NULL" else (sums(i).toDouble / count).toString
+                     case _ => "NULL"
+                 }
+             }
+             
+             val sb = new StringBuilder()
+             sb.append(s"\n   Found Rows (${requestedHeaders.mkString(" | ")}):\n")
+             sb.append("   " + finalAggRow.mkString(" | ") + "\n")
+             return SQLResult(false, sb.toString(), 1L)
+          }
+          
+          // Standard Projection (Non-Aggregated)
+          val projectionIndices = requestedColumns.map(col => leftTable.columnOrder.indexOf(col)).toArray
+          if (projectionIndices.contains(-1)) return SQLResult(true, s"Error: One or more projected columns do not exist.")
+          
           val sb = new StringBuilder()
-          sb.append(s"\n   Found Rows:\n")
-          finalRows.foreach { row =>
-            val projectedRow = projectionIndices.map(idx => row(idx))
-            sb.append("   " + projectedRow.mkString(" | ") + "\n")
+          sb.append(s"\n   Found Rows (${requestedHeaders.mkString(" | ")}):\n")
+          
+          finalRows.foreach { row => 
+             val projectedRow = projectionIndices.map(idx => row(idx))
+             sb.append("   " + projectedRow.mkString(" | ") + "\n") 
           }
           return SQLResult(false, sb.toString(), finalRows.length.toLong)
 
         case insert: Insert =>
           val tableName = insert.getTable.getName.toLowerCase
           val table = tables.get(tableName)
-          if (table == null)
-            return SQLResult(true, s"Error: Table '$tableName' not found.")
-
+          if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
+          
+          val columnsObj = insert.getColumns
           val valuesObj = insert.getValues
           val scalaExprs = valuesObj.getExpressions.asScala
-          val values = scalaExprs
-            .map {
-              case l: LongValue   => l.getValue.toInt
-              case s: StringValue => s.getValue
-              case _              => 0
-            }
-            .toArray[Any]
+          
+          // [FIX] Full Insert Validation - Prevent undersized/oversized rows
+          if (columnsObj == null && scalaExprs.length != table.columnOrder.length) {
+              return SQLResult(true, s"Error: Column mismatch. Expected ${table.columnOrder.length} columns, got ${scalaExprs.length}.")
+          }
+          
+          // Pre-allocate the row with the exact width of the table
+          val finalValues = new Array[Any](table.columnOrder.length)
 
-          table.insertRow(values)
+          // 1. Initialize safe defaults to prevent JVM casting crashes
+          for (i <- table.columnOrder.indices) {
+             val colName = table.columnOrder(i)
+             finalValues(i) = if (table.columns(colName).isString) "" else 0
+          }
 
-          // [NEW] Check for RETURNING clause
-          if (hasReturning) {
-            val sb = new StringBuilder()
-            sb.append(s"\n   Found Rows:\n")
-            sb.append("   " + values.mkString(" | ") + "\n")
-            SQLResult(false, sb.toString(), 1L)
+          // 2. Map the provided values into the correct column slots with STRICT Type Safety
+          if (columnsObj != null) {
+             // PARTIAL INSERT
+             val specifiedCols = columnsObj.asScala.map(_.getColumnName.toLowerCase)
+             
+             // [FIX] Partial Insert Validation
+             if (specifiedCols.length != scalaExprs.length) {
+                 return SQLResult(true, s"Error: Column mismatch. Specified ${specifiedCols.length} columns, but provided ${scalaExprs.length} values.")
+             }
+             
+             // [FIX] Replaced 'for' comprehension with a 'while' loop to prevent Scala 3 non-local return warnings
+             var i = 0
+             while (i < specifiedCols.length) {
+                 val colName = specifiedCols(i)
+                 val colIdx = table.columnOrder.indexOf(colName)
+                 if (colIdx != -1) {
+                     finalValues(colIdx) = scalaExprs(i) match {
+                         case l: LongValue => 
+                             if (table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects String, but got Int.")
+                             l.getValue.toInt
+                         case s: StringValue => 
+                             if (!table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
+                             s.getValue
+                         case _ => if (table.columns(colName).isString) "" else 0
+                     }
+                 }
+                 i += 1
+             }
           } else {
-            SQLResult(false, "Inserted 1 row.", 1L)
+             // FULL INSERT
+             // [FIX] Replaced 'for' comprehension with a 'while' loop to prevent Scala 3 non-local return warnings
+             var i = 0
+             while (i < scalaExprs.length) {
+                 if (i < finalValues.length) {
+                     val colName = table.columnOrder(i)
+                     finalValues(i) = scalaExprs(i) match {
+                         case l: LongValue => 
+                             if (table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects String, but got Int.")
+                             l.getValue.toInt
+                         case s: StringValue => 
+                             if (!table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
+                             s.getValue
+                         case _ => if (table.columns(colName).isString) "" else 0
+                     }
+                 }
+                 i += 1
+             }
+          }
+          
+          table.insertRow(finalValues)
+          
+          if (hasReturning) {
+             val sb = new StringBuilder()
+             sb.append(s"\n   Found Rows:\n")
+             sb.append("   " + finalValues.mkString(" | ") + "\n")
+             SQLResult(false, sb.toString(), 1L)
+          } else {
+             SQLResult(false, "Inserted 1 row.", 1L)
           }
 
         case create: CreateTable =>
