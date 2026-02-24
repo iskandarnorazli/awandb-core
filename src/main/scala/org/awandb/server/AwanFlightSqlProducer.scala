@@ -180,11 +180,22 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       flightStream: FlightStream,
       ackStream: FlightProducer.StreamListener[PutResult]
   ): Runnable = {
+    
+    val descriptor = flightStream.getDescriptor
+    
+    // [FIX] The Routing Switch:
+    // Flight SQL sends mutations as Commands (Protobuf Any messages).
+    // If it's a command, hand it back to the parent class so it can unpack 
+    // the protobuf and route it to our `acceptPutStatement` method!
+    if (descriptor.isCommand) {
+      return super.acceptPut(context, flightStream, ackStream)
+    }
+
+    // Otherwise, it's a Path descriptor, which means it's our raw binary ingestion stream!
     new Runnable {
       override def run(): Unit = {
         try {
-          val descriptor = flightStream.getDescriptor
-          val tableName = if (descriptor.isCommand) new String(descriptor.getCommand).toLowerCase() else descriptor.getPath.get(0).toLowerCase()
+          val tableName = descriptor.getPath.get(0).toLowerCase()
 
           val table = SQLHandler.tables.get(tableName)
           if (table == null) throw CallStatus.NOT_FOUND.withDescription(s"Table '$tableName' does not exist.").toRuntimeException
@@ -194,7 +205,7 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
             val root = flightStream.getRoot
             if (root.getRowCount > 0) {
               root.getVector(0) match {
-                case intVector: IntVector =>
+                case intVector: org.apache.arrow.vector.IntVector =>
                   val batchData = new Array[Int](root.getRowCount)
                   var i = 0
                   while (i < root.getRowCount) { batchData(i) = intVector.get(i); i += 1 }
