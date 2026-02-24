@@ -13,7 +13,7 @@ Test / javaOptions ++= Seq(
 )
 
 // Default main class (Standalone Server)
-Compile / mainClass := Some("org.awandb.server.AwanServer")
+Compile / mainClass := Some("org.awandb.server.AwanFlightServer")
 
 // Local Development Native Library Path 
 // (CI/CD passes this dynamically, but this allows local `sbt run` and `sbt test` to work)
@@ -82,3 +82,33 @@ assembly / assemblyMergeStrategy := {
   case "module-info.class" => MergeStrategy.discard
   case x => MergeStrategy.first
 }
+
+// ---------------------------------------------------------------------------
+// GRAALVM NATIVE IMAGE CONFIGURATION
+// ---------------------------------------------------------------------------
+enablePlugins(NativeImagePlugin)
+
+// The class that contains your main() method
+//Compile / nativeImageMainClass := "org.awandb.server.AwanFlightServer"
+Compile / mainClass := Some("org.awandb.server.AwanServer")
+
+// Name of the output executable
+nativeImageOutput := file("target") / "native-image" / "awandb-server"
+
+nativeImageOptions ++= Seq(
+  "--no-fallback", // Force a pure native build (fail if it requires a JVM fallback)
+  "-H:+ReportExceptionStackTraces",
+  
+  // 1. Enable JNI for your C++ Engine
+  "-H:+JNI",
+  
+  // 2. Unlock Native Access for Apache Arrow / Netty
+  "--enable-native-access=ALL-UNNAMED",
+  "-J--add-opens=java.base/java.nio=ALL-UNNAMED",
+  "-J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+  "-J--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+  
+  // 3. Initialize specific loggers at build time to prevent reflection crashes
+  "--initialize-at-build-time=org.slf4j",
+  "--initialize-at-build-time=scala.reflect"
+)

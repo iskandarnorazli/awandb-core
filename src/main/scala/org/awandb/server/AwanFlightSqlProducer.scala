@@ -9,6 +9,8 @@ import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, Schema}
 import org.awandb.core.sql.SQLHandler
 import scala.jdk.CollectionConverters._
+import org.apache.arrow.vector.IntVector
+import org.apache.arrow.flight.{CallStatus, FlightRuntimeException, FlightStream, PutResult}
 
 class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) extends FlightSqlProducer {
 
@@ -169,4 +171,51 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
   override def getStreamPreparedStatement(command: CommandPreparedStatementQuery, context: FlightProducer.CallContext, listener: FlightProducer.ServerStreamListener): Unit = throw CallStatus.UNIMPLEMENTED.toRuntimeException
   override def acceptPutPreparedStatementUpdate(command: CommandPreparedStatementUpdate, context: FlightProducer.CallContext, flightStream: FlightStream, listener: FlightProducer.StreamListener[PutResult]): Runnable = throw CallStatus.UNIMPLEMENTED.toRuntimeException
   override def acceptPutPreparedStatementQuery(command: CommandPreparedStatementQuery, context: FlightProducer.CallContext, flightStream: FlightStream, listener: FlightProducer.StreamListener[PutResult]): Runnable = throw CallStatus.UNIMPLEMENTED.toRuntimeException
+
+  // ========================================================================
+  // 4. RAW BINARY INGESTION (DoPut) - Bypassing SQL
+  // ========================================================================
+  override def acceptPut(
+      context: FlightProducer.CallContext,
+      flightStream: FlightStream,
+      ackStream: FlightProducer.StreamListener[PutResult]
+  ): Runnable = {
+    new Runnable {
+      override def run(): Unit = {
+        try {
+          val descriptor = flightStream.getDescriptor
+          val tableName = if (descriptor.isCommand) new String(descriptor.getCommand).toLowerCase() else descriptor.getPath.get(0).toLowerCase()
+
+          val table = SQLHandler.tables.get(tableName)
+          if (table == null) throw CallStatus.NOT_FOUND.withDescription(s"Table '$tableName' does not exist.").toRuntimeException
+
+          var totalRowsIngested = 0L
+          while (flightStream.next()) {
+            val root = flightStream.getRoot
+            if (root.getRowCount > 0) {
+              root.getVector(0) match {
+                case intVector: IntVector =>
+                  val batchData = new Array[Int](root.getRowCount)
+                  var i = 0
+                  while (i < root.getRowCount) { batchData(i) = intVector.get(i); i += 1 }
+                  table.insertBatch(batchData)
+                  totalRowsIngested += root.getRowCount
+                case _ => 
+                  root.clear()
+                  throw CallStatus.INVALID_ARGUMENT.withDescription("Only IntVector streams are currently supported.").toRuntimeException
+              }
+            }
+          }
+          ackStream.onNext(PutResult.empty())
+          ackStream.onCompleted()
+
+        } catch {
+          case fre: FlightRuntimeException => ackStream.onError(fre)
+          case e: Exception => ackStream.onError(CallStatus.INTERNAL.withCause(e).withDescription(e.getMessage).toRuntimeException)
+        } finally {
+          try { flightStream.close() } catch { case _: Exception => }
+        }
+      }
+    }
+  }
 }

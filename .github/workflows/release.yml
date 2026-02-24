@@ -95,32 +95,28 @@ jobs:
             exit 1
           fi
 
-      - name: Build JVM Fat JAR
+      - name: Build GraalVM Native Executable
         shell: bash
-        # [FIX] Use assembly to bundle Arrow, Netty, and Scala libraries
-        run: sbt assembly
+        # This triggers GraalVM to compile the Scala/Java code into machine code
+        run: sbt nativeImage
 
       - name: Package OS-Specific Release Archive
         shell: bash
         run: |
           # 1. Structure the Distribution Directory
-          mkdir -p awandb/lib
           mkdir -p awandb/bin
           
-          # 2. Copy the Native Library & Compiled Scala Fat JAR
-          cp lib/Release/* awandb/lib/
-          # [FIX] Look for the AwanDB-assembly JAR instead of the thin JAR
-          cp target/scala-*/AwanDB-assembly-*.jar awandb/lib/awandb.jar
+          # 2. Copy the Native C++ Library (.so, .dll, .dylib) directly next to the executable
+          # This allows System.loadLibrary to find it automatically without wrapper scripts
+          cp lib/Release/* awandb/bin/
           
-          # 3. Create Standalone Server Scripts
-          echo '#!/bin/bash' > awandb/bin/awandb-server.sh
-          echo 'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' >> awandb/bin/awandb-server.sh
-          echo 'java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -Djava.library.path="$DIR/../lib" -cp "$DIR/../lib/awandb.jar" org.awandb.server.AwanFlightServer "$@"' >> awandb/bin/awandb-server.sh
-          chmod +x awandb/bin/awandb-server.sh
-
-          echo '@echo off' > awandb/bin/awandb-server.bat
-          echo 'set DIR=%~dp0' >> awandb/bin/awandb-server.bat
-          echo 'java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --enable-native-access=ALL-UNNAMED -Djava.library.path="%DIR%..\lib" -cp "%DIR%..\lib\awandb.jar" org.awandb.server.AwanFlightServer %*' >> awandb/bin/awandb-server.bat
+          # 3. Copy the GraalVM Executable
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/native-image/awandb-server.exe awandb/bin/
+          else
+            cp target/native-image/awandb-server awandb/bin/
+            chmod +x awandb/bin/awandb-server
+          fi
 
           # 4. Compress Archive
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
@@ -128,6 +124,13 @@ jobs:
           else
             tar -czvf ${{ matrix.archive_name }} awandb/
           fi
+
+      - name: Upload OS Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
 
       - name: Upload OS Archive
         uses: actions/upload-artifact@v4
