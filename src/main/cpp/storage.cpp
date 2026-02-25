@@ -27,8 +27,9 @@ extern "C" {
     ) {
         if (jColSizes == nullptr) return 0;
         
-        jint* colSizes = env->GetIntArrayElements(jColSizes, nullptr);
-        if (!colSizes) return 0; // Prevent JNI crashes under GC pressure
+        // [RESTORED] Zero-Copy Critical Access
+        jint* colSizes = (jint*)env->GetPrimitiveArrayCritical(jColSizes, nullptr);
+        if (!colSizes) return 0; // Safety check maintained
         
         size_t headerSize = sizeof(BlockHeader);
         size_t colHeadersSize = colCount * sizeof(ColumnHeader);
@@ -42,12 +43,11 @@ extern "C" {
             totalDataSize += (size_t)colSizes[i];
         }
         
-        // [CRITICAL FIX] Add 512 bytes of trailing padding to silence ASan AVX prefetches
-        size_t totalBlockSize = dataStartOffset + totalDataSize + 512;
-
+        size_t totalBlockSize = dataStartOffset + totalDataSize + 512; // Keep AVX padding
         uint8_t* rawPtr = (uint8_t*)alloc_aligned(totalBlockSize);
+        
         if (!rawPtr) {
-            env->ReleaseIntArrayElements(jColSizes, colSizes, JNI_ABORT);
+            env->ReleasePrimitiveArrayCritical(jColSizes, colSizes, 0);
             return 0; 
         }
         std::memset(rawPtr, 0, totalBlockSize);
@@ -76,7 +76,8 @@ extern "C" {
             currentOffset += (size_t)colSizes[i];
         }
 
-        env->ReleaseIntArrayElements(jColSizes, colSizes, JNI_ABORT);
+        // Release with mode 0 for Critical arrays
+        env->ReleasePrimitiveArrayCritical(jColSizes, colSizes, 0);
         return (jlong)rawPtr;
     }
 
@@ -84,14 +85,14 @@ extern "C" {
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadDataNative(JNIEnv* env, jobject obj, jlong ptr, jintArray jData) {
         if (ptr == 0 || jData == nullptr) return;
         
-        jint* scalaData = env->GetIntArrayElements(jData, nullptr);
-        if (!scalaData) return; // Prevent wild memory reads
+        // [RESTORED] Zero-Copy Critical Access
+        jint* scalaData = (jint*)env->GetPrimitiveArrayCritical(jData, nullptr);
+        if (!scalaData) return; 
         
         jsize length = env->GetArrayLength(jData);
         std::memcpy((void*)ptr, scalaData, (size_t)length * sizeof(int));
         
-        // [CRITICAL FIX] Use JNI_ABORT to prevent 40MB memory duplication back to JVM
-        env->ReleaseIntArrayElements(jData, scalaData, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(jData, scalaData, 0);
     }
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaNative(JNIEnv* env, jobject obj, jlong srcPtr, jintArray dstArray, jint len) {
@@ -147,7 +148,8 @@ extern "C" {
     }
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadVectorDataNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jfloatArray jData, jint dim) {
-        if (blockPtr == 0) return;
+        if (blockPtr == 0 || jData == nullptr) return;
+        
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
         ch->type = TYPE_VECTOR;
@@ -155,16 +157,16 @@ extern "C" {
         ch->stride = dim * sizeof(float);
         if (ch->data_offset == 0) return;
         
-        jfloat* srcData = env->GetFloatArrayElements(jData, nullptr);
-        if (!srcData) return; // GC pressure safety check
+        // [RESTORED] Zero-Copy Critical Access
+        jfloat* srcData = (jfloat*)env->GetPrimitiveArrayCritical(jData, nullptr);
+        if (!srcData) return; 
 
         jsize count = env->GetArrayLength(jData); 
         float* dstData = (float*)(rawPtr + ch->data_offset);
         std::memcpy(dstData, srcData, (size_t)count * sizeof(float));
         ch->data_length = (size_t)count * sizeof(float);
         
-        // [YOUR FIX] Use JNI_ABORT to stop massive memory copybacks!
-        env->ReleaseFloatArrayElements(jData, srcData, JNI_ABORT);
+        env->ReleasePrimitiveArrayCritical(jData, srcData, 0);
     }
 
     // --- IO & Metadata ---
