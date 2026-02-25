@@ -32,8 +32,10 @@ class MaterializeOperator(
         val colBasePtr = NativeBridge.getColumnPtr(batch.blockPtr, colIdx)
         
         if (colBasePtr != 0) {
-            // [CRITICAL FIX 1] Restore the offset! selectionVector is batch-local (0 to count-1)
-            val offsetBytes = batch.startRowInBlock * 4L 
+            // Dynamically fetch the stride (4 for Int, 16 for String, etc.)
+            val stride = NativeBridge.getColumnStride(batch.blockPtr, colIdx)
+            val offsetBytes = batch.startRowInBlock * stride.toLong
+            
             val chunkPtr = NativeBridge.getOffsetPointer(colBasePtr, offsetBytes)
             
             // [CRITICAL FIX 2] Dynamic Memory Width check to prevent Segfaults & Corruption!

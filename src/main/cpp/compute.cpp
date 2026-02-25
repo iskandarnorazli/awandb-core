@@ -476,6 +476,8 @@ extern "C" {
         ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
         ColumnHeader& col = colHeaders[colIdx];
 
+        if (col.type != TYPE_INT) return 0;
+
         if (targetVal < col.min_int || targetVal > col.max_int) return 0;
 
         int32_t* data = (int32_t*)(rawPtr + col.data_offset);

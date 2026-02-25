@@ -763,22 +763,17 @@ class AwanTable(
                // 2. Allocate Scala arrays to hold the fully extracted columns
                val colsData = new Array[Array[Int]](columnOrder.size)
                
-               // 3. For each column, do ONE massive JNI fetch
                for (c <- columnOrder.indices) {
-                   colsData(c) = new Array[Int](matchCount)
-                   val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
-                   
-                   // Allocate a temporary native buffer for the C++ gather kernel
-                   val tempValuesPtr = NativeBridge.allocMainStore(matchCount)
-                   
-                   // Use the blazingly fast C++ AVX gather kernel
-                   NativeBridge.batchRead(colPtr, outIndicesPtr, matchCount, tempValuesPtr)
-                   
-                   // Copy the entire column to Scala in one swoop
-                   NativeBridge.copyToScala(tempValuesPtr, colsData(c), matchCount)
-                   
-                   // Free the temporary native buffer
-                   NativeBridge.freeMainStore(tempValuesPtr)
+                   val col = columns(columnOrder(c))
+                   if (!col.isString) { // Safe-guard against native string corruption
+                       colsData(c) = new Array[Int](matchCount)
+                       val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
+                       val tempValuesPtr = NativeBridge.allocMainStore(matchCount)
+                       
+                       NativeBridge.batchRead(colPtr, outIndicesPtr, matchCount, tempValuesPtr)
+                       NativeBridge.copyToScala(tempValuesPtr, colsData(c), matchCount)
+                       NativeBridge.freeMainStore(tempValuesPtr)
+                   }
                }
                
                // 4. Transpose the columnar arrays into rows purely in Scala (Zero JNI overhead)
