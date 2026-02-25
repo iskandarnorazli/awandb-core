@@ -117,16 +117,19 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
       case _ => (0, false)
     }
 
+    // [NEW] Dynamically detect if this block contains Vector data
+    val hasVector = columnsData.exists(_.isInstanceOf[Array[Float]])
+
     if (rowCount == 0) return
     val colCount = columnsData.length
     val currentId = blockCounter.getAndIncrement()
     
     // [STRATEGY: Over-Allocate, Then Patch]
-    val allocationRows = if (hasString) rowCount * 16 else rowCount
+    // Now hasVector is properly defined!
+    val allocationRows = if (hasVector) rowCount * 128 else if (hasString) rowCount * 16 else rowCount
     val blockPtr = NativeBridge.createBlock(allocationRows, colCount)
     
     // [CRITICAL FIX] ALWAYS patch the header row count.
-    // This fixes the "0 items found" bug for Integer-only tables.
     UnsafeHelper.putInt(blockPtr, 8L, rowCount)
     
     try {

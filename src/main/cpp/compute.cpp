@@ -77,8 +77,8 @@ extern "C" {
 
         // --- PATH A: AVX2 (Intel/AMD) ---
 #ifdef ARCH_X86
-        size_t limit = (size_t)rows - 32;
-        for (; i < limit; i += 32) {
+        int limit = rows - 32; // Changed from size_t
+        for (; i <= limit; i += 32) { // Changed < to <= to process the final full chunk
             _mm_prefetch((const char*)&data[i + 32], _MM_HINT_T0);
             _mm_prefetch((const char*)&data[i + 48], _MM_HINT_T0);
             
@@ -100,8 +100,8 @@ extern "C" {
         
         // --- PATH B: NEON (ARM/Apple) ---
 #elif defined(ARCH_ARM)
-        size_t limit = (size_t)rows - 16;
-        for (; i < limit; i += 16) {
+        int limit = rows - 16; // Changed from size_t
+        for (; i <= limit; i += 16) { // Changed < to <= 
             int32x4_t v0 = vld1q_s32(&data[i]);
             int32x4_t v1 = vld1q_s32(&data[i+4]);
             int32x4_t v2 = vld1q_s32(&data[i+8]);
