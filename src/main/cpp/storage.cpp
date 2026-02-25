@@ -28,6 +28,7 @@ extern "C" {
         if (jColSizes == nullptr) return 0;
         
         jint* colSizes = env->GetIntArrayElements(jColSizes, nullptr);
+        if (!colSizes) return 0; // Prevent JNI crashes under GC pressure
         
         size_t headerSize = sizeof(BlockHeader);
         size_t colHeadersSize = colCount * sizeof(ColumnHeader);
@@ -36,17 +37,17 @@ extern "C" {
         size_t padding = (metaDataSize % 256 != 0) ? (256 - (metaDataSize % 256)) : 0;
         size_t dataStartOffset = metaDataSize + padding;
         
-        // Sum the requested exact bytes for all columns
         size_t totalDataSize = 0;
         for (int i = 0; i < colCount; i++) {
             totalDataSize += (size_t)colSizes[i];
         }
         
-        size_t totalBlockSize = dataStartOffset + totalDataSize;
+        // [CRITICAL FIX] Add 512 bytes of trailing padding to silence ASan AVX prefetches
+        size_t totalBlockSize = dataStartOffset + totalDataSize + 512;
 
         uint8_t* rawPtr = (uint8_t*)alloc_aligned(totalBlockSize);
         if (!rawPtr) {
-            env->ReleaseIntArrayElements(jColSizes, colSizes, 0);
+            env->ReleaseIntArrayElements(jColSizes, colSizes, JNI_ABORT);
             return 0; 
         }
         std::memset(rawPtr, 0, totalBlockSize);
@@ -54,8 +55,6 @@ extern "C" {
         BlockHeader* blkHeader = (BlockHeader*)rawPtr;
         blkHeader->magic_number = BLOCK_MAGIC;
         blkHeader->version = BLOCK_VERSION;
-        
-        // [CRITICAL FIX] Set the true row count, decoupled from byte sizing
         blkHeader->row_count = rowCount;
         blkHeader->column_count = colCount;
 
@@ -67,11 +66,8 @@ extern "C" {
             colHeaders[i].type = TYPE_INT; 
             colHeaders[i].compression = COMP_NONE;
             colHeaders[i].data_offset = currentOffset;
-            colHeaders[i].data_length = (size_t)colSizes[i]; // Reserve full pool space
-            
-            // Default Stride to 4. loadStringDataNative will override to 16.
+            colHeaders[i].data_length = (size_t)colSizes[i];
             colHeaders[i].stride = 4; 
-            
             colHeaders[i].string_pool_offset = 0;
             colHeaders[i].string_pool_length = 0;
             colHeaders[i].min_int = std::numeric_limits<int32_t>::max();
@@ -80,17 +76,22 @@ extern "C" {
             currentOffset += (size_t)colSizes[i];
         }
 
-        env->ReleaseIntArrayElements(jColSizes, colSizes, 0);
+        env->ReleaseIntArrayElements(jColSizes, colSizes, JNI_ABORT);
         return (jlong)rawPtr;
     }
 
     // --- Data Loading ---
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadDataNative(JNIEnv* env, jobject obj, jlong ptr, jintArray jData) {
-        if (ptr == 0) return;
+        if (ptr == 0 || jData == nullptr) return;
+        
         jint* scalaData = env->GetIntArrayElements(jData, nullptr);
+        if (!scalaData) return; // Prevent wild memory reads
+        
         jsize length = env->GetArrayLength(jData);
         std::memcpy((void*)ptr, scalaData, (size_t)length * sizeof(int));
-        env->ReleaseIntArrayElements(jData, scalaData, 0);
+        
+        // [CRITICAL FIX] Use JNI_ABORT to prevent 40MB memory duplication back to JVM
+        env->ReleaseIntArrayElements(jData, scalaData, JNI_ABORT);
     }
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaNative(JNIEnv* env, jobject obj, jlong srcPtr, jintArray dstArray, jint len) {

@@ -94,7 +94,7 @@ jobs:
           echo "Running SBT Tests with JNI Teardown Protection & ASan..."
           
           # Tell the JVM to disable Compressed Oops so ASan can use the shadow memory space
-          export JAVA_TOOL_OPTIONS="-XX:-UseCompressedOops"
+          export JAVA_TOOL_OPTIONS="-XX:-UseCompressedOops -Xmx8G"
           
           # Tell ASan to focus only on hard crashes (SIGSEGV), not standard JVM memory leaks
           export ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0
