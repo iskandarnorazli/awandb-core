@@ -97,7 +97,7 @@ jobs:
 
       - name: Upload JRE Crash Logs
         uses: actions/upload-artifact@v4
-        if: failure() # This ensures it only runs if the tests crash
+        if: always() # This ensures it runs regardless of previous step status
         with:
           name: jre-crash-logs-${{ matrix.os }}
           path: "**/hs_err_pid*.log"
