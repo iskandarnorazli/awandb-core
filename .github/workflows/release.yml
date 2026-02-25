@@ -32,16 +32,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # [NEW] Pre-allocate 10GB of Swap Space ONLY on Linux to prevent ASan SEGVs
-      - name: Create 10GB Swap Space (Linux Only)
+      # [NEW] Configure Linux Environment to prevent ASan and Memory crashes
+      - name: Configure Linux CI Environment
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # Use a unique name to avoid colliding with the runner's default swap
+          # 1. Fix ASan DEADLYSIGNAL bug (Google Sanitizers Issue #1716)
+          # Lowers ASLR entropy so AddressSanitizer's shadow memory doesn't crash
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          
+          # 2. Pre-allocate 10GB of Swap Space to prevent true OOMs
           sudo fallocate -l 10G /swapfile.extra
           sudo chmod 600 /swapfile.extra
           sudo mkswap /swapfile.extra
           sudo swapon /swapfile.extra
-          echo "Swap space created:"
+          
+          echo "Linux Environment configuration complete:"
           free -h
 
       - uses: actions/setup-java@v4
