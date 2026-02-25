@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS='-fsanitize=address -fno-omit-frame-pointer -g' -DCMAKE_C_FLAGS='-fsanitize=address -fno-omit-frame-pointer -g' -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=address'"
             lib_path: "build"
             archive_name: "awandb-linux-x86_64.tar.gz"
           - os: windows-latest
@@ -79,8 +79,12 @@ jobs:
       - name: Run Scala Tests
         shell: bash
         run: |
-          echo "Running SBT Tests with JNI Teardown Protection..."
-          # Pipe output to log and screen, and prevent the 134 exit code from immediately failing the step
+          echo "Running SBT Tests with JNI Teardown Protection & ASan..."
+          
+          # Tell ASan to focus only on hard crashes (SIGSEGV), not standard JVM memory leaks
+          export ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0
+          
+          # Pipe output to log and screen
           sbt -Djava.library.path=${{ matrix.lib_path }} test 2>&1 | tee test_output.log || true
           
           # Analyze the log to see if Scalatest actually succeeded before the C++ thread aborted
