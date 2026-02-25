@@ -17,6 +17,17 @@
 #include <cstdio> 
 #include <new> 
 
+#include <new>
+#include <exception>
+
+// Helper to throw a Java OutOfMemoryError from C++
+inline void throwJavaOOM(JNIEnv* env, const char* message) {
+    jclass exceptionClass = env->FindClass("java/lang/OutOfMemoryError");
+    if (exceptionClass != nullptr) {
+        env->ThrowNew(exceptionClass, message);
+    }
+}
+
 // ---------------------------------------------------------
 // HIGH-PERFORMANCE HASH MAP (Linear Probing + Dynamic Resize)
 // Optimized for: GROUP BY key SUM(val)
@@ -39,6 +50,14 @@ struct NativeHashMap {
         keys = (int*)alloc_aligned(capacity * sizeof(int));
         values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
+
+        if (!keys || !values || !occupied) {
+            // Memory allocation failed. Free any partial allocations.
+            free_aligned(keys);
+            free_aligned(values);
+            free_aligned(occupied);
+            throw std::bad_alloc(); 
+        }
 
         // [CRITICAL FIX] We ONLY need to zero the occupied array. 
         // keys and values will naturally be overwritten when occupied is flagged.
@@ -64,6 +83,14 @@ struct NativeHashMap {
         keys = (int*)alloc_aligned(capacity * sizeof(int));
         values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
+
+        if (!keys || !values || !occupied) {
+            // Memory allocation failed. Free any partial allocations.
+            free_aligned(keys);
+            free_aligned(values);
+            free_aligned(occupied);
+            throw std::bad_alloc(); 
+        }
 
         std::memset(occupied, 0, capacity * sizeof(uint8_t));
 
@@ -163,17 +190,25 @@ extern "C" {
     ) {
         if (keysPtr == 0 || valsPtr == 0 || count <= 0) return 0;
 
-        // [CRITICAL FIX] Start with a small, L1-cache friendly capacity (8192)
-        // rather than using 'count' (which represents total rows).
-        NativeHashMap* map = new (std::nothrow) NativeHashMap(8192);
-        if (!map) return 0;
+        try {
+            // [CRITICAL FIX] Removed (std::nothrow) to allow exceptions to propagate.
+            NativeHashMap* map = new NativeHashMap(8192);
 
-        int* keys = (int*)keysPtr;
-        int* vals = (int*)valsPtr;
-        
-        map->aggregate_batch(keys, vals, (size_t)count);
+            int* keys = (int*)keysPtr;
+            int* vals = (int*)valsPtr;
+            
+            map->aggregate_batch(keys, vals, (size_t)count);
 
-        return (jlong)map;
+            return (jlong)map;
+
+        } catch (const std::bad_alloc& e) {
+            // Tell the JVM to throw an OutOfMemoryError
+            throwJavaOOM(env, "Native memory allocation failed in NativeHashMap (aggregateSumNative)");
+            
+            // Return 0 so the C++ stack safely unwinds. 
+            // The JVM will immediately throw the OOM exception when control returns to Scala.
+            return 0; 
+        }
     }
 
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateExportNative(

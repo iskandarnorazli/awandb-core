@@ -104,6 +104,7 @@ void parallel_radix_msd(int* ptr, int count) {
     // 2. Hardware Discovery
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
+    if (num_threads > 64) num_threads = 64;
     
     // 3. Phase 1: Parallel Histogram
     // We split the array into chunks, one for each thread.

@@ -17,6 +17,8 @@
 #include "common.h"
 #include <cstring> // for std::memset, std::memcpy
 #include <cstdlib> // [FIX] Required for posix_memalign & free on Linux/Mac
+#include <new>
+#include <exception>
 
 void* alloc_aligned(size_t size) {
     // 64-byte alignment is optimal for:
