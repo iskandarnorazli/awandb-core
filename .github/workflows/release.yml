@@ -32,6 +32,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # [NEW] Pre-allocate 10GB of Swap Space ONLY on Linux to prevent ASan SEGVs
+      - name: Create 10GB Swap Space (Linux Only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "Swap space created:"
+          free -h
+
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -81,7 +92,7 @@ jobs:
         run: |
           echo "Running SBT Tests with JNI Teardown Protection & ASan..."
           
-          # [NEW] Tell the JVM to disable Compressed Oops so ASan can use the shadow memory space
+          # Tell the JVM to disable Compressed Oops so ASan can use the shadow memory space
           export JAVA_TOOL_OPTIONS="-XX:-UseCompressedOops"
           
           # Tell ASan to focus only on hard crashes (SIGSEGV), not standard JVM memory leaks
@@ -104,7 +115,7 @@ jobs:
 
       - name: Upload JRE Crash Logs
         uses: actions/upload-artifact@v4
-        if: always() # This ensures it runs regardless of previous step status
+        if: always() 
         with:
           name: jre-crash-logs-${{ matrix.os }}
           path: "**/hs_err_pid*.log"
@@ -112,7 +123,6 @@ jobs:
 
       - name: Build GraalVM Native Executable
         shell: bash
-        # This triggers GraalVM to compile the Scala/Java code into machine code
         run: sbt nativeImage
 
       - name: Package OS-Specific Release Archive
@@ -122,7 +132,6 @@ jobs:
           mkdir -p awandb/bin
           
           # 2. Copy the Native C++ Library (.so, .dll, .dylib) directly next to the executable
-          # This allows System.loadLibrary to find it automatically without wrapper scripts
           cp lib/Release/* awandb/bin/
           
           # 3. Copy the GraalVM Executable
