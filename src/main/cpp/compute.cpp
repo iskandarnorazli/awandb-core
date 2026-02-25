@@ -73,7 +73,7 @@ extern "C" {
         }
 
         int* data = (int*)(rawPtr + colHeaders[colIdx].data_offset);
-        size_t i = 0;
+        int i = 0;
 
         // --- PATH A: AVX2 (Intel/AMD) ---
 #ifdef ARCH_X86
@@ -292,7 +292,7 @@ extern "C" {
         jint* data = (jint*)env->GetPrimitiveArrayCritical(jData, nullptr);
         jsize rows = env->GetArrayLength(jData);
         int matchCount = 0;
-        size_t i = 0;
+        int i = 0;
 
 #ifdef ARCH_X86
         size_t alignedLimit = (size_t)rows - (rows % 8);

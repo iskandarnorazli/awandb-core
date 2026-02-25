@@ -109,63 +109,92 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
    * [FAST PATH] Create and Persist Block Data ONLY.
    */
   def createAndPersistBlock(columnsData: Seq[Any]): Unit = {
-    if (columnsData.isEmpty) return
+  if (columnsData.isEmpty) return
 
-    val (rowCount, hasString) = columnsData.head match {
-      case a: Array[Int] => (a.length, columnsData.exists(_.isInstanceOf[Array[String]]))
-      case a: Array[String] => (a.length, true)
-      case _ => (0, false)
-    }
+  // Determine base row count from the first column
+  val rowCount = columnsData.head match {
+    case a: Array[Int] => a.length
+    case a: Array[String] => a.length
+    case a: Array[Float] => a.length / 128 // Assumes 128-dim vector fallback
+    case _ => 0
+  }
 
-    // [NEW] Dynamically detect if this block contains Vector data
-    val hasVector = columnsData.exists(_.isInstanceOf[Array[Float]])
-
-    if (rowCount == 0) return
-    val colCount = columnsData.length
-    val currentId = blockCounter.getAndIncrement()
-    
-    // [STRATEGY: Over-Allocate, Then Patch]
-    // Now hasVector is properly defined!
-    val allocationRows = if (hasVector) rowCount * 128 else if (hasString) rowCount * 16 else rowCount
-    val blockPtr = NativeBridge.createBlock(allocationRows, colCount)
-    
-    // [CRITICAL FIX] ALWAYS patch the header row count.
-    UnsafeHelper.putInt(blockPtr, 8L, rowCount)
-    
-    try {
-        val dataArray = columnsData.toArray
+  if (rowCount == 0) return
+  val colCount = columnsData.length
+  val currentId = blockCounter.getAndIncrement()
+  
+  // [FIXED] Calculate precise memory allocation (in 4-byte 'row' units)
+  var totalAllocationRows = 0
+  
+  for (colData <- columnsData) {
+    colData match {
+      case ints: Array[Int] =>
+        totalAllocationRows += rowCount // 4 bytes per Int (1 allocation unit)
         
-        for (colIdx <- 0 until colCount) {
-           dataArray(colIdx) match {
-               case ints: Array[Int] =>
-                   val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
-                   NativeBridge.loadData(colPtr, ints)
-               case strs: Array[String] =>
-                   NativeBridge.loadStringData(blockPtr, colIdx, strs)
-               case _ => 
-                   throw new IllegalArgumentException(s"Unsupported column type at index $colIdx")
-           }
+      case floats: Array[Float] =>
+        totalAllocationRows += floats.length // 4 bytes per Float (1 allocation unit)
+        
+      case strs: Array[String] =>
+        totalAllocationRows += (rowCount * 4) // 16 bytes per GermanString Header (4 allocation units)
+        
+        // Provision space for the variable-length String Pool
+        var stringPoolBytes = 0
+        for (s <- strs) {
+          if (s != null) {
+            val byteLen = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+            // GermanString inlines <= 12 bytes; only longer strings spill into the pool
+            if (byteLen > 12) {
+              stringPoolBytes += byteLen
+            }
+          }
         }
+        // Add required bytes converted to 4-byte allocation units (rounded up)
+        totalAllocationRows += (stringPoolBytes + 3) / 4
         
-        val filename = router.getPathForBlock(currentId)
-        val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename) 
-        
-        if (!saved) {
-          throw new RuntimeException(s"Failed to save block: $filename")
-        }
-
-        loadedBlocks.add(blockPtr)
-        
-        if (enableIndex && rowCount > 0) {
-            pendingIndexes.offer(loadedBlocks.size() - 1)
-        }
-
-    } catch {
-        case e: Throwable =>
-            NativeBridge.freeMainStore(blockPtr)
-            throw e
+      case _ => 
     }
   }
+
+  // Allocate with the exact calculated capacity
+  val blockPtr = NativeBridge.createBlock(totalAllocationRows, colCount)
+  
+  // [CRITICAL FIX] ALWAYS patch the header row count.
+  UnsafeHelper.putInt(blockPtr, 8L, rowCount)
+  
+  try {
+      val dataArray = columnsData.toArray
+      
+      for (colIdx <- 0 until colCount) {
+         dataArray(colIdx) match {
+             case ints: Array[Int] =>
+                 val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+                 NativeBridge.loadData(colPtr, ints)
+             case strs: Array[String] =>
+                 NativeBridge.loadStringData(blockPtr, colIdx, strs)
+             case _ => 
+                 throw new IllegalArgumentException(s"Unsupported column type at index $colIdx")
+         }
+      }
+      
+      val filename = router.getPathForBlock(currentId)
+      val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename) 
+      
+      if (!saved) {
+        throw new RuntimeException(s"Failed to save block: $filename")
+      }
+
+      loadedBlocks.add(blockPtr)
+      
+      if (enableIndex && rowCount > 0) {
+          pendingIndexes.offer(loadedBlocks.size() - 1)
+      }
+
+  } catch {
+      case e: Throwable =>
+          NativeBridge.freeMainStore(blockPtr)
+          throw e
+  }
+}
 
   def buildPendingIndexes(): Int = {
     val blockIdx = pendingIndexes.poll()
