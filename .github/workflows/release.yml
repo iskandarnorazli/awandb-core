@@ -36,10 +36,11 @@ jobs:
       - name: Create 10GB Swap Space (Linux Only)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo fallocate -l 10G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          # Use a unique name to avoid colliding with the runner's default swap
+          sudo fallocate -l 10G /swapfile.extra
+          sudo chmod 600 /swapfile.extra
+          sudo mkswap /swapfile.extra
+          sudo swapon /swapfile.extra
           echo "Swap space created:"
           free -h
 
