@@ -23,8 +23,12 @@ extern "C" {
 
     // --- Block Management ---
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_createBlockNative(
-        JNIEnv* env, jobject obj, jint rowCount, jint colCount
+        JNIEnv* env, jobject obj, jint rowCount, jint colCount, jintArray jColSizes
     ) {
+        if (jColSizes == nullptr) return 0;
+        
+        jint* colSizes = env->GetIntArrayElements(jColSizes, nullptr);
+        
         size_t headerSize = sizeof(BlockHeader);
         size_t colHeadersSize = colCount * sizeof(ColumnHeader);
         size_t metaDataSize = headerSize + colHeadersSize;
@@ -32,17 +36,26 @@ extern "C" {
         size_t padding = (metaDataSize % 256 != 0) ? (256 - (metaDataSize % 256)) : 0;
         size_t dataStartOffset = metaDataSize + padding;
         
-        size_t columnSizeBytes = (size_t)rowCount * sizeof(int);
-        size_t totalDataSize = (size_t)colCount * columnSizeBytes;
+        // Sum the requested exact bytes for all columns
+        size_t totalDataSize = 0;
+        for (int i = 0; i < colCount; i++) {
+            totalDataSize += (size_t)colSizes[i];
+        }
+        
         size_t totalBlockSize = dataStartOffset + totalDataSize;
 
         uint8_t* rawPtr = (uint8_t*)alloc_aligned(totalBlockSize);
-        if (!rawPtr) return 0; 
+        if (!rawPtr) {
+            env->ReleaseIntArrayElements(jColSizes, colSizes, 0);
+            return 0; 
+        }
         std::memset(rawPtr, 0, totalBlockSize);
 
         BlockHeader* blkHeader = (BlockHeader*)rawPtr;
         blkHeader->magic_number = BLOCK_MAGIC;
         blkHeader->version = BLOCK_VERSION;
+        
+        // [CRITICAL FIX] Set the true row count, decoupled from byte sizing
         blkHeader->row_count = rowCount;
         blkHeader->column_count = colCount;
 
@@ -54,10 +67,9 @@ extern "C" {
             colHeaders[i].type = TYPE_INT; 
             colHeaders[i].compression = COMP_NONE;
             colHeaders[i].data_offset = currentOffset;
-            colHeaders[i].data_length = columnSizeBytes;
+            colHeaders[i].data_length = (size_t)colSizes[i]; // Reserve full pool space
             
-            // [CRITICAL FIX] Set Stride to 4. 
-            // If this is 0, TableScan reads the first rows forever.
+            // Default Stride to 4. loadStringDataNative will override to 16.
             colHeaders[i].stride = 4; 
             
             colHeaders[i].string_pool_offset = 0;
@@ -65,9 +77,10 @@ extern "C" {
             colHeaders[i].min_int = std::numeric_limits<int32_t>::max();
             colHeaders[i].max_int = std::numeric_limits<int32_t>::min();
 
-            currentOffset += columnSizeBytes;
+            currentOffset += (size_t)colSizes[i];
         }
 
+        env->ReleaseIntArrayElements(jColSizes, colSizes, 0);
         return (jlong)rawPtr;
     }
 

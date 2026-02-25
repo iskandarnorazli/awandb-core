@@ -31,7 +31,8 @@ class VectorPerformanceSpec extends AnyFlatSpec with Matchers {
     println(s"Total Data Size: ${(totalFloats * 4) / 1024 / 1024} MB")
 
     // 1. Allocate (Using Int-as-Bytes hack: 128 floats = 128 ints size-wise)
-    val blockPtr = NativeBridge.createBlock(totalFloats, 1)
+    val colSizes = Array(totalFloats * 4) // 4 bytes per Float
+    val blockPtr = NativeBridge.createBlock(rows, 1, colSizes) // Pass the actual 'rows' variable
     
     // 2. Generate Data (Random Normalized Floats)
     // We reuse a small buffer to fill the large array to save setup time

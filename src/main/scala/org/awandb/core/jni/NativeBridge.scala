@@ -66,7 +66,7 @@ class NativeBridge {
   @native def loadColumn(ptr: Long, size: Long, path: String): Boolean
 
   // --- BLOCK MANAGEMENT ---
-  @native def createBlockNative(rowCount: Int, colCount: Int): Long
+  @native def createBlockNative(rowCount: Int, colCount: Int, colSizesBytes: Array[Int]): Long
   
   @native def getColumnPtr(blockPtr: Long, colIdx: Int): Long
   @native def getBlockSize(blockPtr: Long): Long
@@ -252,11 +252,11 @@ object NativeBridge {
   def saveColumn(ptr: Long, size: Long, path: String): Boolean = instance.saveColumn(ptr, size, path)
   def loadColumn(ptr: Long, size: Long, path: String): Boolean = instance.loadColumn(ptr, size, path)
   
-  def createBlock(rowCount: Int, colCount: Int): Long = {
-    val ptr = instance.createBlockNative(rowCount, colCount)
+  def createBlock(rowCount: Int, colCount: Int, colSizesBytes: Array[Int]): Long = {
+    val ptr = instance.createBlockNative(rowCount, colCount, colSizesBytes)
     if (ptr == 0) throw new OutOfMemoryError("Native Block Alloc Failed")
     ptr
-  }
+}
   
   def getColumnPtr(blockPtr: Long, colIdx: Int): Long = instance.getColumnPtr(blockPtr, colIdx)
   def getBlockSize(blockPtr: Long): Long = instance.getBlockSize(blockPtr)

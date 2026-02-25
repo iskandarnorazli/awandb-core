@@ -25,7 +25,9 @@ class HashSpec extends AnyFlatSpec with Matchers {
   "AwanDB Hashing Engine" should "generate stable signatures for Vectors" in {
     val dim = 128
     val rows = 4
-    val blockPtr = NativeBridge.createBlock(rows * dim, 1) // Alloc space
+    // TO THIS:
+    val colSizes = Array(rows * dim * 4) // 4 bytes per Float
+    val blockPtr = NativeBridge.createBlock(rows, 1, colSizes) // Pass 'rows' as the true row count!
     
     val data = new Array[Float](rows * dim)
     

@@ -51,7 +51,8 @@ class PersistenceSpec extends AnyFlatSpec with Matchers {
     
     // 1. ALLOCATE & POPULATE
     // Create block with 2 columns
-    val blockPtr = NativeBridge.createBlock(rowCount, 2)
+    val colSizes = Array(rowCount * 4, (rowCount * 16) + 1024) 
+    val blockPtr = NativeBridge.createBlock(rowCount, 2, colSizes)
     
     // Col 0: Int
     val col0 = NativeBridge.getColumnPtr(blockPtr, 0)

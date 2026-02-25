@@ -47,15 +47,14 @@ class GermanStringSpec extends AnyFlatSpec with Matchers {
     }
 
     // 2. Allocate Block (Hybrid Mode)
-    // CRITICAL MEMORY HACK:
-    // createBlock(rows, cols) assumes 4-byte integers.
-    // GermanStrings are 16 bytes + Variable Heap.
-    // We request 'rowCount * 16' "rows".
-    // - 16 bytes (4 ints) go to the Struct.
-    // - 48 bytes (12 ints) go to the String Pool (Heap).
-    // This gives us 64 bytes per row total, which is plenty for this test.
-    val capacityHack = rowCount * 16
-    val blockPtr = NativeBridge.createBlock(capacityHack, 1)
+    // We have 100,000 rows. 
+    // - 16 bytes per string for the fixed struct
+    // - 1,000 of those strings are long (35 bytes each), so we need at least 35,000 bytes in the pool.
+    val poolBytes = 50000 // Safely over-provisioned for the 35,000 bytes of long strings
+    val colSizes = Array((rowCount * 16) + poolBytes)
+    
+    // Pass the actual rowCount (100000) to match the array size
+    val blockPtr = NativeBridge.createBlock(rowCount, 1, colSizes)
 
     try {
       // 3. Ingest Strings (Native)

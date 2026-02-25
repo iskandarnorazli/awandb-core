@@ -31,7 +31,9 @@ class VectorSpec extends AnyFlatSpec with Matchers {
     // We need space for (rows * dim) floats.
     // createBlock uses 4-byte Ints. Float is also 4 bytes.
     // So createBlock(rows * dim, 1) allocates exactly enough bytes.
-    val blockPtr = NativeBridge.createBlock(rows * dim, 1)
+    // TO THIS:
+    val colSizes = Array(rows * dim * 4) // 4 bytes per Float
+    val blockPtr = NativeBridge.createBlock(rows, 1, colSizes) // Pass 'rows' as the true row count!
     
     // 2. Generate Data (Normalized)
     val data = new Array[Float](vectorSize)
