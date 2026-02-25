@@ -154,12 +154,17 @@ extern "C" {
         ch->vector_dim = (uint32_t)dim;
         ch->stride = dim * sizeof(float);
         if (ch->data_offset == 0) return;
+        
         jfloat* srcData = env->GetFloatArrayElements(jData, nullptr);
+        if (!srcData) return; // GC pressure safety check
+
         jsize count = env->GetArrayLength(jData); 
         float* dstData = (float*)(rawPtr + ch->data_offset);
         std::memcpy(dstData, srcData, (size_t)count * sizeof(float));
         ch->data_length = (size_t)count * sizeof(float);
-        env->ReleaseFloatArrayElements(jData, srcData, 0);
+        
+        // [YOUR FIX] Use JNI_ABORT to stop massive memory copybacks!
+        env->ReleaseFloatArrayElements(jData, srcData, JNI_ABORT);
     }
 
     // --- IO & Metadata ---

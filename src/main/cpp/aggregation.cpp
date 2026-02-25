@@ -17,20 +17,14 @@
 #include <cstdio> 
 #include <new> 
 
-#include <new>
-#include <exception>
-
 // Helper to throw a Java OutOfMemoryError from C++
 inline void throwJavaOOM(JNIEnv* env, const char* message) {
     jclass exceptionClass = env->FindClass("java/lang/OutOfMemoryError");
-    if (exceptionClass != nullptr) {
-        env->ThrowNew(exceptionClass, message);
-    }
+    if (exceptionClass != nullptr) env->ThrowNew(exceptionClass, message);
 }
 
 // ---------------------------------------------------------
-// HIGH-PERFORMANCE HASH MAP (Linear Probing + Dynamic Resize)
-// Optimized for: GROUP BY key SUM(val)
+// HIGH-PERFORMANCE HASH MAP
 // ---------------------------------------------------------
 struct NativeHashMap {
     int* keys;          
@@ -41,7 +35,6 @@ struct NativeHashMap {
     size_t mask;
     size_t size;
 
-    // Start small (fits entirely in L1/L2 cache)
     NativeHashMap(size_t initial_capacity = 8192) {
         capacity = initial_capacity;
         mask = capacity - 1;
@@ -51,17 +44,14 @@ struct NativeHashMap {
         values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
 
+        // [CRITICAL FIX] Abort gracefully if memory is exhausted
         if (!keys || !values || !occupied) {
-            // Memory allocation failed. Free any partial allocations.
             free_aligned(keys);
             free_aligned(values);
             free_aligned(occupied);
-            throw std::bad_alloc(); 
+            throw std::bad_alloc();
         }
 
-        // [CRITICAL FIX] We ONLY need to zero the occupied array. 
-        // keys and values will naturally be overwritten when occupied is flagged.
-        // This saves hundreds of milliseconds in memory bandwidth.
         std::memset(occupied, 0, capacity * sizeof(uint8_t));
     }
 
@@ -84,17 +74,16 @@ struct NativeHashMap {
         values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
 
+        // [CRITICAL FIX] Check allocations during map resizing!
         if (!keys || !values || !occupied) {
-            // Memory allocation failed. Free any partial allocations.
-            free_aligned(keys);
-            free_aligned(values);
-            free_aligned(occupied);
-            throw std::bad_alloc(); 
+            free_aligned(keys); free_aligned(values); free_aligned(occupied);
+            // Restore old pointers so destructor doesn't double-free or leak
+            keys = old_keys; values = old_values; occupied = old_occupied;
+            throw std::bad_alloc();
         }
 
         std::memset(occupied, 0, capacity * sizeof(uint8_t));
 
-        // Rehash existing data into the newly allocated map
         for (size_t i = 0; i < old_capacity; i++) {
             if (old_occupied[i]) {
                 int key = old_keys[i];
@@ -109,45 +98,33 @@ struct NativeHashMap {
                         occupied[idx] = 1;
                         keys[idx] = key;
                         values[idx] = val;
-                        break; // Size remains identical, no need to increment
+                        break; 
                     }
                     idx = (idx + 1) & mask;
                 }
             }
         }
-
         free_aligned(old_keys);
         free_aligned(old_values);
         free_aligned(old_occupied);
     }
 
-    // THE HOT LOOP
     void aggregate_batch(int* input_keys, int* input_vals, size_t count) {
         for (size_t i = 0; i < count; i++) {
             int key = input_keys[i];
             int val = input_vals[i];
 
-            // Murmur3 Finalizer Hash
             uint32_t k = (uint32_t)key;
-            k ^= k >> 16;
-            k *= 0x85ebca6b;
-            k ^= k >> 13;
-            k *= 0xc2b2ae35;
-            k ^= k >> 16;
-            
+            k ^= k >> 16; k *= 0x85ebca6b; k ^= k >> 13; k *= 0xc2b2ae35; k ^= k >> 16;
             size_t idx = k & mask;
 
             while (true) {
-                // 1. Empty Slot -> Claim
                 if (!occupied[idx]) {
-                    // Check load factor BEFORE claiming the new slot
                     if (size >= capacity / 2) {
-                        resize();
-                        // Capacity and mask changed. Recompute the target index.
+                        resize(); // Might throw std::bad_alloc
                         idx = k & mask;
                         continue; 
                     }
-                    
                     occupied[idx] = 1;
                     keys[idx] = key;
                     values[idx] = val;
@@ -155,13 +132,10 @@ struct NativeHashMap {
                     break;
                 }
                 
-                // 2. Match -> Accumulate
                 if (keys[idx] == key) {
                     values[idx] += val;
                     break;
                 }
-
-                // 3. Collision -> Probe Next
                 idx = (idx + 1) & mask;
             }
         }
@@ -181,33 +155,19 @@ struct NativeHashMap {
 };
 
 extern "C" {
-    // --------------------------------------------------------
-    // AGGREGATION WRAPPERS ONLY
-    // --------------------------------------------------------
-
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateSumNative(
         JNIEnv* env, jobject obj, jlong keysPtr, jlong valsPtr, jint count
     ) {
         if (keysPtr == 0 || valsPtr == 0 || count <= 0) return 0;
 
         try {
-            // [CRITICAL FIX] Removed (std::nothrow) to allow exceptions to propagate.
+            // Safe allocation wrapper
             NativeHashMap* map = new NativeHashMap(8192);
-
-            int* keys = (int*)keysPtr;
-            int* vals = (int*)valsPtr;
-            
-            map->aggregate_batch(keys, vals, (size_t)count);
-
+            map->aggregate_batch((int*)keysPtr, (int*)valsPtr, (size_t)count);
             return (jlong)map;
-
         } catch (const std::bad_alloc& e) {
-            // Tell the JVM to throw an OutOfMemoryError
-            throwJavaOOM(env, "Native memory allocation failed in NativeHashMap (aggregateSumNative)");
-            
-            // Return 0 so the C++ stack safely unwinds. 
-            // The JVM will immediately throw the OOM exception when control returns to Scala.
-            return 0; 
+            throwJavaOOM(env, "Native memory allocation failed in NativeHashMap");
+            return 0;
         }
     }
 
@@ -215,15 +175,12 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong mapPtr, jlong outKeysPtr, jlong outValsPtr
     ) {
         if (mapPtr == 0 || outKeysPtr == 0 || outValsPtr == 0) return 0;
-        NativeHashMap* map = (NativeHashMap*)mapPtr;
-        return map->export_to_arrays((int*)outKeysPtr, (int64_t*)outValsPtr);
+        return ((NativeHashMap*)mapPtr)->export_to_arrays((int*)outKeysPtr, (int64_t*)outValsPtr);
     }
 
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_freeAggregationResultNative(
         JNIEnv* env, jobject obj, jlong mapPtr
     ) {
-        if (mapPtr != 0) {
-            delete (NativeHashMap*)mapPtr;
-        }
+        if (mapPtr != 0) delete (NativeHashMap*)mapPtr;
     }
 }

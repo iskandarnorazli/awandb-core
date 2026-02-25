@@ -40,7 +40,6 @@ struct NativeJoinMap {
     size_t mask;
 
     NativeJoinMap(size_t input_size) {
-        // Target Load Factor < 0.5 for speed
         size_t target = input_size * 2;
         capacity = 1024;
         while (capacity < target) capacity <<= 1;
@@ -49,22 +48,16 @@ struct NativeJoinMap {
         keys = (int*)alloc_aligned(capacity * sizeof(int));
         payloads = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
         occupied = (uint8_t*)alloc_aligned(capacity);
-
+        
+        // [CRITICAL FIX] Safe Abort
         if (!keys || !payloads || !occupied) {
-            free_aligned(keys);
-            free_aligned(payloads);
-            free_aligned(occupied);
+            free_aligned(keys); free_aligned(payloads); free_aligned(occupied);
             throw std::bad_alloc();
         }
         
-        // [CRITICAL FIX] Explicitly zero ALL memory.
-        // alloc_aligned does NOT guarantee zeroed memory. 
-        // Without this, garbage 'occupied' flags cause ghost matches.
-        if (keys) std::memset(keys, 0, capacity * sizeof(int));
-        if (payloads) std::memset(payloads, 0, capacity * sizeof(int64_t));
-        if (occupied) std::memset(occupied, 0, capacity);
-        
-        printf("[NativeJoinMap-v2] Initialized Clean Map. Capacity: %zu\n", capacity);
+        std::memset(keys, 0, capacity * sizeof(int));
+        std::memset(payloads, 0, capacity * sizeof(int64_t));
+        std::memset(occupied, 0, capacity);
     }
 
     ~NativeJoinMap() {
@@ -138,18 +131,13 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong keysPtr, jlong payloadsPtr, jint count
     ) {
         if (count <= 0) return 0;
-        
         try {
-            // [CRITICAL FIX] Removed (std::nothrow)
             NativeJoinMap* map = new NativeJoinMap((size_t)count);
-
             map->insert_batch((int*)keysPtr, (int64_t*)payloadsPtr, (size_t)count);
             return (jlong)map;
-
         } catch (const std::bad_alloc& e) {
-            // Tell the JVM to throw an OutOfMemoryError
-            throwJavaOOM(env, "Native memory allocation failed in NativeJoinMap (joinBuildNative)");
-            
+            jclass exClass = env->FindClass("java/lang/OutOfMemoryError");
+            if (exClass != nullptr) env->ThrowNew(exClass, "Join Memory Exhausted");
             return 0;
         }
     }
