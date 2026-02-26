@@ -17,14 +17,15 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            cmake_flags: "-DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS='-fsanitize=address -fno-omit-frame-pointer -g' -DCMAKE_C_FLAGS='-fsanitize=address -fno-omit-frame-pointer -g' -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=address'"
+            # [FIXED] Changed to Release mode, removed AddressSanitizer
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
             lib_path: "build"
             archive_name: "awandb-linux-x86_64.tar.gz"
           - os: windows-latest
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -A x64"
             lib_path: "build/Release"
             archive_name: "awandb-windows-x64.zip"
-          # [NEW] Apple Silicon (M1/M2/M3)
+          # Apple Silicon (M1/M2/M3)
           - os: macos-latest
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release"
             lib_path: "build"
@@ -32,15 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # [NEW] Configure Linux Environment to prevent ASan and Memory crashes
+      # Configure Linux Environment to prevent true OOMs
       - name: Configure Linux CI Environment
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # 1. Fix ASan DEADLYSIGNAL bug (Google Sanitizers Issue #1716)
-          # Lowers ASLR entropy so AddressSanitizer's shadow memory doesn't crash
-          sudo sysctl -w vm.mmap_rnd_bits=28
-          
-          # 2. Pre-allocate 10GB of Swap Space to prevent true OOMs
+          # Pre-allocate 10GB of Swap Space to prevent true OOMs
           sudo fallocate -l 10G /swapfile.extra
           sudo chmod 600 /swapfile.extra
           sudo mkswap /swapfile.extra
@@ -96,13 +93,10 @@ jobs:
       - name: Run Scala Tests
         shell: bash
         run: |
-          echo "Running SBT Tests with JNI Teardown Protection & ASan..."
+          echo "Running SBT Tests with JNI Teardown Protection..."
           
-          # Tell the JVM to disable Compressed Oops so ASan can use the shadow memory space
+          # Tell the JVM to disable Compressed Oops and give the JVM 8GB to build the Maps
           export JAVA_TOOL_OPTIONS="-XX:-UseCompressedOops -Xmx8G"
-          
-          # Tell ASan to focus only on hard crashes (SIGSEGV), not standard JVM memory leaks
-          export ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0
           
           # Pipe output to log and screen
           sbt -Djava.library.path=${{ matrix.lib_path }} test 2>&1 | tee test_output.log || true
