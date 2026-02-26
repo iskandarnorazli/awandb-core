@@ -325,14 +325,36 @@ class AwanTable(
     }
   }
 
+  // [FIX] Legacy fallback for single-column arrays
   def insertBatch(values: Array[Int]): Unit = {
+    if (columnOrder.nonEmpty) insertBatch(columnOrder.head, values)
+  }
+
+  // [NEW] Column-aware batch insertion that populates the Primary Index
+  def insertBatch(colName: String, values: Array[Int]): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) throw new IllegalStateException("Table is closed")
-      if (columns.nonEmpty) {
-        val col = columns.values.head
-        wal.logBatch(values)
+      
+      columns.get(colName).foreach { col =>
+        // Capture the current row count before inserting
+        val startRowId = col.deltaIntBuffer.length
+        
+        // Log batch to WAL only for the first column to prevent redundancy
+        if (columnOrder.head == colName) wal.logBatch(values)
+        
+        // Physically insert the data into the column array
         col.insertBatch(values)
+
+        // [CRITICAL FIX] If this is the Primary Key column, map the IDs!
+        if (columnOrder.head == colName) {
+          var i = 0
+          while (i < values.length) {
+            // Pack location: Block -1 (RAM), Row ID
+            primaryIndex.put(values(i), packLocation(-1, startRowId + i))
+            i += 1
+          }
+        }
       }
     } finally {
       rwLock.writeLock().unlock()

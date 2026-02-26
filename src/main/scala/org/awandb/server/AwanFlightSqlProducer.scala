@@ -227,8 +227,8 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                       i += 1 
                     }
                     
-                    // [FIX] Route data to the specific column, not just the head column!
-                    table.columns(colName).insertBatch(batchData)
+                    // Routes through the table so the Primary Index gets updated
+                    table.insertBatch(colName, batchData)
                     
                   case _ => 
                     root.clear()
