@@ -203,18 +203,40 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
           var totalRowsIngested = 0L
           while (flightStream.next()) {
             val root = flightStream.getRoot
-            if (root.getRowCount > 0) {
-              root.getVector(0) match {
-                case intVector: org.apache.arrow.vector.IntVector =>
-                  val batchData = new Array[Int](root.getRowCount)
-                  var i = 0
-                  while (i < root.getRowCount) { batchData(i) = intVector.get(i); i += 1 }
-                  table.insertBatch(batchData)
-                  totalRowsIngested += root.getRowCount
-                case _ => 
-                  root.clear()
-                  throw CallStatus.INVALID_ARGUMENT.withDescription("Only IntVector streams are currently supported.").toRuntimeException
+            val rowCount = root.getRowCount
+
+            if (rowCount > 0) {
+              // [FIX] Iterate over ALL columns in the Arrow stream
+              for (colIdx <- 0 until root.getFieldVectors.size()) {
+                val vector = root.getVector(colIdx)
+                
+                // Map Arrow vector name to DB column name, fallback to index
+                val vectorName = vector.getName.toLowerCase
+                val colName = if (table.columns.contains(vectorName)) {
+                  vectorName
+                } else {
+                  table.columnOrder(colIdx)
+                }
+
+                vector match {
+                  case intVector: org.apache.arrow.vector.IntVector =>
+                    val batchData = new Array[Int](rowCount)
+                    var i = 0
+                    while (i < rowCount) { 
+                      batchData(i) = intVector.get(i)
+                      i += 1 
+                    }
+                    
+                    // [FIX] Route data to the specific column, not just the head column!
+                    table.columns(colName).insertBatch(batchData)
+                    
+                  case _ => 
+                    root.clear()
+                    throw CallStatus.INVALID_ARGUMENT.withDescription(s"Only IntVector streams are currently supported. Found: ${vector.getClass.getSimpleName} on column '$colName'").toRuntimeException
+                }
               }
+              // Add row count only once per batch, not per column
+              totalRowsIngested += rowCount 
             }
           }
           ackStream.onNext(PutResult.empty())
