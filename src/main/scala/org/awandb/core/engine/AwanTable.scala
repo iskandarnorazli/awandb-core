@@ -59,7 +59,7 @@ class AwanTable(
   @inline private def unpackRowId(loc: Long): Int = loc.toInt
 
   // [DELETION] RAM Deletion Bitmap (For rows in Delta Buffer)
-  private val ramDeleted = new java.util.BitSet()
+  val ramDeleted = new java.util.BitSet()
 
   val engineManager = new EngineManager(this, governor) 
   engineManager.start()
@@ -662,75 +662,74 @@ class AwanTable(
     val valIdx = columnOrder.indexOf(valCol)
     if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
 
+    val finalMap = scala.collection.mutable.Map[Int, Long]()
+
+    // 1. DISK: Aggregate Native C++ Blocks
     val allBlocks = blockManager.getLoadedBlocks.toSeq
-    if (allBlocks.isEmpty) return Map.empty
+    if (allBlocks.nonEmpty) {
+      val cores = MorselExec.activeCores
+      val blockSize = math.ceil(allBlocks.size.toDouble / cores).toInt
+      val blockChunks = allBlocks.grouped(blockSize).toSeq
 
-    val cores = MorselExec.activeCores
-    val blockSize = math.ceil(allBlocks.size.toDouble / cores).toInt
-    val blockChunks = allBlocks.grouped(blockSize).toSeq
-
-    val tasks = blockChunks.map { subset =>
-      new Callable[scala.collection.mutable.Map[Int, Long]] {
-        override def call(): scala.collection.mutable.Map[Int, Long] = {
-          val scanOp = new TableScanOperator(blockManager, subset.toArray, keyIdx, valIdx)
-          val aggOp = new HashAggOperator(scanOp)
-          aggOp.open()
-          val resultBatch = aggOp.next() 
-          val localMap = scala.collection.mutable.Map[Int, Long]()
-          if (resultBatch != null && resultBatch.count > 0) {
-             val keys = new Array[Int](resultBatch.count)
-             val vals = new Array[Long](resultBatch.count)
-             NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
-             NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
-             var i = 0
-             while (i < resultBatch.count) {
-               localMap(keys(i)) = vals(i)
-               i += 1
-             }
+      val tasks = blockChunks.map { subset =>
+        new Callable[scala.collection.mutable.Map[Int, Long]] {
+          override def call(): scala.collection.mutable.Map[Int, Long] = {
+            val scanOp = new TableScanOperator(blockManager, subset.toArray, keyIdx, valIdx)
+            val aggOp = new HashAggOperator(scanOp)
+            aggOp.open()
+            
+            var resultBatch = aggOp.next() 
+            val localMap = scala.collection.mutable.Map[Int, Long]()
+            
+            // Loop until the operator is exhausted
+            while (resultBatch != null && resultBatch.count > 0) {
+               val keys = new Array[Int](resultBatch.count)
+               val vals = new Array[Long](resultBatch.count)
+               NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
+               NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
+               
+               var i = 0
+               while (i < resultBatch.count) {
+                 val k = keys(i)
+                 localMap(k) = localMap.getOrElse(k, 0L) + vals(i)
+                 i += 1
+               }
+               resultBatch = aggOp.next() 
+            }
+            aggOp.close()
+            localMap
           }
-          aggOp.close()
-          localMap
+        }
+      }
+      val partialResults = MorselExec.runParallel(tasks)
+      for (partial <- partialResults) {
+        for ((k, v) <- partial) {
+          finalMap(k) = finalMap.getOrElse(k, 0L) + v
         }
       }
     }
-    val partialResults = MorselExec.runParallel(tasks)
-    val finalMap = scala.collection.mutable.Map[Int, Long]()
-    for (partial <- partialResults) {
-      for ((k, v) <- partial) {
-        val current = finalMap.getOrElse(k, 0L)
-        finalMap(k) = current + v
-      }
-    }
-    finalMap.toMap
-  }
 
-  // Fast In-Place Update for Integers
-  def updateCellNative(id: Int, colName: String, newValue: Int): Boolean = {
-    rwLock.writeLock().lock()
+    // 2. RAM: Aggregate Unflushed JVM Delta Buffers
+    rwLock.readLock().lock()
     try {
-      val packedLoc = primaryIndex.get(id)
-      if (packedLoc == null) return false
+      val keyColData = columns(keyCol).deltaIntBuffer
+      val valColData = columns(valCol).deltaIntBuffer
       
-      // [FIX] Unpack the physical location
-      val blockIdx = unpackBlockIdx(packedLoc)
-      val rowId = unpackRowId(packedLoc)
-      val blockPtr = if (blockIdx == -1) 0L else blockManager.getBlockPtr(blockIdx)
-      
-      val colIdx = columnOrder.indexOf(colName)
-      if (colIdx == -1) return false
-
-      if (blockPtr == 0) {
-        // RAM Update
-        val col = columns(colName)
-        col.deltaIntBuffer(rowId) = newValue
-        true
-      } else {
-        // NATIVE DISK/RAM Update (In-Place C++)
-        NativeBridge.updateCell(blockPtr, colIdx, rowId, newValue)
+      var i = 0
+      while (i < keyColData.length) {
+        if (!ramDeleted.get(i)) {
+          val k = keyColData(i)
+          val v = valColData(i).toLong
+          // Merge RAM values directly into the final C++ Map
+          finalMap(k) = finalMap.getOrElse(k, 0L) + v
+        }
+        i += 1
       }
     } finally {
-      rwLock.writeLock().unlock()
+      rwLock.readLock().unlock()
     }
+
+    finalMap.toMap
   }
 
   def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = {

@@ -206,7 +206,10 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
             val rowCount = root.getRowCount
 
             if (rowCount > 0) {
-              // [FIX] Iterate over ALL columns in the Arrow stream
+              // Track which columns are actively being ingested in this batch
+              val incomingCols = scala.collection.mutable.Set[String]()
+
+              // 1. Ingest provided columns
               for (colIdx <- 0 until root.getFieldVectors.size()) {
                 val vector = root.getVector(colIdx)
                 
@@ -217,6 +220,9 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                 } else {
                   table.columnOrder(colIdx)
                 }
+
+                // Mark column as successfully received
+                incomingCols.add(colName)
 
                 vector match {
                   case intVector: org.apache.arrow.vector.IntVector =>
@@ -235,6 +241,15 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                     throw CallStatus.INVALID_ARGUMENT.withDescription(s"Only IntVector streams are currently supported. Found: ${vector.getClass.getSimpleName} on column '$colName'").toRuntimeException
                 }
               }
+
+              // [FIX] 2. Pad missing columns with default values to prevent jagged arrays
+              val missingCols = table.columnOrder.filterNot(incomingCols.contains)
+              for (colName <- missingCols) {
+                 // Allocate a blank array (defaults to 0) to keep memory aligned
+                 val padData = new Array[Int](rowCount) 
+                 table.insertBatch(colName, padData)
+              }
+
               // Add row count only once per batch, not per column
               totalRowsIngested += rowCount 
             }

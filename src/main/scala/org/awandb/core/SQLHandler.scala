@@ -230,67 +230,89 @@ object SQLHandler {
           val joins = plain.getJoins
           if (joins != null && !joins.isEmpty) {
             val join = joins.get(0)
-            val rightTableName =
-              join.getRightItem.asInstanceOf[Table].getName.toLowerCase
+            val rightTableName = join.getRightItem.asInstanceOf[Table].getName.toLowerCase
             val rightTable = tables.get(rightTableName)
-            if (rightTable == null)
-              return SQLResult(
-                true,
-                s"Error: Join Table '$rightTableName' not found."
-              )
+            if (rightTable == null) return SQLResult(true, s"Error: Join Table '$rightTableName' not found.")
 
-            val onExpr =
-              join.getOnExpressions.iterator().next().asInstanceOf[EqualsTo]
-            val leftJoinCol =
-              onExpr.getLeftExpression.asInstanceOf[Column].getColumnName
-            val rightJoinCol =
-              onExpr.getRightExpression.asInstanceOf[Column].getColumnName
+            val onExpr = join.getOnExpressions.iterator().next().asInstanceOf[EqualsTo]
+            val leftJoinCol = onExpr.getLeftExpression.asInstanceOf[Column].getColumnName.toLowerCase
+            val rightJoinCol = onExpr.getRightExpression.asInstanceOf[Column].getColumnName.toLowerCase
+
+            // HTAP Optimization: Only flush the small Dimension Table (Right side). 
+            // We never block the high-throughput Fact Table (Left side).
+            rightTable.flush()
 
             val leftKeyIdx = leftTable.columnOrder.indexOf(leftJoinCol)
             val leftPayloadIdx = if (leftTable.columnOrder.length > 2) 2 else 0
             val rightKeyIdx = rightTable.columnOrder.indexOf(rightJoinCol)
-            val rightPayloadIdx =
-              if (rightTable.columnOrder.length > 1) 1 else 0
+            val rightPayloadIdx = if (rightTable.columnOrder.length > 1) 1 else 0
 
-            val rightScan = new TableScanOperator(
-              rightTable.blockManager,
-              rightTable.blockManager.getLoadedBlocks.toArray,
-              rightKeyIdx,
-              rightPayloadIdx
-            )
-            val buildOp = new HashJoinBuildOperator(rightScan)
-            val leftScan = new TableScanOperator(
-              leftTable.blockManager,
-              leftTable.blockManager.getLoadedBlocks.toArray,
-              leftKeyIdx,
-              leftPayloadIdx
-            )
-            val probeOp = new HashJoinProbeOperator(leftScan, buildOp)
-
-            probeOp.open()
             var totalMatches = 0
-            var batch = probeOp.next()
             val sb = new StringBuilder()
             sb.append(s"\n   JOIN Results (Probe Output):\n")
-            while (batch != null) {
+
+            // --- 1. BUILD PHASE (Right Table - Disk Only) ---
+            val rightScan = new TableScanOperator(rightTable.blockManager, rightTable.blockManager.getLoadedBlocks.toArray, rightKeyIdx, rightPayloadIdx)
+            val buildOp = new HashJoinBuildOperator(rightScan)
+            buildOp.open() 
+
+            // --- 2. PROBE PHASE A (Left Table - Disk) ---
+            val leftScan = new TableScanOperator(leftTable.blockManager, leftTable.blockManager.getLoadedBlocks.toArray, leftKeyIdx, leftPayloadIdx)
+            val probeOp = new HashJoinProbeOperator(leftScan, buildOp)
+            probeOp.open()
+            
+            var batch = probeOp.next()
+            while (batch != null && batch.count > 0) {
               totalMatches += batch.count
               val keys = new Array[Int](batch.count)
               val payloads = new Array[Long](batch.count)
               NativeBridge.copyToScala(batch.keysPtr, keys, batch.count)
-              NativeBridge.copyToScalaLong(
-                batch.valuesPtr,
-                payloads,
-                batch.count
-              )
-              for (i <- 0 until math.min(batch.count, 10)) {
-                sb.append(
-                  s"   Match -> LeftKey: ${keys(i)} | RightPayload: ${payloads(i)}\n"
-                )
+              NativeBridge.copyToScalaLong(batch.valuesPtr, payloads, batch.count)
+              for (i <- 0 until math.min(batch.count, 3)) { 
+                sb.append(s"   [Disk] Match -> LeftKey: ${keys(i)} | RightPayload: ${payloads(i)}\n")
               }
               batch = probeOp.next()
             }
             probeOp.close()
-            sb.append(s"   Matches Found: $totalMatches\n")
+
+            // --- 3. PROBE PHASE B (Left Table - RAM) ---
+            val ramKeysBuffer = leftTable.columns(leftJoinCol).deltaIntBuffer
+            val validRamKeys = new scala.collection.mutable.ArrayBuffer[Int]()
+            
+            // Gather active rows from the JVM Delta Buffer
+            for (i <- 0 until ramKeysBuffer.length) {
+                if (!leftTable.ramDeleted.get(i)) {
+                    validRamKeys.append(ramKeysBuffer(i))
+                }
+            }
+            
+            if (validRamKeys.nonEmpty) {
+                // Send the JVM rows down into the C++ Hash Map to find matches
+                val probeKeysPtr = NativeBridge.allocMainStore(validRamKeys.length)
+                val outPayloadsPtr = NativeBridge.allocMainStore(validRamKeys.length * 2) // *2 because payloads are Longs (8 bytes)
+                val outIndicesPtr = NativeBridge.allocMainStore(validRamKeys.length)
+                
+                NativeBridge.loadData(probeKeysPtr, validRamKeys.toArray)
+                
+                val ramMatches = NativeBridge.joinProbe(buildOp.mapPtr, probeKeysPtr, validRamKeys.length, outPayloadsPtr, outIndicesPtr)
+                totalMatches += ramMatches
+                
+                if (ramMatches > 0) {
+                    val matchedPayloads = new Array[Long](ramMatches)
+                    NativeBridge.copyToScalaLong(outPayloadsPtr, matchedPayloads, ramMatches)
+                    for (i <- 0 until math.min(ramMatches, 2)) {
+                       sb.append(s"   [RAM] Match -> RightPayload: ${matchedPayloads(i)}\n")
+                    }
+                }
+                
+                NativeBridge.freeMainStore(probeKeysPtr)
+                NativeBridge.freeMainStore(outPayloadsPtr)
+                NativeBridge.freeMainStore(outIndicesPtr)
+            }
+            
+            buildOp.close() // Cleanup C++ Hash Map
+
+            sb.append(s"   Total Matches Found: $totalMatches\n")
             return SQLResult(false, sb.toString(), totalMatches.toLong)
           }
 

@@ -22,7 +22,7 @@ import org.awandb.core.jni.NativeBridge
 // Reads the RIGHT table and builds a Hash Map.
 // -------------------------------------------------------------------------
 class HashJoinBuildOperator(child: Operator) extends Operator {
-  private var mapPtr: Long = 0
+  var mapPtr: Long = 0L
   private var tempKeys: Long = 0
   private var tempPayloads: Long = 0
   private var totalInput = 0
