@@ -17,10 +17,8 @@ package org.awandb.server
 
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.flight.{FlightServer, Location}
-import org.awandb.core.engine.AwanTable
 import org.awandb.core.sql.SQLHandler
 import org.awandb.core.jni.NativeBridge
-import org.awandb.server.AwanFlightProducer
 
 object AwanFlightServer {
 
@@ -54,13 +52,6 @@ object AwanFlightServer {
     // Initialize Native Engine
     NativeBridge.init()
 
-    // Setup a default table for testing
-    val defaultTable = new AwanTable("leaderboard", 100000, dataDir)
-    defaultTable.addColumn("id")
-    defaultTable.addColumn("player_name", isString = true)
-    defaultTable.addColumn("score")
-    SQLHandler.register("leaderboard", defaultTable)
-
     val allocator = new RootAllocator()
     val location = Location.forGrpcInsecure("0.0.0.0", port)
     
@@ -72,7 +63,7 @@ object AwanFlightServer {
 
     // 3. Build the server with Auth Enabled
     val server = FlightServer.builder(allocator, location, producer)
-      .headerAuthenticator(authHandler) // [FIX] Pass the handler directly!
+      .headerAuthenticator(authHandler) 
       .build()
 
     try {
@@ -84,7 +75,7 @@ object AwanFlightServer {
         System.err.println(s"❌ Fatal Server Error: ${e.getMessage}")
         e.printStackTrace()
     } finally {
-      defaultTable.close()
+      // [CLEANUP] Ensure allocator is closed properly on shutdown
       allocator.close()
     }
   }
