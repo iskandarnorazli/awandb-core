@@ -82,16 +82,71 @@ class ScanOperator(data: Array[Int], batchSize: Int) extends Operator {
 // 3. SIP FILTER OPERATOR (Transform)
 // -------------------------------------------------------------------------
 class SipFilterOperator(child: Operator, cuckooPtr: Long) extends Operator {
-  override def open(): Unit = child.open()
+  private var tempBitmaskPtr: Long = 0
+
+  override def open(): Unit = {
+    child.open()
+    tempBitmaskPtr = NativeBridge.allocMainStore(4096) // Match standard batch size
+  }
+
   override def next(): VectorBatch = {
     var batch = child.next()
-    while (batch != null) {
-      NativeBridge.cuckooProbeBatch(cuckooPtr, batch.keysPtr, batch.count, batch.valuesPtr)
-      return batch
+    while (batch != null && batch.count > 0) {
+      if (cuckooPtr != 0L) {
+        // 1. Natively Probe Cuckoo Filter
+        NativeBridge.cuckooProbeBatch(cuckooPtr, batch.keysPtr, batch.count, tempBitmaskPtr)
+
+        val bitmask = new Array[Int](batch.count)
+        NativeBridge.copyToScala(tempBitmaskPtr, bitmask, batch.count)
+
+        val keys = new Array[Int](batch.count)
+        val vals = new Array[Int](batch.count)
+        NativeBridge.copyToScala(batch.keysPtr, keys, batch.count)
+        NativeBridge.copyToScala(batch.valuesPtr, vals, batch.count)
+
+        // Prep the Selection Vector to maintain Late Materialization integrity
+        val originalIndices = new Array[Int](batch.count)
+        val inputSel = if (batch.hasSelection) {
+            val arr = new Array[Int](batch.count)
+            NativeBridge.copyToScala(batch.selectionVectorPtr, arr, batch.count)
+            arr
+        } else null
+
+        // 2. Compact the batch
+        var keepCount = 0
+        var i = 0
+        while (i < batch.count) {
+          if (bitmask(i) == 1) {
+            keys(keepCount) = keys(i)
+            vals(keepCount) = vals(i)
+            originalIndices(keepCount) = if (batch.hasSelection) inputSel(i) else i
+            keepCount += 1
+          }
+          i += 1
+        }
+
+        if (keepCount > 0) {
+           NativeBridge.loadData(batch.keysPtr, keys)
+           NativeBridge.loadData(batch.valuesPtr, vals)
+           NativeBridge.loadData(batch.selectionVectorPtr, originalIndices)
+           batch.hasSelection = true 
+           batch.count = keepCount
+           return batch
+        } else {
+           // Entire batch was filtered out (Massive IO savings for Materialize)!
+           batch = child.next()
+        }
+      } else {
+        return batch
+      }
     }
     null
   }
-  override def close(): Unit = child.close()
+
+  override def close(): Unit = {
+    child.close()
+    if (tempBitmaskPtr != 0L) NativeBridge.freeMainStore(tempBitmaskPtr)
+  }
 }
 
 // -------------------------------------------------------------------------

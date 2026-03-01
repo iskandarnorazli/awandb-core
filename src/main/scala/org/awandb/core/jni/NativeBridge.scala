@@ -138,6 +138,9 @@ class NativeBridge {
 
   // --- Compation ---
   @native def compactBlocksNative(blockPtrs: Array[Long], bitmaskPtrs: Array[Long], numBlocks: Int): Long
+
+  // --- Graph Table ---
+  @native def csrBfsNative(rowPtrs: Long, colIdxs: Long, numVertices: Int, startNode: Int, outDistances: Long): Unit
 }
 
 // -----------------------------------------------------------
@@ -420,5 +423,10 @@ object NativeBridge {
   def compactBlocks(blockPtrs: Array[Long], bitmaskPtrs: Array[Long]): Long = {
     if (blockPtrs.isEmpty) return 0L
     instance.compactBlocksNative(blockPtrs, bitmaskPtrs, blockPtrs.length)
+  }
+
+  // --- Graph Table ---
+  def csrBfs(rowPtrs: Long, colIdxs: Long, numVertices: Int, startNode: Int, outDistances: Long): Unit = {
+    instance.csrBfsNative(rowPtrs, colIdxs, numVertices, startNode, outDistances)
   }
 }

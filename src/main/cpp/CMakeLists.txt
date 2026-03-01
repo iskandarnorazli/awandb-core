@@ -94,6 +94,7 @@ set(SOURCES
     bitpacking.cpp
     join.cpp
     compaction.cpp
+    graph.cpp
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})

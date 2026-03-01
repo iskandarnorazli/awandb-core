@@ -19,10 +19,12 @@ import org.awandb.core.jni.NativeBridge
 
 // -------------------------------------------------------------------------
 // 1. BUILD OPERATOR (Blocking)
-// Reads the RIGHT table and builds a Hash Map.
+// Reads the RIGHT table, builds a Hash Map, AND builds the SIP Cuckoo Filter.
 // -------------------------------------------------------------------------
 class HashJoinBuildOperator(child: Operator) extends Operator {
   var mapPtr: Long = 0L
+  var cuckooPtr: Long = 0L // [NEW] SIP Filter
+  
   private var tempKeys: Long = 0
   private var tempPayloads: Long = 0
   private var totalInput = 0
@@ -36,26 +38,21 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
   }
 
   override def next(): VectorBatch = {
-    // 1. Consume ALL input from the Right table
     var batch = child.next()
     while (batch != null && totalInput < MAX_BUILD_SIZE) {
-      val offset = totalInput * 4L // offset for keys (4 bytes)
-      val payloadOffset = totalInput * 8L // offset for payloads (8 bytes)
+      val offset = totalInput * 4L 
+      val payloadOffset = totalInput * 8L 
       
-      // Copy Keys: Batch -> TempBuffer
       NativeBridge.memcpy(batch.keysPtr, NativeBridge.getOffsetPointer(tempKeys, offset), batch.count * 4L)
       
-      // [FIX] Widen 32-bit Payloads to 64-bit for the Hash Map
       if (batch.valueWidthBytes == 4) {
          val ints = new Array[Int](batch.count)
          NativeBridge.copyToScala(batch.valuesPtr, ints, batch.count)
-         
-         // 2 ints = 1 Long (Little Endian memory layout)
          val widened = new Array[Int](batch.count * 2)
          var i = 0
          while (i < batch.count) {
-            widened(i * 2) = ints(i) // Lower 32 bits
-            widened(i * 2 + 1) = if (ints(i) < 0) -1 else 0 // Upper 32 bits (Sign extension)
+            widened(i * 2) = ints(i) 
+            widened(i * 2 + 1) = if (ints(i) < 0) -1 else 0 
             i += 1
          }
          NativeBridge.loadData(NativeBridge.getOffsetPointer(tempPayloads, payloadOffset), widened)
@@ -67,28 +64,36 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
       batch = child.next()
     }
 
-    // 2. Build the C++ Hash Map
     if (totalInput > 0) {
+      // 1. Build the exact Hash Map for the Join
       mapPtr = NativeBridge.joinBuild(tempKeys, tempPayloads, totalInput)
+      
+      // 2. [SIP] Build the approximate Cuckoo Filter for pushdown (1.5x capacity)
+      cuckooPtr = NativeBridge.cuckooCreate(math.max((totalInput * 1.5).toInt, 1024))
+      val scalaKeys = new Array[Int](totalInput)
+      NativeBridge.copyToScala(tempKeys, scalaKeys, totalInput)
+      NativeBridge.cuckooBuildBatch(cuckooPtr, scalaKeys)
     }
-    
-    // Build Operator returns nothing (it is a sink for the pipeline)
     null 
   }
   
   def getMapPtr(): Long = mapPtr
+  def getCuckooPtr(): Long = cuckooPtr
 
   override def close(): Unit = {
     child.close()
     if (tempKeys != 0) NativeBridge.freeMainStore(tempKeys)
     if (tempPayloads != 0) NativeBridge.freeMainStore(tempPayloads)
-    // Don't free mapPtr here! It's needed by Probe.
   }
   
   def destroyMap(): Unit = {
     if (mapPtr != 0) {
       NativeBridge.joinDestroy(mapPtr)
       mapPtr = 0
+    }
+    if (cuckooPtr != 0) {
+      NativeBridge.cuckooDestroy(cuckooPtr)
+      cuckooPtr = 0
     }
   }
 }
@@ -99,37 +104,28 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
 // Output: Join Keys + Payloads + Selection Vector (Row IDs for Late Materialization)
 // -------------------------------------------------------------------------
 class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) extends Operator {
-  
   private var mapPtr: Long = 0
   private var outBatch: VectorBatch = _
-  // Buffer to hold indices of matching probe rows (allocated once)
   private var matchIndicesPtr: Long = 0 
 
   override def open(): Unit = {
-    // Ensure Build side is ready
     if (buildOp.getMapPtr() == 0) {
        buildOp.open()
-       buildOp.next() // Triggers the build loop
+       buildOp.next() 
     }
     
     mapPtr = buildOp.getMapPtr()
     if (mapPtr == 0) throw new RuntimeException("Join Build Failed: Map is null")
     
     child.open()
-    outBatch = new VectorBatch(4096, valueWidthBytes = 8) // Output: Key (Int) + Payload (Long)
+    outBatch = new VectorBatch(4096, valueWidthBytes = 8) 
     matchIndicesPtr = NativeBridge.allocMainStore(4096)
   }
 
   override def next(): VectorBatch = {
     var inputBatch = child.next()
     
-    // Loop until we find matches or run out of input
     while (inputBatch != null) {
-      
-      // Probe C++ Map
-      // keysPtr = Probe Keys from Input
-      // valuesPtr = Output buffer for Payloads
-      // matchIndicesPtr = Output buffer for Row IDs (indices in inputBatch)
       val matches = NativeBridge.joinProbe(
           mapPtr, 
           inputBatch.keysPtr, 
@@ -140,32 +136,23 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
       
       if (matches > 0) {
         outBatch.count = matches
-        
-        // [LATE MATERIALIZATION SUPPORT]
-        // 1. Pass the Source Block Pointer downstream
         outBatch.blockPtr = inputBatch.blockPtr
-        
-        // [CRITICAL FIX] Pass the Start Row Offset downstream
-        // This ensures MaterializeOperator knows where the batch starts relative to the block
         outBatch.startRowInBlock = inputBatch.startRowInBlock
-        
         outBatch.hasSelection = true
         
-        // 2. Copy the Match Indices into the Selection Vector
-        // This allows MaterializeOperator to know exactly which rows to fetch
-        NativeBridge.memcpy(matchIndicesPtr, outBatch.selectionVectorPtr, matches * 4L)
+        // [CRITICAL FIX] Map the Selection Vector so downstream Materialize Operator 
+        // doesn't read corrupted offsets if SIP dropped rows earlier.
+        if (inputBatch.hasSelection) {
+            NativeBridge.batchRead(inputBatch.selectionVectorPtr, matchIndicesPtr, matches, outBatch.selectionVectorPtr)
+        } else {
+            NativeBridge.memcpy(matchIndicesPtr, outBatch.selectionVectorPtr, matches * 4L)
+        }
         
-        // 3. Gather Keys for the Result Batch (completeness)
-        // We fetch the Keys from the Input using the indices we just got
         NativeBridge.batchRead(inputBatch.keysPtr, matchIndicesPtr, matches, outBatch.keysPtr)
-        
         return outBatch
       }
-      
-      // No matches in this batch, try next
       inputBatch = child.next()
     }
-    
     null
   }
 
@@ -173,7 +160,6 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
     child.close()
     if (outBatch != null) outBatch.close()
     if (matchIndicesPtr != 0) NativeBridge.freeMainStore(matchIndicesPtr)
-    
     buildOp.destroyMap()
     buildOp.close()
   }
