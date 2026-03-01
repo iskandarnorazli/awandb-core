@@ -135,6 +135,9 @@ class NativeBridge {
   @native def updateCellNative(blockPtr: Long, colIdx: Int, rowId: Int, newValue: Int): Boolean
 
   @native def avxFilterBlockNative(blockPtr: Long, colIdx: Int, opType: Int, targetVal: Int, outIndicesPtr: Long, deletedBitmaskPtr: Long): Int
+
+  // --- Compation ---
+  @native def compactBlocksNative(blockPtrs: Array[Long], bitmaskPtrs: Array[Long], numBlocks: Int): Long
 }
 
 // -----------------------------------------------------------
@@ -411,5 +414,11 @@ object NativeBridge {
   def avxFilterBlock(blockPtr: Long, colIdx: Int, opType: Int, targetVal: Int, outIndicesPtr: Long, deletedBitmaskPtr: Long): Int = {
     if (blockPtr == 0) return 0
     instance.avxFilterBlockNative(blockPtr, colIdx, opType, targetVal, outIndicesPtr, deletedBitmaskPtr)
+  }
+
+  // --- Compaction ---
+  def compactBlocks(blockPtrs: Array[Long], bitmaskPtrs: Array[Long]): Long = {
+    if (blockPtrs.isEmpty) return 0L
+    instance.compactBlocksNative(blockPtrs, bitmaskPtrs, blockPtrs.length)
   }
 }

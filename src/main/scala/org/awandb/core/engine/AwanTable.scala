@@ -881,6 +881,44 @@ class AwanTable(
     ramIds.toArray ++ diskIds
   }
 
+  def swapCompactedBlocks(oldBlocks: Array[Long], newBlockPtr: Long, epochManager: memory.EpochManager): Unit = {
+    rwLock.writeLock().lock()
+    try {
+      // 1. Swap the blocks safely inside BlockManager
+      blockManager.swapBlocks(oldBlocks, newBlockPtr)
+
+      // 2. Hand the old blocks to the EpochManager for safe Lock-Free garbage collection!
+      oldBlocks.foreach { ptr =>
+        epochManager.retire(ptr)
+        
+        // Also retire the native bitmasks to prevent memory leaks
+        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
+        val bitmaskPtr = blockManager.getNativeDeletionBitmap(ptr, rowCount)
+        if (bitmaskPtr != 0L) epochManager.retire(bitmaskPtr)
+      }
+      
+      // 3. Rebuild the Primary Index for surviving rows
+      if (newBlockPtr != 0L) {
+        // We know Column 0 is the Primary Key
+        val newBlockIdx = blockManager.getLoadedBlocks.size - 1 
+        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(newBlockPtr)
+        val idColPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(newBlockPtr, 0)
+        
+        val survivingIds = new Array[Int](rowCount)
+        org.awandb.core.jni.NativeBridge.copyToScala(idColPtr, survivingIds, rowCount)
+        
+        var i = 0
+        while (i < rowCount) {
+          primaryIndex.put(survivingIds(i), packLocation(newBlockIdx, i))
+          i += 1
+        }
+      }
+      
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
   def close(): Unit = {
     rwLock.writeLock().lock()
     try {

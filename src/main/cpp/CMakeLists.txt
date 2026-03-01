@@ -93,6 +93,7 @@ set(SOURCES
     avx_scan.cpp
     bitpacking.cpp
     join.cpp
+    compaction.cpp
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})

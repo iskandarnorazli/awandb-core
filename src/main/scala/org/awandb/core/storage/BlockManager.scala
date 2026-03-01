@@ -324,6 +324,15 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
   // O(1) zero-allocation access to the raw pointer
   def getBlockPtr(idx: Int): Long = loadedBlocks.get(idx)
 
+  // Safely swap blocks during compaction without breaking encapsulation
+  def swapBlocks(oldBlocks: Array[Long], newBlockPtr: Long): Unit = {
+    oldBlocks.foreach(ptr => loadedBlocks.remove(ptr))
+    // Only add the new block if it actually contains data (not 100% deleted)
+    if (newBlockPtr != 0L) {
+      loadedBlocks.add(newBlockPtr)
+    }
+  }
+
   def close(): Unit = {
     loadedBlocks.asScala.foreach(NativeBridge.freeMainStore)
     loadedBlocks.clear()
