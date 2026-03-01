@@ -127,7 +127,6 @@ object SQLHandler {
                        }
                        val colName = cleanColName(rawCol)
                        
-                       // [CRITICAL FIX] Explicitly check column existence and throw SQL error
                        if (!table.columnOrder.contains(colName)) {
                            throw new RuntimeException(s"Column '$colName' not found.")
                        }
@@ -264,11 +263,9 @@ object SQLHandler {
             }
           }
 
-          // [NEW] GRAPH ENGINE INTERCEPTOR
+          // GRAPH ENGINE INTERCEPTOR
           if (isGraphBfs) {
             try {
-                // Assumes columns are standard 'src_id' and 'dst_id'. 
-                // Could be extended to read arguments if needed.
                 val graph = leftTable.projectToGraph("src_id", "dst_id")
                 val distances = graph.bfs(bfsStartNode)
                 
@@ -305,9 +302,15 @@ object SQLHandler {
             rightTable.flush()
 
             val leftKeyIdx = leftTable.columnOrder.indexOf(leftJoinCol)
-            val leftPayloadIdx = if (leftTable.columnOrder.length > 2) 2 else 0
+            // [CRITICAL FIX]: Scan table dynamically to find a SAFE numeric column for the native payload, preventing String pointer segfaults
+            val leftPayloadIdx = leftTable.columnOrder.indices.find(i => 
+                i != leftKeyIdx && !leftTable.columns(leftTable.columnOrder(i)).isString && !leftTable.columns(leftTable.columnOrder(i)).isVector
+            ).getOrElse(leftKeyIdx)
+
             val rightKeyIdx = rightTable.columnOrder.indexOf(rightJoinCol)
-            val rightPayloadIdx = if (rightTable.columnOrder.length > 1) 1 else 0
+            val rightPayloadIdx = rightTable.columnOrder.indices.find(i => 
+                i != rightKeyIdx && !rightTable.columns(rightTable.columnOrder(i)).isString && !rightTable.columns(rightTable.columnOrder(i)).isVector
+            ).getOrElse(rightKeyIdx)
 
             var totalMatches = 0
             val sb = new StringBuilder()
@@ -559,11 +562,10 @@ object SQLHandler {
                  if (colIdx != -1) {
                      finalValues(colIdx) = scalaExprs(i) match {
                          case l: LongValue => 
-                             if (table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects String, but got Int.")
+                             if (table.columns(colName).isString || table.columns(colName).isVector) return SQLResult(true, s"Error: Column '$colName' expects String/Vector, but got Int.")
                              l.getValue.toInt
                          case s: StringValue => 
                              if (table.columns(colName).isVector) {
-                                 // [NEW] Parse the incoming string into a Float Array for the Native Engine
                                  s.getValue.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
                              } else if (!table.columns(colName).isString) {
                                  return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
@@ -582,11 +584,16 @@ object SQLHandler {
                      val colName = table.columnOrder(i)
                      finalValues(i) = scalaExprs(i) match {
                          case l: LongValue => 
-                             if (table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects String, but got Int.")
+                             if (table.columns(colName).isString || table.columns(colName).isVector) return SQLResult(true, s"Error: Column '$colName' expects String/Vector, but got Int.")
                              l.getValue.toInt
                          case s: StringValue => 
-                             if (!table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
-                             s.getValue
+                             if (table.columns(colName).isVector) {
+                                 s.getValue.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
+                             } else if (!table.columns(colName).isString) {
+                                 return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
+                             } else {
+                                 s.getValue
+                             }
                          case _ => if (table.columns(colName).isString) "" else 0
                      }
                  }
@@ -620,9 +627,8 @@ object SQLHandler {
             val dataType = col.getColDataType.getDataType.toUpperCase
 
             val isString = dataType.contains("CHAR") || dataType.contains("TEXT") || dataType.contains("STRING")
-            val isVector = dataType.contains("VECTOR") // [NEW] Detect VECTOR type
+            val isVector = dataType.contains("VECTOR") // [CRITICAL FIX] Detect VECTOR type!
             
-            // Pass the isVector flag to the table schema
             newTable.addColumn(colName, isString = isString, isVector = isVector) 
           }
 
