@@ -161,10 +161,14 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
         for (colIdx <- 0 until colCount) {
            dataArray(colIdx) match {
                case ints: Array[Int] =>
-                   val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
-                   NativeBridge.loadData(colPtr, ints)
+                   val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, colIdx)
+                   org.awandb.core.jni.NativeBridge.loadData(colPtr, ints)
                case strs: Array[String] =>
-                   NativeBridge.loadStringData(blockPtr, colIdx, strs)
+                   org.awandb.core.jni.NativeBridge.loadStringData(blockPtr, colIdx, strs)
+               case floats: Array[Float] =>
+                   // Dynamically calculate dimension based on total rows
+                   val dim = floats.length / rowCount 
+                   org.awandb.core.jni.NativeBridge.loadVectorData(blockPtr, colIdx, floats, dim)
                case _ => 
                    throw new IllegalArgumentException(s"Unsupported column type at index $colIdx")
            }

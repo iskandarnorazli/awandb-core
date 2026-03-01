@@ -136,12 +136,12 @@ class AwanTable(
   // SCHEMA
   // ---------------------------------------------------------
   
-  def addColumn(colName: String, isString: Boolean = false, useDictionary: Boolean = false): Unit = {
+  def addColumn(colName: String, isString: Boolean = false, useDictionary: Boolean = false, isVector: Boolean = false): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) throw new IllegalStateException("Table is closed")
       if (!columns.contains(colName)) {
-        columns += (colName -> new NativeColumn(colName, isString, useDictionary))
+        columns += (colName -> new NativeColumn(colName, isString, useDictionary, isVector))
         columnOrder += colName
       }
     } finally {
@@ -320,7 +320,10 @@ class AwanTable(
             col.insert(v)
           case s: String => 
             if (col.isString) col.insert(s)
-            else throw new IllegalArgumentException(s"Column '$colName' expects Int, but got String.")
+            else throw new IllegalArgumentException(s"Column '$colName' expects Int/Vector.")
+          case f: Array[Float] =>
+            if (col.isVector) col.insert(f)
+            else throw new IllegalArgumentException(s"Column '$colName' is not a Vector.")
           case _ => throw new UnsupportedOperationException(s"Type not supported: ${value.getClass}")
         }
       }
@@ -419,7 +422,9 @@ class AwanTable(
       if (hasData) {
           // 1. Prepare Data
           val allColumnsData = columns.values.map { col =>
-            if (col.isString) {
+            if (col.isVector) {
+              col.toVectorFlatArray
+            } else if (col.isString) {
               if (col.useDictionary) col.encodeDelta() else col.toStringArray
             } else {
               col.toIntArray
@@ -951,6 +956,44 @@ class AwanTable(
     } finally {
       rwLock.writeLock().unlock()
     }
+  }
+
+  def queryVector(colName: String, query: Array[Float], threshold: Float): Array[Int] = {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1) return Array.empty[Int]
+    
+    val snapshotBlocks = blockManager.getLoadedBlocks.toList
+    
+    val rawIds = snapshotBlocks.flatMap { blockPtr =>
+       val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
+       val outIndicesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount)
+       
+       try {
+           val matchCount = org.awandb.core.jni.NativeBridge.avxScanVectorCosine(blockPtr, colIdx, query, threshold, outIndicesPtr)
+           
+           if (matchCount == 0) {
+               Array.empty[Int]
+           } else {
+               val idColPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, 0)
+               val tempValuesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(matchCount)
+               org.awandb.core.jni.NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
+               
+               val ids = new Array[Int](matchCount)
+               org.awandb.core.jni.NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
+               org.awandb.core.jni.NativeBridge.freeMainStore(tempValuesPtr)
+               ids
+           }
+       } finally {
+           org.awandb.core.jni.NativeBridge.freeMainStore(outIndicesPtr)
+       }
+    }
+    
+    // [CRITICAL FIX] Late-Stage Filtering
+    // 1. Removes Tombstoned (Deleted) rows by verifying they still exist in the Primary Index.
+    // 2. Removes Phantom IDs (ID 0) caused by AVX memory alignment padding.
+    rawIds.filter { id =>
+      getRow(id).isDefined
+    }.distinct.toArray
   }
 
   def close(): Unit = {

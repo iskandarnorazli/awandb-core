@@ -21,11 +21,13 @@ import org.awandb.core.jni.NativeBridge
 // Wrapper for Block Pointers
 case class Block(ptr: Long, rowCount: Int)
 
-class NativeColumn(val name: String, val isString: Boolean = false, val useDictionary: Boolean = false) {
+// [NEW] Added isVector flag
+class NativeColumn(val name: String, val isString: Boolean = false, val useDictionary: Boolean = false, val isVector: Boolean = false) {
   
   // 1. Delta Store (Write-Optimized RAM)
   val deltaIntBuffer = new ArrayBuffer[Int]()
   val deltaStringBuffer = new ArrayBuffer[String]()
+  val deltaVectorBuffer = new ArrayBuffer[Array[Float]]() // Float buffer for vectors
 
   // 2. Snapshot Store (Read-Optimized Disk/Native RAM)
   val snapshotBlocks = new ListBuffer[Block]()
@@ -43,22 +45,28 @@ class NativeColumn(val name: String, val isString: Boolean = false, val useDicti
   // -----------------------------------------------------------
 
   def insert(value: Int): Unit = {
-    if (isString) throw new IllegalStateException(s"Col $name is String")
+    if (isString || isVector) throw new IllegalStateException(s"Col $name expects Int")
     deltaIntBuffer.append(value)
   }
 
   def insert(value: String): Unit = {
-    if (!isString) throw new IllegalStateException(s"Col $name is Int")
+    if (!isString) throw new IllegalStateException(s"Col $name expects String")
     deltaStringBuffer.append(value)
   }
 
+  // [NEW] Route for vector embeddings
+  def insert(value: Array[Float]): Unit = {
+    if (!isVector) throw new IllegalStateException(s"Col $name is not a Vector")
+    deltaVectorBuffer.append(value)
+  }
+
   def insertBatch(values: Array[Int]): Unit = {
-    if (isString) throw new IllegalStateException(s"Col $name is String")
+    if (isString || isVector) throw new IllegalStateException(s"Col $name expects Int")
     deltaIntBuffer ++= values
   }
 
   def insertBatch(values: Array[String]): Unit = {
-    if (!isString) throw new IllegalStateException(s"Col $name is Int")
+    if (!isString) throw new IllegalStateException(s"Col $name expects String")
     deltaStringBuffer ++= values
   }
 
@@ -137,16 +145,20 @@ class NativeColumn(val name: String, val isString: Boolean = false, val useDicti
   def clearDelta(): Unit = {
     deltaIntBuffer.clear()
     deltaStringBuffer.clear()
+    deltaVectorBuffer.clear() // [NEW]
   }
   
   def isEmpty: Boolean = {
-    if (isString) deltaStringBuffer.isEmpty else deltaIntBuffer.isEmpty
+    if (isVector) deltaVectorBuffer.isEmpty // [NEW]
+    else if (isString) deltaStringBuffer.isEmpty 
+    else deltaIntBuffer.isEmpty
   }
 
   def close(): Unit = {
     snapshotBlocks.clear()
     deltaIntBuffer.clear()
     deltaStringBuffer.clear()
+    deltaVectorBuffer.clear() // [NEW]
     
     if (dictionaryPtr != 0) {
       NativeBridge.dictionaryDestroy(dictionaryPtr)
@@ -157,4 +169,7 @@ class NativeColumn(val name: String, val isString: Boolean = false, val useDicti
   def toIntArray: Array[Int] = deltaIntBuffer.toArray
   def toStringArray: Array[String] = deltaStringBuffer.toArray
   def toArray: Array[Int] = toIntArray
+  
+  // Flattens the array of float arrays into a single contiguous array for JNI
+  def toVectorFlatArray: Array[Float] = deltaVectorBuffer.flatten.toArray 
 }
