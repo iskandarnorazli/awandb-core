@@ -76,13 +76,13 @@ object SQLHandler {
     try {
       val statement = CCJSqlParserUtil.parse(sql)
 
-      // [FIX] Global Helper to strip table prefixes for internal array lookups
+      // Global Helper to strip table prefixes for internal array lookups
       def cleanColName(rawName: String): String = {
           val lower = rawName.toLowerCase
           if (lower.contains(".")) lower.split("\\.").last else lower
       }
 
-      // [NEW] Lifted and shared WHERE evaluator for Unrestricted DML
+      // Shared WHERE evaluator for Unrestricted DML
           def evaluateWhere(expr: Expression, table: AwanTable): Array[Int] = {
               
               // Helper to safely extract (ColumnName, TargetValue) and prevent ClassCastExceptions
@@ -94,11 +94,9 @@ object SQLHandler {
                     throw new RuntimeException("Right side of condition must be an integer.")
                  }
                  
-                 // [FIX] Use getFullyQualifiedName to bypass JSqlParser's auto-stripping
                  val rawName = op.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
                  val colName = cleanColName(rawName)
                  
-                 // [FIX] Explicitly reject missing columns
                  if (!table.columnOrder.contains(colName)) {
                      throw new RuntimeException(s"Column '$colName' not found.")
                  }
@@ -117,6 +115,33 @@ object SQLHandler {
                     (leftIds.toSet ++ rightIds.toSet).toArray
                     
                  case eq: EqualsTo =>
+                    val left = eq.getLeftExpression
+                    // [NEW] VECTOR SEARCH INTERCEPTOR
+                    if (left.isInstanceOf[Function] && left.asInstanceOf[Function].getName.equalsIgnoreCase("VECTOR_SEARCH")) {
+                       val func = left.asInstanceOf[Function]
+                       val params = func.getParameters.getExpressions
+                       
+                       val rawCol = params.get(0) match {
+                         case c: Column => c.getFullyQualifiedName
+                         case _ => params.get(0).toString
+                       }
+                       val colName = cleanColName(rawCol)
+                       
+                       // [CRITICAL FIX] Explicitly check column existence and throw SQL error
+                       if (!table.columnOrder.contains(colName)) {
+                           throw new RuntimeException(s"Column '$colName' not found.")
+                       }
+                       
+                       val vecStr = params.get(1).asInstanceOf[StringValue].getValue
+                       val threshold = params.get(2) match {
+                          case d: net.sf.jsqlparser.expression.DoubleValue => d.getValue.toFloat
+                          case l: net.sf.jsqlparser.expression.LongValue => l.getValue.toFloat
+                          case _ => 0.0f
+                       }
+                       val vecArray = vecStr.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
+                       return table.queryVector(colName, vecArray, threshold)
+                    }
+
                     val (colName, targetVal) = getColAndVal(eq)
                     table.scanFilteredIds(colName, 0, targetVal)
                  case gt: GreaterThan =>
@@ -134,15 +159,13 @@ object SQLHandler {
 
                  case in: InExpression =>
                     val rawName = in.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                    val colName = cleanColName(rawName) // [FIX] Strip Prefix
+                    val colName = cleanColName(rawName)
                     if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
                     
-                    // Reverting to string extraction to make the IN clause 100% version-agnostic
                     val inStr = in.toString 
                     val content = inStr.substring(inStr.indexOf('(') + 1, inStr.lastIndexOf(')'))
                     val targetVals = content.split(",").map(_.trim.replace("'", "")).toSet
 
-                    // Fallback: Fetch all active rows and filter via Scala
                     val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
                     val colIdx = table.columnOrder.indexOf(colName)
                     
@@ -153,12 +176,10 @@ object SQLHandler {
 
                  case like: LikeExpression =>
                     val rawName = like.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                    val colName = cleanColName(rawName) // [FIX] Strip Prefix
+                    val colName = cleanColName(rawName)
                     if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
                     
                     val targetVal = like.getRightExpression.asInstanceOf[StringValue].getValue
-                    
-                    // Convert SQL LIKE ('Al%') to standard Regex ('^Al.*$')
                     val regexStr = "^" + targetVal.replace("%", ".*").replace("_", ".") + "$"
                     val regex = regexStr.r
                     
@@ -172,11 +193,10 @@ object SQLHandler {
 
                  case isNull: IsNullExpression =>
                     val rawName = isNull.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                    val colName = cleanColName(rawName) // [FIX] Strip Prefix
+                    val colName = cleanColName(rawName)
                     if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
                     
                     val isNot = isNull.isNot
-                    
                     val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
                     val colIdx = table.columnOrder.indexOf(colName)
                     
@@ -184,7 +204,6 @@ object SQLHandler {
                        val rowOpt = table.getRow(id)
                        if (rowOpt.isDefined) {
                            val v = rowOpt.get(colIdx)
-                           // AwanDB pads missing values with empty strings or zeros
                            val isNullEquivalent = v == null || v == "" || v == 0
                            if (isNot) !isNullEquivalent else isNullEquivalent
                        } else false
@@ -197,11 +216,9 @@ object SQLHandler {
       statement match {
         case select: Select =>
           val plain = select.getSelectBody.asInstanceOf[PlainSelect]
-          val leftTableName =
-            plain.getFromItem.asInstanceOf[Table].getName.toLowerCase
+          val leftTableName = plain.getFromItem.asInstanceOf[Table].getName.toLowerCase
           val leftTable = tables.get(leftTableName)
-          if (leftTable == null)
-            return SQLResult(true, s"Error: Table '$leftTableName' not found.")
+          if (leftTable == null) return SQLResult(true, s"Error: Table '$leftTableName' not found.")
 
           // 1. CHECK FOR GROUP BY
           val groupBy = plain.getGroupBy
@@ -222,19 +239,55 @@ object SQLHandler {
               }
             }
             if (valCol.isEmpty)
-              return SQLResult(
-                true,
-                "Error: GROUP BY currently requires a SUM(column) aggregate."
-              )
+              return SQLResult(true, "Error: GROUP BY currently requires a SUM(column) aggregate.")
             val resultMap = leftTable.executeGroupBy(keyCol, valCol)
-            if (resultMap.isEmpty)
-              return SQLResult(false, "   GROUP BY Results: (Empty)", 0L)
+            if (resultMap.isEmpty) return SQLResult(false, "   GROUP BY Results: (Empty)", 0L)
 
             val sb = new StringBuilder()
-            // Preserve original text for the display
             sb.append(s"\n   GROUP BY Results ($rawKey | SUM($rawValCol)):\n")
             resultMap.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
             return SQLResult(false, sb.toString(), resultMap.size.toLong)
+          }
+
+          // 1.5. CHECK FOR GRAPH BFS
+          var isGraphBfs = false
+          var bfsStartNode = 0
+          for (item <- plain.getSelectItems.asScala) {
+            val expr = item.getExpression
+            if (expr != null && expr.isInstanceOf[Function]) {
+              val func = expr.asInstanceOf[Function]
+              if (func.getName.equalsIgnoreCase("BFS_DISTANCE")) {
+                isGraphBfs = true
+                val params = func.getParameters.getExpressions
+                bfsStartNode = params.get(0).asInstanceOf[LongValue].getValue.toInt
+              }
+            }
+          }
+
+          // [NEW] GRAPH ENGINE INTERCEPTOR
+          if (isGraphBfs) {
+            try {
+                // Assumes columns are standard 'src_id' and 'dst_id'. 
+                // Could be extended to read arguments if needed.
+                val graph = leftTable.projectToGraph("src_id", "dst_id")
+                val distances = graph.bfs(bfsStartNode)
+                
+                val sb = new StringBuilder()
+                sb.append(s"\n   BFS Distances from Node $bfsStartNode:\n")
+                sb.append("   Node ID | Distance\n")
+                
+                var count = 0L
+                for (i <- distances.indices) {
+                   if (distances(i) != -1) {
+                      sb.append(s"   $i | ${distances(i)}\n")
+                      count += 1
+                   }
+                }
+                graph.close()
+                return SQLResult(false, sb.toString(), count)
+            } catch {
+                case e: Exception => return SQLResult(true, s"Graph Error: ${e.getMessage}")
+            }
           }
 
           // 2. CHECK FOR JOIN
@@ -249,8 +302,6 @@ object SQLHandler {
             val leftJoinCol = cleanColName(onExpr.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName)
             val rightJoinCol = cleanColName(onExpr.getRightExpression.asInstanceOf[Column].getFullyQualifiedName)
 
-            // HTAP Optimization: Only flush the small Dimension Table (Right side). 
-            // We never block the high-throughput Fact Table (Left side).
             rightTable.flush()
 
             val leftKeyIdx = leftTable.columnOrder.indexOf(leftJoinCol)
@@ -290,7 +341,6 @@ object SQLHandler {
             val ramKeysBuffer = leftTable.columns(leftJoinCol).deltaIntBuffer
             val validRamKeys = new scala.collection.mutable.ArrayBuffer[Int]()
             
-            // Gather active rows from the JVM Delta Buffer
             for (i <- 0 until ramKeysBuffer.length) {
                 if (!leftTable.ramDeleted.get(i)) {
                     validRamKeys.append(ramKeysBuffer(i))
@@ -298,9 +348,8 @@ object SQLHandler {
             }
             
             if (validRamKeys.nonEmpty) {
-                // Send the JVM rows down into the C++ Hash Map to find matches
                 val probeKeysPtr = NativeBridge.allocMainStore(validRamKeys.length)
-                val outPayloadsPtr = NativeBridge.allocMainStore(validRamKeys.length * 2) // *2 because payloads are Longs (8 bytes)
+                val outPayloadsPtr = NativeBridge.allocMainStore(validRamKeys.length * 2)
                 val outIndicesPtr = NativeBridge.allocMainStore(validRamKeys.length)
                 
                 NativeBridge.loadData(probeKeysPtr, validRamKeys.toArray)
@@ -321,7 +370,7 @@ object SQLHandler {
                 NativeBridge.freeMainStore(outIndicesPtr)
             }
             
-            buildOp.close() // Cleanup C++ Hash Map
+            buildOp.close() 
 
             sb.append(s"   Total Matches Found: $totalMatches\n")
             return SQLResult(false, sb.toString(), totalMatches.toLong)
@@ -382,7 +431,6 @@ object SQLHandler {
           val requestedColumns = scala.collection.mutable.ArrayBuffer[String]()
           val requestedHeaders = scala.collection.mutable.ArrayBuffer[String]()
           
-          // Tracking arrays for Aggregation Functions
           val aggregators = scala.collection.mutable.ArrayBuffer[(String, String)]()
           var isAggregation = false
           
@@ -396,27 +444,24 @@ object SQLHandler {
                  val expr = item.getExpression
                  val alias = if (item.getAlias != null) item.getAlias.getName else null
 
-                 // Detect Aggregate Functions (COUNT, SUM, MAX, MIN, AVG)
                  if (expr != null && expr.isInstanceOf[Function]) {
                      isAggregation = true
                      val func = expr.asInstanceOf[Function]
                      val funcName = func.getName.toUpperCase
                      
-                     // Get BOTH the raw parameter (for headers) and clean parameter (for logic)
                      val rawParam = if (func.isAllColumns) "*" else {
                          val params = func.getParameters
                          if (params != null && params.getExpressions != null && params.getExpressions.size() > 0) {
                              val firstExpr = params.getExpressions.get(0)
                              firstExpr match {
                                  case _: net.sf.jsqlparser.statement.select.AllColumns => "*"
-                                 case c: Column => c.getFullyQualifiedName // Keep raw string unstripped!
+                                 case c: Column => c.getFullyQualifiedName 
                                  case _ => firstExpr.toString 
                              }
                          } else "*"
                      }
                      val cleanParam = if (rawParam == "*") "*" else cleanColName(rawParam)
                      
-                     // Use RAW for display header, CLEAN for the internal aggregator target
                      requestedHeaders.append(if (alias != null) alias else s"$funcName($rawParam)")
                      aggregators.append((funcName, cleanParam))
                      
@@ -425,21 +470,18 @@ object SQLHandler {
                      val rawColName = c.getFullyQualifiedName
                      val cleanName = cleanColName(rawColName)
                      
-                     // Use CLEAN for data lookup, RAW for display header
                      requestedColumns.append(cleanName)
                      requestedHeaders.append(if (alias != null) alias else rawColName)
                  }
              }
           }
           
-          // Execute Scalar Aggregations
           if (isAggregation) {
              var count = 0L
              val sums = Array.fill[Long](aggregators.size)(0L)
              val maxs = Array.fill[Int](aggregators.size)(Int.MinValue)
              val mins = Array.fill[Int](aggregators.size)(Int.MaxValue)
              
-             // Single-pass reduction over the filtered rows
              for (row <- finalRows) {
                  count += 1
                  for (i <- aggregators.indices) {
@@ -454,7 +496,6 @@ object SQLHandler {
                  }
              }
              
-             // Finalize the values (handling DivByZero and Empty Sets safely)
              val finalAggRow = aggregators.indices.map { i =>
                  aggregators(i)._1 match {
                      case "COUNT" => count.toString
@@ -472,7 +513,6 @@ object SQLHandler {
              return SQLResult(false, sb.toString(), 1L)
           }
           
-          // Standard Projection (Non-Aggregated)
           val projectionIndices = requestedColumns.map(col => leftTable.columnOrder.indexOf(col)).toArray
           if (projectionIndices.contains(-1)) return SQLResult(true, s"Error: One or more projected columns do not exist.")
           
@@ -494,7 +534,6 @@ object SQLHandler {
           val valuesObj = insert.getValues
           val scalaExprs = valuesObj.getExpressions.asScala
           
-          // Full Insert Validation
           if (columnsObj == null && scalaExprs.length != table.columnOrder.length) {
               return SQLResult(true, s"Error: Column mismatch. Expected ${table.columnOrder.length} columns, got ${scalaExprs.length}.")
           }
@@ -523,8 +562,14 @@ object SQLHandler {
                              if (table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects String, but got Int.")
                              l.getValue.toInt
                          case s: StringValue => 
-                             if (!table.columns(colName).isString) return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
-                             s.getValue
+                             if (table.columns(colName).isVector) {
+                                 // [NEW] Parse the incoming string into a Float Array for the Native Engine
+                                 s.getValue.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
+                             } else if (!table.columns(colName).isString) {
+                                 return SQLResult(true, s"Error: Column '$colName' expects Int, but got String.")
+                             } else {
+                                 s.getValue
+                             }
                          case _ => if (table.columns(colName).isString) "" else 0
                      }
                  }
@@ -575,7 +620,10 @@ object SQLHandler {
             val dataType = col.getColDataType.getDataType.toUpperCase
 
             val isString = dataType.contains("CHAR") || dataType.contains("TEXT") || dataType.contains("STRING")
-            newTable.addColumn(colName, isString)
+            val isVector = dataType.contains("VECTOR") // [NEW] Detect VECTOR type
+            
+            // Pass the isVector flag to the table schema
+            newTable.addColumn(colName, isString = isString, isVector = isVector) 
           }
 
           register(tableName, newTable)
