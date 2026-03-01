@@ -22,13 +22,17 @@ import java.util.concurrent.{ConcurrentHashMap, Callable}
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import scala.collection.mutable.{LinkedHashMap, ListBuffer}
 import scala.collection.Seq 
+import org.awandb.core.engine.memory.{EpochManager, NativeMemoryReleaser}
+import java.util.Timer
+import java.util.TimerTask
 
 class AwanTable(
     val name: String, 
     val capacity: Int, 
     val dataDir: String = "data",
     val governor: EngineGovernor = NoOpGovernor,
-    val enableIndex: Boolean = true 
+    val enableIndex: Boolean = true,
+    val daemonIntervalMs: Long = 5000L // Configurable daemon interval
 ) {
   
   // COMPONENTS
@@ -40,7 +44,7 @@ class AwanTable(
   // [PERFORMANCE] Pre-allocated Buffer
   val resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
   
-  private val rwLock = new ReentrantReadWriteLock()
+  private[engine] val rwLock = new ReentrantReadWriteLock()
   
   @volatile private var isClosed = false
 
@@ -63,6 +67,36 @@ class AwanTable(
 
   val engineManager = new EngineManager(this, governor) 
   engineManager.start()
+
+  // ---------------------------------------------------------
+  // ROBUST BACKGROUND DAEMON (EBMM & Compaction)
+  // ---------------------------------------------------------
+  val epochManager = new org.awandb.core.engine.memory.EpochManager(new org.awandb.core.engine.memory.NativeMemoryReleaser())
+  val compactor = new Compactor(this, epochManager)
+  
+  private val daemonThread = new Thread(new Runnable {
+    override def run(): Unit = {
+      while (!isClosed) {
+        try {
+          Thread.sleep(daemonIntervalMs)
+          epochManager.advanceGlobalEpoch()
+          
+          val compacted = compactor.compact(0.3)
+          if (compacted > 0) println(s"[Daemon] Compacted $compacted blocks in table '$name'.")
+          
+          epochManager.tryReclaim()
+        } catch {
+          case _: InterruptedException => // Graceful shutdown
+          case t: Throwable => 
+             println(s"[Daemon] FATAL CRASH: ${t.getMessage}")
+             t.printStackTrace() // This will reveal if your C++ library needs recompiling!
+        }
+      }
+    }
+  }, s"AwanDB-Daemon-$name")
+  
+  daemonThread.setDaemon(true)
+  daemonThread.start()
 
   blockManager.recover()
   rebuildPrimaryIndex() // [NEW] Rebuild the O(1) index from recovered blocks
@@ -923,13 +957,19 @@ class AwanTable(
     rwLock.writeLock().lock()
     try {
       if (isClosed) return
+      
+      // [CRITICAL FIX] Mark as closed FIRST to break the daemon's while-loop
+      isClosed = true 
+      
+      // Now safely wake it up so it can instantly exit
+      daemonThread.interrupt() 
+      
       engineManager.stopEngine()
       engineManager.joinThread()
       blockManager.close()
       wal.close()
       columns.values.foreach(_.close())
-      NativeBridge.freeMainStore(resultIndexBuffer)
-      isClosed = true 
+      org.awandb.core.jni.NativeBridge.freeMainStore(resultIndexBuffer)
     } finally {
       rwLock.writeLock().unlock()
     }
