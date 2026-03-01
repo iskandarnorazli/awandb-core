@@ -996,6 +996,68 @@ class AwanTable(
     }.distinct.toArray
   }
 
+  // ---------------------------------------------------------
+  // GRAPH PROJECTION
+  // ---------------------------------------------------------
+  
+  def projectToGraph(srcColName: String, dstColName: String): org.awandb.core.graph.GraphTable = {
+    val srcIdx = columnOrder.indexOf(srcColName)
+    val dstIdx = columnOrder.indexOf(dstColName)
+    
+    if (srcIdx == -1 || dstIdx == -1) {
+        throw new IllegalArgumentException("Source or Destination column not found for Graph Projection.")
+    }
+
+    // 1. Gather all active edges (Reads from both RAM and Disk, automatically skipping tombstones)
+    val edges = scala.collection.mutable.ArrayBuffer[(Int, Int)]()
+    val it = scanAll()
+    
+    while (it.hasNext) {
+       val row = it.next()
+       val src = row(srcIdx) match { case i: Int => i; case _ => 0 }
+       val dst = row(dstIdx) match { case i: Int => i; case _ => 0 }
+       edges.append((src, dst))
+    }
+
+    if (edges.isEmpty) return new org.awandb.core.graph.GraphTable(0, 0)
+
+    // 2. Determine matrix dimensions
+    val maxVertex = edges.map(e => math.max(e._1, e._2)).max
+    val numVertices = maxVertex + 1
+    val numEdges = edges.size
+
+    // 3. Build the CSR Arrays (Row Pointers and Column Indices)
+    val outDegrees = new Array[Int](numVertices)
+    for (e <- edges) {
+        outDegrees(e._1) += 1
+    }
+
+    val rowPtrs = new Array[Int](numVertices + 1)
+    var sum = 0
+    for (i <- 0 until numVertices) {
+      rowPtrs(i) = sum
+      sum += outDegrees(i)
+    }
+    rowPtrs(numVertices) = sum // Tail pointer
+
+    val colIdxs = new Array[Int](numEdges)
+    val currentOffsets = rowPtrs.clone() // Tracks insertion positions for each vertex
+
+    for (e <- edges) {
+      val src = e._1
+      val dst = e._2
+      val offset = currentOffsets(src)
+      colIdxs(offset) = dst
+      currentOffsets(src) += 1
+    }
+
+    // 4. Mount into the Native Engine
+    val graph = new org.awandb.core.graph.GraphTable(numVertices, numEdges)
+    graph.loadFromArrays(rowPtrs, colIdxs)
+    
+    graph
+  }
+
   def close(): Unit = {
     rwLock.writeLock().lock()
     try {
