@@ -1058,6 +1058,236 @@ class AwanTable(
     graph
   }
 
+  // ---------------------------------------------------------
+  // AGGREGATION PUSHDOWNS (Zero-Allocation)
+  // ---------------------------------------------------------
+  
+  def countAll(): Long = {
+    var count = 0L
+    rwLock.readLock().lock()
+    try {
+        if (columns.nonEmpty) {
+            count += columns.values.head.deltaIntBuffer.length - ramDeleted.cardinality()
+        }
+    } finally { rwLock.readLock().unlock() }
+    
+    blockManager.getLoadedBlocks.foreach { ptr =>
+       val total = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
+       val delBitset = blockManager.getDeletionBitSet(ptr)
+       val delCount = if (delBitset == null) 0 else delBitset.cardinality()
+       count += (total - delCount)
+    }
+    count
+  }
+
+  def sumColumn(colName: String): Long = {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1) return 0L
+    var sum = 0L
+    
+    rwLock.readLock().lock()
+    try {
+       val colData = columns(colName).deltaIntBuffer
+       var i = 0
+       while (i < colData.length) {
+          if (!ramDeleted.get(i)) sum += colData(i)
+          i += 1
+       }
+    } finally { rwLock.readLock().unlock() }
+    
+    val blocks = blockManager.getLoadedBlocks
+    blocks.foreach { ptr =>
+       val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
+       val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(ptr, colIdx)
+       val data = new Array[Int](rowCount)
+       org.awandb.core.jni.NativeBridge.copyToScala(colPtr, data, rowCount)
+       
+       val isClean = blockManager.isClean(ptr)
+       var i = 0
+       if (isClean) {
+           while(i < rowCount) { sum += data(i); i += 1 }
+       } else {
+           while(i < rowCount) {
+               if (!blockManager.isDeleted(ptr, i)) sum += data(i)
+               i += 1
+           }
+       }
+    }
+    sum
+  }
+
+  def sumFilteredIds(colName: String, matchedIds: Array[Int]): Long = {
+     val colIdx = columnOrder.indexOf(colName)
+     if (colIdx == -1) return 0L
+     var sum = 0L
+     
+     rwLock.readLock().lock()
+     try {
+         val tmp = new Array[Int](1)
+         var i = 0
+         while (i < matchedIds.length) {
+            val loc = primaryIndex.get(matchedIds(i))
+            if (loc != null) {
+                val bIdx = unpackBlockIdx(loc)
+                val rId = unpackRowId(loc)
+                if (bIdx == -1) {
+                    sum += columns(colName).deltaIntBuffer(rId)
+                } else {
+                    val bPtr = blockManager.getBlockPtr(bIdx)
+                    val cPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(bPtr, colIdx)
+                    val cellPtr = org.awandb.core.jni.NativeBridge.getOffsetPointer(cPtr, rId * 4L)
+                    org.awandb.core.jni.NativeBridge.copyToScala(cellPtr, tmp, 1)
+                    sum += tmp(0)
+                }
+            }
+            i += 1
+         }
+     } finally { rwLock.readLock().unlock() }
+     sum
+  }
+
+  def maxColumn(colName: String): Int = {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1) return 0
+    var max = Int.MinValue
+    
+    rwLock.readLock().lock()
+    try {
+       val colData = columns(colName).deltaIntBuffer
+       var i = 0
+       while (i < colData.length) {
+          if (!ramDeleted.get(i)) {
+              if (colData(i) > max) max = colData(i)
+          }
+          i += 1
+       }
+    } finally { rwLock.readLock().unlock() }
+    
+    val blocks = blockManager.getLoadedBlocks
+    blocks.foreach { ptr =>
+       val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
+       val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(ptr, colIdx)
+       val data = new Array[Int](rowCount)
+       org.awandb.core.jni.NativeBridge.copyToScala(colPtr, data, rowCount)
+       
+       val isClean = blockManager.isClean(ptr)
+       var i = 0
+       if (isClean) {
+           while(i < rowCount) { if (data(i) > max) max = data(i); i += 1 }
+       } else {
+           while(i < rowCount) {
+               if (!blockManager.isDeleted(ptr, i)) {
+                   if (data(i) > max) max = data(i)
+               }
+               i += 1
+           }
+       }
+    }
+    if (max == Int.MinValue && countAll() == 0) 0 else max
+  }
+
+  def minColumn(colName: String): Int = {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1) return 0
+    var min = Int.MaxValue
+    
+    rwLock.readLock().lock()
+    try {
+       val colData = columns(colName).deltaIntBuffer
+       var i = 0
+       while (i < colData.length) {
+          if (!ramDeleted.get(i)) {
+              if (colData(i) < min) min = colData(i)
+          }
+          i += 1
+       }
+    } finally { rwLock.readLock().unlock() }
+    
+    val blocks = blockManager.getLoadedBlocks
+    blocks.foreach { ptr =>
+       val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
+       val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(ptr, colIdx)
+       val data = new Array[Int](rowCount)
+       org.awandb.core.jni.NativeBridge.copyToScala(colPtr, data, rowCount)
+       
+       val isClean = blockManager.isClean(ptr)
+       var i = 0
+       if (isClean) {
+           while(i < rowCount) { if (data(i) < min) min = data(i); i += 1 }
+       } else {
+           while(i < rowCount) {
+               if (!blockManager.isDeleted(ptr, i)) {
+                   if (data(i) < min) min = data(i)
+               }
+               i += 1
+           }
+       }
+    }
+    if (min == Int.MaxValue && countAll() == 0) 0 else min
+  }
+
+  def maxFilteredIds(colName: String, matchedIds: Array[Int]): Int = {
+     val colIdx = columnOrder.indexOf(colName)
+     if (colIdx == -1) return 0
+     var max = Int.MinValue
+     
+     rwLock.readLock().lock()
+     try {
+         val tmp = new Array[Int](1)
+         var i = 0
+         while (i < matchedIds.length) {
+            val loc = primaryIndex.get(matchedIds(i))
+            if (loc != null) {
+                val bIdx = unpackBlockIdx(loc)
+                val rId = unpackRowId(loc)
+                val v = if (bIdx == -1) {
+                    columns(colName).deltaIntBuffer(rId)
+                } else {
+                    val bPtr = blockManager.getBlockPtr(bIdx)
+                    val cPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(bPtr, colIdx)
+                    val cellPtr = org.awandb.core.jni.NativeBridge.getOffsetPointer(cPtr, rId * 4L)
+                    org.awandb.core.jni.NativeBridge.copyToScala(cellPtr, tmp, 1)
+                    tmp(0)
+                }
+                if (v > max) max = v
+            }
+            i += 1
+         }
+     } finally { rwLock.readLock().unlock() }
+     if (max == Int.MinValue && matchedIds.length == 0) 0 else max
+  }
+
+  def minFilteredIds(colName: String, matchedIds: Array[Int]): Int = {
+     val colIdx = columnOrder.indexOf(colName)
+     if (colIdx == -1) return 0
+     var min = Int.MaxValue
+     
+     rwLock.readLock().lock()
+     try {
+         val tmp = new Array[Int](1)
+         var i = 0
+         while (i < matchedIds.length) {
+            val loc = primaryIndex.get(matchedIds(i))
+            if (loc != null) {
+                val bIdx = unpackBlockIdx(loc)
+                val rId = unpackRowId(loc)
+                val v = if (bIdx == -1) {
+                    columns(colName).deltaIntBuffer(rId)
+                } else {
+                    val bPtr = blockManager.getBlockPtr(bIdx)
+                    val cPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(bPtr, colIdx)
+                    val cellPtr = org.awandb.core.jni.NativeBridge.getOffsetPointer(cPtr, rId * 4L)
+                    org.awandb.core.jni.NativeBridge.copyToScala(cellPtr, tmp, 1)
+                    tmp(0)
+                }
+                if (v < min) min = v
+            }
+            i += 1
+         }
+     } finally { rwLock.readLock().unlock() }
+     if (min == Int.MaxValue && matchedIds.length == 0) 0 else min
+  }
+
   def close(): Unit = {
     rwLock.writeLock().lock()
     try {

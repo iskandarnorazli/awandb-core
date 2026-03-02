@@ -392,10 +392,102 @@ object SQLHandler {
           }
 
           // -------------------------------------------------------
-          // 3. PIPELINE: FILTER -> SORT -> LIMIT -> PROJECT
+          // 3. PIPELINE: ZERO-ALLOCATION AGGREGATION PUSHDOWN
           // -------------------------------------------------------
-
           val where = plain.getWhere
+          
+          val isAsterisk = plain.getSelectItems.get(0).toString == "*"
+          
+          // [FIX] Added a 4th String tuple element to hold the Alias
+          val pushdownAggregators = scala.collection.mutable.ArrayBuffer[(String, String, String, String)]() 
+          var isPureAggregation = true 
+          
+          if (!isAsterisk) {
+             for (item <- plain.getSelectItems.asScala) {
+                 val expr = item.getExpression
+                 // [FIX] Extract the alias here
+                 val alias = if (item.getAlias != null) item.getAlias.getName else null
+
+                 if (expr != null && expr.isInstanceOf[Function]) {
+                     val func = expr.asInstanceOf[Function]
+                     val rawParam = if (func.isAllColumns) "*" else {
+                         val params = func.getParameters
+                         if (params != null && params.getExpressions != null && params.getExpressions.size() > 0) {
+                             val firstExpr = params.getExpressions.get(0)
+                             firstExpr match {
+                                 case _: net.sf.jsqlparser.statement.select.AllColumns => "*"
+                                 case c: Column => c.getFullyQualifiedName 
+                                 case _ => firstExpr.toString 
+                             }
+                         } else "*"
+                     }
+                     // [FIX] Append the alias to the list
+                     pushdownAggregators.append((func.getName.toUpperCase, cleanColName(rawParam), rawParam, alias))
+                 } else {
+                     isPureAggregation = false
+                 }
+             }
+          } else {
+             isPureAggregation = false
+          }
+
+          // FAST PATH: Pure Aggregation (No GROUP BY, No raw columns requested)
+          if (isPureAggregation && groupBy == null && pushdownAggregators.nonEmpty) {
+              val matchedIds = if (where != null) evaluateWhere(where, leftTable) else null
+              
+              // O(1) Count resolution!
+              val count = if (matchedIds != null) matchedIds.length.toLong else leftTable.countAll()
+              
+              // Memoization cache to prevent redundant loops for AVG and SUM mixes
+              val computedSums = scala.collection.mutable.Map[String, Long]()
+              def getSum(col: String): Long = {
+                 computedSums.getOrElseUpdate(col, {
+                    if (matchedIds != null) leftTable.sumFilteredIds(col, matchedIds)
+                    else leftTable.sumColumn(col)
+                 })
+              }
+              
+              val finalAggRow = pushdownAggregators.map { case (funcName, cleanCol, rawCol, alias) =>
+                   funcName match {
+                       case "COUNT" => count.toString
+                       case "SUM" => 
+                          if (count == 0) "NULL" 
+                          else getSum(cleanCol).toString
+                       case "MAX" =>
+                          if (count == 0) "NULL"
+                          else {
+                             if (matchedIds != null) leftTable.maxFilteredIds(cleanCol, matchedIds).toString
+                             else leftTable.maxColumn(cleanCol).toString
+                          }
+                       case "MIN" =>
+                          if (count == 0) "NULL"
+                          else {
+                             if (matchedIds != null) leftTable.minFilteredIds(cleanCol, matchedIds).toString
+                             else leftTable.minColumn(cleanCol).toString
+                          }
+                       case "AVG" =>
+                          if (count == 0) "NULL"
+                          else (getSum(cleanCol).toDouble / count).toString
+                       case _ => "NULL"
+                   }
+              }
+              
+              // [FIX] Use the alias if it exists, otherwise fallback to the function name
+              val headers = pushdownAggregators.map { case (f, c, r, alias) => 
+                 if (alias != null) alias 
+                 else if (r == "*") s"$f(*)" 
+                 else s"$f($r)" 
+              }.mkString(" | ")
+              
+              val sb = new StringBuilder()
+              sb.append(s"\n   Found Rows ($headers):\n")
+              sb.append("   " + finalAggRow.mkString(" | ") + "\n")
+              return SQLResult(false, sb.toString(), 1L)
+          }
+
+          // -------------------------------------------------------
+          // 4. HEAVY PIPELINE: MATERIALIZE -> SORT -> LIMIT -> PROJECT
+          // -------------------------------------------------------
           var finalRows = if (where == null) {
               leftTable.scanFiltered(leftTable.columnOrder.head, 2, 0).toSeq
           } else {
@@ -415,10 +507,7 @@ object SQLHandler {
             val sortColIdx = leftTable.columnOrder.indexOf(sortColName)
 
             if (sortColIdx == -1)
-              return SQLResult(
-                true,
-                s"Error: ORDER BY column '$rawSortName' not found."
-              )
+              return SQLResult(true, s"Error: ORDER BY column '$rawSortName' not found.")
 
             val isAsc = orderBy.isAsc
             finalRows = finalRows.sortWith { (r1, r2) =>
@@ -442,14 +531,14 @@ object SQLHandler {
             }
           }
           
-          // --- PROJECT & FORMAT OUTPUT ---
+          // --- STANDARD PROJECTION (For non-aggregated queries) ---
           val requestedColumns = scala.collection.mutable.ArrayBuffer[String]()
           val requestedHeaders = scala.collection.mutable.ArrayBuffer[String]()
           
+          // Note: We keep the old fallback aggregation code here just in case 
+          // a query mixes scalar fields and aggregations improperly (e.g. SQLite style)
           val aggregators = scala.collection.mutable.ArrayBuffer[(String, String)]()
           var isAggregation = false
-          
-          val isAsterisk = plain.getSelectItems.get(0).toString == "*"
           
           if (isAsterisk) {
              requestedColumns ++= leftTable.columnOrder
