@@ -302,7 +302,6 @@ object SQLHandler {
             rightTable.flush()
 
             val leftKeyIdx = leftTable.columnOrder.indexOf(leftJoinCol)
-            // [CRITICAL FIX]: Scan table dynamically to find a SAFE numeric column for the native payload, preventing String pointer segfaults
             val leftPayloadIdx = leftTable.columnOrder.indices.find(i => 
                 i != leftKeyIdx && !leftTable.columns(leftTable.columnOrder(i)).isString && !leftTable.columns(leftTable.columnOrder(i)).isVector
             ).getOrElse(leftKeyIdx)
@@ -319,12 +318,11 @@ object SQLHandler {
             // --- 1. BUILD PHASE (Right Table - Disk Only) ---
             val rightScan = new TableScanOperator(rightTable.blockManager, rightTable.blockManager.getLoadedBlocks.toArray, rightKeyIdx, rightPayloadIdx)
             val buildOp = new HashJoinBuildOperator(rightScan)
-            buildOp.open() 
 
             // --- 2. PROBE PHASE A (Left Table - Disk) ---
             val leftScan = new TableScanOperator(leftTable.blockManager, leftTable.blockManager.getLoadedBlocks.toArray, leftKeyIdx, leftPayloadIdx)
             val probeOp = new HashJoinProbeOperator(leftScan, buildOp)
-            probeOp.open()
+            probeOp.open() 
             
             var batch = probeOp.next()
             while (batch != null && batch.count > 0) {
@@ -338,7 +336,7 @@ object SQLHandler {
               }
               batch = probeOp.next()
             }
-            probeOp.close()
+            // [CRITICAL FIX] Do NOT call probeOp.close() here! 
 
             // --- 3. PROBE PHASE B (Left Table - RAM) ---
             val ramKeysBuffer = leftTable.columns(leftJoinCol).deltaIntBuffer
@@ -350,22 +348,35 @@ object SQLHandler {
                 }
             }
             
-            if (validRamKeys.nonEmpty) {
-                val probeKeysPtr = NativeBridge.allocMainStore(validRamKeys.length)
-                val outPayloadsPtr = NativeBridge.allocMainStore(validRamKeys.length * 2)
-                val outIndicesPtr = NativeBridge.allocMainStore(validRamKeys.length)
+            val mapPtr = buildOp.getMapPtr()
+            if (mapPtr != 0L && validRamKeys.nonEmpty) {
+                val maxProbeSize = 4096
+                val maxFanOut = 100 // Handle up to 1:100 duplicate keys safely
+                val outCapacity = maxProbeSize * maxFanOut
                 
-                NativeBridge.loadData(probeKeysPtr, validRamKeys.toArray)
+                val probeKeysPtr = NativeBridge.allocMainStore(maxProbeSize)
+                val outPayloadsPtr = NativeBridge.allocMainStore(outCapacity * 2) 
+                val outIndicesPtr = NativeBridge.allocMainStore(outCapacity)
                 
-                val ramMatches = NativeBridge.joinProbe(buildOp.mapPtr, probeKeysPtr, validRamKeys.length, outPayloadsPtr, outIndicesPtr)
-                totalMatches += ramMatches
-                
-                if (ramMatches > 0) {
-                    val matchedPayloads = new Array[Long](ramMatches)
-                    NativeBridge.copyToScalaLong(outPayloadsPtr, matchedPayloads, ramMatches)
-                    for (i <- 0 until math.min(ramMatches, 2)) {
-                       sb.append(s"   [RAM] Match -> RightPayload: ${matchedPayloads(i)}\n")
+                var offset = 0
+                while (offset < validRamKeys.length) {
+                    val chunkLen = math.min(maxProbeSize, validRamKeys.length - offset)
+                    val chunk = validRamKeys.slice(offset, offset + chunkLen).toArray
+                    
+                    NativeBridge.loadData(probeKeysPtr, chunk)
+                    
+                    val ramMatches = NativeBridge.joinProbe(mapPtr, probeKeysPtr, chunkLen, outPayloadsPtr, outIndicesPtr)
+                    totalMatches += ramMatches
+                    
+                    if (ramMatches > 0 && totalMatches <= 10) {
+                        val toRead = math.min(ramMatches, 2)
+                        val matchedPayloads = new Array[Long](toRead)
+                        NativeBridge.copyToScalaLong(outPayloadsPtr, matchedPayloads, toRead)
+                        for (i <- 0 until toRead) {
+                           sb.append(s"   [RAM] Match -> RightPayload: ${matchedPayloads(i)}\n")
+                        }
                     }
+                    offset += chunkLen
                 }
                 
                 NativeBridge.freeMainStore(probeKeysPtr)
@@ -373,7 +384,8 @@ object SQLHandler {
                 NativeBridge.freeMainStore(outIndicesPtr)
             }
             
-            buildOp.close() 
+            // [CRITICAL FIX] Close and clean up memory AFTER both phases are complete!
+            probeOp.close()
 
             sb.append(s"   Total Matches Found: $totalMatches\n")
             return SQLResult(false, sb.toString(), totalMatches.toLong)

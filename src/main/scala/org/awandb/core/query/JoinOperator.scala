@@ -23,7 +23,7 @@ import org.awandb.core.jni.NativeBridge
 // -------------------------------------------------------------------------
 class HashJoinBuildOperator(child: Operator) extends Operator {
   var mapPtr: Long = 0L
-  var cuckooPtr: Long = 0L // [NEW] SIP Filter
+  var cuckooPtr: Long = 0L 
   
   private var tempKeys: Long = 0
   private var tempPayloads: Long = 0
@@ -33,7 +33,6 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
   override def open(): Unit = {
     child.open()
     tempKeys = NativeBridge.allocMainStore(MAX_BUILD_SIZE)
-    // Payloads are 64-bit (Long), so allocate double space
     tempPayloads = NativeBridge.allocMainStore(MAX_BUILD_SIZE * 2) 
   }
 
@@ -65,10 +64,7 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
     }
 
     if (totalInput > 0) {
-      // 1. Build the exact Hash Map for the Join
       mapPtr = NativeBridge.joinBuild(tempKeys, tempPayloads, totalInput)
-      
-      // 2. [SIP] Build the approximate Cuckoo Filter for pushdown (1.5x capacity)
       cuckooPtr = NativeBridge.cuckooCreate(math.max((totalInput * 1.5).toInt, 1024))
       val scalaKeys = new Array[Int](totalInput)
       NativeBridge.copyToScala(tempKeys, scalaKeys, totalInput)
@@ -100,8 +96,6 @@ class HashJoinBuildOperator(child: Operator) extends Operator {
 
 // -------------------------------------------------------------------------
 // 2. PROBE OPERATOR (Streaming)
-// Reads the LEFT table and probes the Hash Map.
-// Output: Join Keys + Payloads + Selection Vector (Row IDs for Late Materialization)
 // -------------------------------------------------------------------------
 class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) extends Operator {
   private var mapPtr: Long = 0
@@ -115,14 +109,19 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
     }
     
     mapPtr = buildOp.getMapPtr()
-    if (mapPtr == 0) throw new RuntimeException("Join Build Failed: Map is null")
     
     child.open()
-    outBatch = new VectorBatch(4096, valueWidthBytes = 8) 
-    matchIndicesPtr = NativeBridge.allocMainStore(4096)
+    
+    // [CRITICAL FIX 1] Support up to 1:100 fan-out to prevent STATUS_HEAP_CORRUPTION
+    val maxFanOut = 100
+    outBatch = new VectorBatch(4096 * maxFanOut, valueWidthBytes = 8) 
+    matchIndicesPtr = NativeBridge.allocMainStore(4096 * maxFanOut)
   }
 
   override def next(): VectorBatch = {
+    // [CRITICAL FIX 2] Safely return empty iterator if the Dimension Table was completely empty
+    if (mapPtr == 0L) return null 
+    
     var inputBatch = child.next()
     
     while (inputBatch != null) {
@@ -140,8 +139,6 @@ class HashJoinProbeOperator(child: Operator, buildOp: HashJoinBuildOperator) ext
         outBatch.startRowInBlock = inputBatch.startRowInBlock
         outBatch.hasSelection = true
         
-        // [CRITICAL FIX] Map the Selection Vector so downstream Materialize Operator 
-        // doesn't read corrupted offsets if SIP dropped rows earlier.
         if (inputBatch.hasSelection) {
             NativeBridge.batchRead(inputBatch.selectionVectorPtr, matchIndicesPtr, matches, outBatch.selectionVectorPtr)
         } else {
