@@ -142,7 +142,15 @@ object SQLHandler {
                     }
 
                     val (colName, targetVal) = getColAndVal(eq)
-                    table.scanFilteredIds(colName, 0, targetVal)
+                    
+                    // 🚀 [O(1) INDEX OPTIMIZATION FIX]
+                    // If the WHERE clause targets the Primary Key (Column 0), do a direct O(1) lookup!
+                    if (colName == table.columnOrder.head) {
+                        if (table.getRow(targetVal).isDefined) Array(targetVal) else Array.empty[Int]
+                    } else {
+                        // Otherwise, fallback to O(N) AVX Scan
+                        table.scanFilteredIds(colName, 0, targetVal)
+                    }
                  case gt: GreaterThan =>
                     val (colName, targetVal) = getColAndVal(gt)
                     table.scanFilteredIds(colName, 1, targetVal)

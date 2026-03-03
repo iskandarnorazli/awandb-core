@@ -41,6 +41,10 @@ object AwanFlightServer {
         case "--data-dir" if i + 1 < args.length => 
           dataDir = args(i + 1)
           i += 2
+        case "--debug" | "-debug" => 
+          AwanConfig.enableProfiler = true
+          println("[Init] 🔍 Internal Profiler ENABLED")
+          i += 1
         case _ => 
           i += 1
       }

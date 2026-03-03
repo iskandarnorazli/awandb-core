@@ -40,10 +40,19 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
     
     try {
       val sql = ticket.getStatementHandle.toStringUtf8
+      
+      // START PROFILER
+      AwanDBInternalProfiler.start()
       println(s"[Network] 🟢 Executing SELECT: $sql")
+
+      // PHASE 1 (Prep & Parse Boundary)
+      AwanDBInternalProfiler.stampPhase1()
 
       // [FIX 3] Receive the structured SQLResult
       val result = SQLHandler.execute(sql)
+      
+      // PHASE 2 (Engine Execution Boundary)
+      AwanDBInternalProfiler.stampPhase2()
       
       // [FIX 3] Hard failure on actual boolean error
       if (result.isError) {
@@ -71,6 +80,9 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
         listener.putNext()
         listener.completed()
       }
+
+      // 🚀 STOP PROFILER (Arrow Packing Complete)
+      AwanDBInternalProfiler.finish()
 
     } catch {
       case e: net.sf.jsqlparser.parser.ParseException =>
