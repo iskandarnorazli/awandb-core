@@ -127,8 +127,30 @@ extern "C" {
                 }
                 newCh[c].min_int = currentMin;
                 newCh[c].max_int = currentMax;
+
+            } else if (newCh[c].type == TYPE_VECTOR) { // [NEW] Vector Compaction Logic
+                float* newColData = (float*)(newRawPtr + newCh[c].data_offset);
+                uint32_t dim = newCh[c].vector_dim;
+                uint32_t newIdx = 0;
+
+                for (int b = 0; b < numBlocks; b++) {
+                    BlockHeader* bh = (BlockHeader*)blocks[b];
+                    ColumnHeader* oldCh = (ColumnHeader*)((uint8_t*)blocks[b] + sizeof(BlockHeader));
+                    float* oldColData = (float*)((uint8_t*)blocks[b] + oldCh[c].data_offset);
+                    uint8_t* bitmask = (uint8_t*)bitmasks[b];
+
+                    int rows = bh->row_count;
+                    for (int r = 0; r < rows; r++) {
+                        bool isDeleted = (bitmask != nullptr && bitmasks[b] != 0) && ((bitmask[r >> 3] & (1 << (r & 7))) != 0);
+                        if (!isDeleted) {
+                            // Copy exactly 'dim' floats per surviving row
+                            std::memcpy(&newColData[newIdx * dim], &oldColData[r * dim], dim * sizeof(float));
+                            newIdx++;
+                        }
+                    }
+                }
             }
-            // TODO: Add TYPE_STRING and TYPE_VECTOR loops when needed.
+            // TODO: Add TYPE_STRING loop when needed.
         }
 
         // Release JVM Arrays

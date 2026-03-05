@@ -95,6 +95,18 @@ extern "C" {
         env->ReleasePrimitiveArrayCritical(jData, scalaData, 0);
     }
 
+    // ==========================================================
+    // MEMORY OPS - Float Array Copy
+    // ==========================================================
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaFloatNative(
+        JNIEnv* env, jobject obj, jlong srcPtr, jfloatArray dest, jint count) {
+        
+        if (srcPtr == 0 || count <= 0) return;
+        
+        // Efficiently copy the native float buffer into the JVM array
+        env->SetFloatArrayRegion(dest, 0, count, (const jfloat*)srcPtr);
+    }
+
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaNative(JNIEnv* env, jobject obj, jlong srcPtr, jintArray dstArray, jint len) {
         if (srcPtr == 0) return;
         int* cppData = (int*)srcPtr;

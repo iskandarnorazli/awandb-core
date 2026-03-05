@@ -126,4 +126,81 @@ class VectorSearchSpec extends AnyFunSuite with Matchers with BeforeAndAfterEach
     results.length shouldBe 1
     results should contain (10)
   }
+  
+  test("Vector Engine should strictly enforce the similarity threshold boundaries") {
+    // We use known geometric angles to test precise cosine values
+    // Target: [1.0, 0.0, 0.0]
+    table.insertRow(Array(1, Array(1.0f, 0.0f, 0.0f))) 
+    
+    // Angle 30 degrees -> Cosine similarity is ~0.866
+    table.insertRow(Array(2, Array(0.866f, 0.5f, 0.0f))) 
+    
+    // Angle 60 degrees -> Cosine similarity is exactly 0.5
+    table.insertRow(Array(3, Array(0.5f, 0.866f, 0.0f))) 
+    table.flush()
+
+    // Query with threshold 0.8 -> Should catch ID 1 (1.0) and ID 2 (0.866), but drop ID 3 (0.5)
+    val results = table.queryVector("embedding", Array(1.0f, 0.0f, 0.0f), 0.8f)
+
+    results.length shouldBe 2
+    results should contain (1)
+    results should contain (2)
+    results should not contain (3)
+  }
+
+  test("Vector Engine should correctly handle perfectly opposite vectors (Similarity = -1.0)") {
+    table.insertRow(Array(1, Array(1.0f, 1.0f, 1.0f)))
+    
+    // Exact mathematical opposite
+    table.insertRow(Array(2, Array(-1.0f, -1.0f, -1.0f))) 
+    table.flush()
+
+    // Querying for the positive vector with a threshold of 0.0
+    // The opposite vector yields -1.0, which is less than 0.0, so it must be excluded.
+    val results = table.queryVector("embedding", Array(1.0f, 1.0f, 1.0f), 0.0f)
+    
+    results.length shouldBe 1
+    results should contain (1)
+    results should not contain (2) 
+  }
+
+  test("Vector Engine should not crash or return false positives on zero-magnitude vectors") {
+    table.insertRow(Array(1, Array(1.0f, 0.5f, 0.2f)))
+    
+    // An empty/zero vector (Magnitude = 0)
+    table.insertRow(Array(2, Array(0.0f, 0.0f, 0.0f))) 
+    table.flush()
+
+    // Querying against the zero vector. 
+    // The engine should either skip it or safely assign it a similarity of 0.0 / -1.0, 
+    // but it should NEVER pass a high threshold like 0.5.
+    val results = table.queryVector("embedding", Array(1.0f, 0.0f, 0.0f), 0.5f)
+    
+    results.length shouldBe 1
+    results should contain (1)
+    results should not contain (2)
+  }
+
+  test("Vector Engine should return exactly K results ranked by highest similarity") {
+    // The query target will be [1.0, 0.0, 0.0]
+    
+    table.insertRow(Array(1, Array(0.6f, 0.8f, 0.0f)))   // Similarity: 0.6 (4th best)
+    table.insertRow(Array(2, Array(1.0f, 0.0f, 0.0f)))   // Similarity: 1.0 (1st best - Perfect)
+    table.insertRow(Array(3, Array(0.9f, 0.435f, 0.0f))) // Similarity: ~0.9 (2nd best)
+    table.insertRow(Array(4, Array(0.8f, 0.6f, 0.0f)))   // Similarity: 0.8 (3rd best)
+    table.flush()
+
+    // Query with a loose threshold of 0.5, but STRICT limit of 2 results
+    // Signature expectation: queryVector(column, query, threshold, limit)
+    val results = table.queryVector("embedding", Array(1.0f, 0.0f, 0.0f), 0.5f, 2)
+
+    // 1. Exact Number Constraint: It must return exactly 2 items, even though all 4 pass the 0.5 threshold.
+    results.length shouldBe 2
+
+    // 2. Ranking Constraint: It must sort them so the highest similarity comes first.
+    // Rank 1 should be ID 2 (1.0 similarity)
+    // Rank 2 should be ID 3 (~0.9 similarity)
+    results(0) shouldBe 2
+    results(1) shouldBe 3
+  }
 }

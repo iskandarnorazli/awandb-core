@@ -17,11 +17,15 @@ package org.awandb.core.engine.memory
 
 trait MemoryReleaser {
   def free(ptr: Long): Unit
+  def freeBlock(ptr: Long): Unit
 }
 
 class NativeMemoryReleaser extends MemoryReleaser {
   override def free(ptr: Long): Unit = {
-    // Calls the JNI layer we established in common.cpp
     org.awandb.core.jni.NativeBridge.freeMainStore(ptr)
+  }
+  
+  override def freeBlock(ptr: Long): Unit = { // [NEW]
+    org.awandb.core.jni.NativeBridge.destroyBlock(ptr)
   }
 }

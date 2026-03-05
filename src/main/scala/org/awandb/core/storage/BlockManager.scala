@@ -330,22 +330,56 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
   // Safely swap blocks during compaction without breaking encapsulation
   def swapBlocks(oldBlocks: Array[Long], newBlockPtr: Long): Unit = {
-    oldBlocks.foreach(ptr => loadedBlocks.remove(ptr))
-    // Only add the new block if it actually contains data (not 100% deleted)
+    oldBlocks.foreach { ptr => 
+      loadedBlocks.remove(ptr)
+      
+      // [NEW] Sever links to old memory addresses to prevent Use-After-Free
+      deletionBitmaps.remove(ptr)
+      nativeBitmaps.remove(ptr)
+      bitmapDirty.remove(ptr)
+    }
+    
     if (newBlockPtr != 0L) {
       loadedBlocks.add(newBlockPtr)
     }
+
+    // [NEW] Physical indices shifted, so all Cuckoo Filters are mapped to the wrong Block IDs!
+    // We must clear the filter map and requeue all active blocks for lazy index rebuild.
+    loadedFilters.clear()
+    pendingIndexes.clear()
+    if (enableIndex) {
+      for (i <- 0 until loadedBlocks.size()) pendingIndexes.offer(i)
+    }
+  }
+
+  // Helper to retrieve the active Cuckoo Filter for garbage collection
+  def getFilterPtr(blockIdx: Int): Long = {
+    loadedFilters.getOrDefault(blockIdx, 0L)
   }
 
   def close(): Unit = {
-    loadedBlocks.asScala.foreach(NativeBridge.freeMainStore)
+    var idx = 0
+    val activeBlocks = loadedBlocks.asScala.toSeq
+    
+    // Iterate ONLY over currently active blocks to prevent Double Free
+    activeBlocks.foreach { ptr =>
+      // 1. Free the Block
+      NativeBridge.freeMainStore(ptr)
+
+      // 2. Free the Active Native Bitmask
+      val bitmaskPtr = nativeBitmaps.getOrDefault(ptr, 0L)
+      if (bitmaskPtr != 0L) NativeBridge.freeMainStore(bitmaskPtr)
+
+      // 3. Free the Active Cuckoo Filter
+      val filterPtr = loadedFilters.getOrDefault(idx, 0L)
+      if (filterPtr != 0L) NativeBridge.cuckooDestroy(filterPtr)
+
+      idx += 1
+    }
+
     loadedBlocks.clear()
-    loadedFilters.values().asScala.foreach(NativeBridge.cuckooDestroy)
     loadedFilters.clear()
     deletionBitmaps.clear()
-    
-    // [NEW] Free cached native bitmasks
-    nativeBitmaps.values().asScala.foreach(ptr => if (ptr != 0L) NativeBridge.freeMainStore(ptr))
     nativeBitmaps.clear()
     bitmapDirty.clear()
   }

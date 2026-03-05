@@ -99,4 +99,13 @@ extern "C" {
         // Return stride (populated during creation/loading)
         return (jint)colHeaders[colIdx].stride;
     }
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_destroyBlockNative
+    (JNIEnv *env, jobject obj, jlong ptr) {
+        if (ptr != 0) {
+            // [CRITICAL FIX] Blocks are allocated via alloc_aligned, 
+            // so they MUST be freed via free_aligned, not C++ 'delete'.
+            free_aligned((void*)ptr); 
+        }
+    }
 }

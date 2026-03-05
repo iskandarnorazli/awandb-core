@@ -356,54 +356,102 @@ extern "C" {
     // ==========================================================
     // 3. VECTOR OPS (Cosine Sim) - Hybrid AVX2/NEON
     // ==========================================================
-    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanVectorCosineNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jfloatArray jQuery, jfloat threshold, jlong outIndicesPtr) {
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanVectorCosineNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jfloatArray jQuery, jfloat threshold, jlong outIndicesPtr, jlong outScoresPtr) { 
+        
         if (blockPtr == 0) return 0;
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
         if (ch->type != TYPE_VECTOR) return 0;
+        
         int dim = (int)ch->vector_dim;
         int rows = (int)(ch->data_length / ch->stride); 
         float* data = (float*)(rawPtr + ch->data_offset);
-        int* out = (int*)outIndicesPtr;
+        
+        int* outIndices = (int*)outIndicesPtr;
+        float* outScores = (float*)outScoresPtr; 
+        
         int matchCount = 0;
         jfloat* query = env->GetFloatArrayElements(jQuery, nullptr);
+        
+        // --- [NEW] Precompute Query Vector Magnitude ---
+        // Doing this outside the row loop saves O(N * dim) calculations
+        float queryNormSq = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            queryNormSq += query[d] * query[d];
+        }
+        float queryNorm = std::sqrt(queryNormSq);
+        // -----------------------------------------------
+
         int dimLimit = dim - (dim % 8); 
 
         for (int i = 0; i < rows; i++) {
             float* vec = data + (i * dim);
             
+            float dotProduct = 0.0f;
+            float vecNormSq = 0.0f;
+            
 #ifdef ARCH_X86
-            __m256 sum = _mm256_setzero_ps();
+            __m256 sumDot = _mm256_setzero_ps();
+            __m256 sumNormA = _mm256_setzero_ps(); // Accumulator for Vector A's magnitude
+            
             for (int d = 0; d < dimLimit; d += 8) {
                 __m256 vA = _mm256_loadu_ps(&vec[d]);
                 __m256 vB = _mm256_loadu_ps(&query[d]);
-                sum = _mm256_fmadd_ps(vA, vB, sum);
+                sumDot = _mm256_fmadd_ps(vA, vB, sumDot);
+                sumNormA = _mm256_fmadd_ps(vA, vA, sumNormA); // vA * vA
             }
-            __m256 shuf = _mm256_permute2f128_ps(sum, sum, 1);
-            sum = _mm256_add_ps(sum, shuf);
-            sum = _mm256_hadd_ps(sum, sum); 
-            sum = _mm256_hadd_ps(sum, sum); 
-            float score = _mm256_cvtss_f32(sum);
+            
+            // Reduce Dot Product
+            __m256 shufDot = _mm256_permute2f128_ps(sumDot, sumDot, 1);
+            sumDot = _mm256_add_ps(sumDot, shufDot);
+            sumDot = _mm256_hadd_ps(sumDot, sumDot); 
+            sumDot = _mm256_hadd_ps(sumDot, sumDot); 
+            dotProduct = _mm256_cvtss_f32(sumDot);
+
+            // Reduce Norm A Squared
+            __m256 shufNorm = _mm256_permute2f128_ps(sumNormA, sumNormA, 1);
+            sumNormA = _mm256_add_ps(sumNormA, shufNorm);
+            sumNormA = _mm256_hadd_ps(sumNormA, sumNormA); 
+            sumNormA = _mm256_hadd_ps(sumNormA, sumNormA); 
+            vecNormSq = _mm256_cvtss_f32(sumNormA);
+
 #elif defined(ARCH_ARM)
-            float32x4_t sumVec = vdupq_n_f32(0.0f);
+            float32x4_t sumDotVec = vdupq_n_f32(0.0f);
+            float32x4_t sumNormAVec = vdupq_n_f32(0.0f);
+            
             int neonLimit = dim - (dim % 4);
             for (int d = 0; d < neonLimit; d += 4) {
                  float32x4_t vA = vld1q_f32(&vec[d]);
                  float32x4_t vB = vld1q_f32(&query[d]);
-                 sumVec = vmlaq_f32(sumVec, vA, vB); // Fused Multiply-Add
+                 sumDotVec = vmlaq_f32(sumDotVec, vA, vB); // Fused Multiply-Add
+                 sumNormAVec = vmlaq_f32(sumNormAVec, vA, vA);
             }
-            float score = vgetq_lane_f32(sumVec, 0) + vgetq_lane_f32(sumVec, 1) + 
-                          vgetq_lane_f32(sumVec, 2) + vgetq_lane_f32(sumVec, 3);
+            
+            dotProduct = vgetq_lane_f32(sumDotVec, 0) + vgetq_lane_f32(sumDotVec, 1) + 
+                         vgetq_lane_f32(sumDotVec, 2) + vgetq_lane_f32(sumDotVec, 3);
+            vecNormSq = vgetq_lane_f32(sumNormAVec, 0) + vgetq_lane_f32(sumNormAVec, 1) + 
+                        vgetq_lane_f32(sumNormAVec, 2) + vgetq_lane_f32(sumNormAVec, 3);
             dimLimit = neonLimit; 
 #else
-            float score = 0.0f;
             dimLimit = 0;
 #endif
+            // Scalar Tail
             for (int d = dimLimit; d < dim; d++) {
-                score += vec[d] * query[d];
+                dotProduct += vec[d] * query[d];
+                vecNormSq += vec[d] * vec[d];
             }
+            
+            // --- [NEW] Final Cosine Calculation ---
+            float score = 0.0f;
+            if (vecNormSq > 0.0f && queryNorm > 0.0f) {
+                float vecNorm = std::sqrt(vecNormSq);
+                score = dotProduct / (vecNorm * queryNorm);
+            }
+            
             if (score >= threshold) {
-                if (outIndicesPtr != 0) out[matchCount] = i;
+                if (outIndicesPtr != 0) outIndices[matchCount] = i;
+                if (outScoresPtr != 0) outScores[matchCount] = score; 
                 matchCount++;
             }
         }

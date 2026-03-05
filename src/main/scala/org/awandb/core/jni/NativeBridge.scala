@@ -67,6 +67,7 @@ class NativeBridge {
 
   // --- BLOCK MANAGEMENT ---
   @native def createBlockNative(rowCount: Int, colCount: Int, colSizesBytes: Array[Int]): Long
+  @native def destroyBlockNative(ptr: Long): Unit
   
   @native def getColumnPtr(blockPtr: Long, colIdx: Int): Long
   @native def getBlockSize(blockPtr: Long): Long
@@ -84,9 +85,17 @@ class NativeBridge {
 
   // --- Vector ---
   @native def loadVectorDataNative(blockPtr: Long, colIdx: Int, data: Array[Float], dim: Int): Unit
-  @native def avxScanVectorCosineNative(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float, outIndicesPtr: Long): Int
+  @native def avxScanVectorCosineNative(
+    blockPtr: Long, 
+    colIdx: Int, 
+    query: Array[Float], 
+    threshold: Float, 
+    outIndicesPtr: Long, 
+    outScoresPtr: Long // <-- New parameter
+  ): Int
   @native def avxHashVectorNative(blockPtr: Long, colIdx: Int, outHashPtr: Long): Unit
   @native def copyToScalaLongNative(srcPtr: Long, dst: Array[Long], len: Int): Unit
+  @native def copyToScalaFloatNative(srcPtr: Long, dest: Array[Float], count: Int): Unit
 
   // --- Hardware Topology---
   @native def getSystemTopologyNative(): Array[Long]
@@ -202,6 +211,7 @@ object NativeBridge {
   def loadData(ptr: Long, data: Array[Int]): Unit = instance.loadDataNative(ptr, data)
   def copyToScala(srcPtr: Long, dst: Array[Int], len: Int): Unit = instance.copyToScalaNative(srcPtr, dst, len)
   def copyToScalaLong(src: Long, dst: Array[Long], len: Int): Unit = instance.copyToScalaLongNative(src, dst, len)
+  def copyToScalaFloat(srcPtr: Long, dst: Array[Float], len: Int): Unit = instance.copyToScalaFloatNative(srcPtr, dst, len)
   
   // [NEW] String Public Wrapper
   def loadStringData(blockPtr: Long, colIdx: Int, data: Array[String]): Unit = {
@@ -267,6 +277,9 @@ object NativeBridge {
   def getColumnPtr(blockPtr: Long, colIdx: Int): Long = instance.getColumnPtr(blockPtr, colIdx)
   def getBlockSize(blockPtr: Long): Long = instance.getBlockSize(blockPtr)
   def getRowCount(blockPtr: Long): Int = instance.getRowCount(blockPtr)
+  def destroyBlock(blockPtr: Long): Unit = {
+    if (blockPtr != 0) instance.destroyBlockNative(blockPtr)
+  }
   def loadBlockFromFile(path: String): Long = {
     val ptr = instance.loadBlockFromFile(path)
     if (ptr == 0) throw new RuntimeException(s"Failed to load block: $path")
@@ -289,14 +302,20 @@ object NativeBridge {
     instance.loadVectorDataNative(blockPtr, colIdx, data, dim)
   }
 
+  // Overload 1: Just count matches (passes 0L for both memory pointers)
   def avxScanVectorCosine(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float): Int = {
-    // Pass 0 for outIndicesPtr to just count (or implement retrieval logic later)
-    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, 0)
+    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, 0L, 0L)
   }
   
-  // Overload to get results
+  // Overload 2: Get indices only (passes 0L for the scores pointer)
+  // (Useful if you have older tests or functions that don't need Top-K ranking)
   def avxScanVectorCosine(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float, outIndicesPtr: Long): Int = {
-    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, outIndicesPtr)
+    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, outIndicesPtr, 0L)
+  }
+
+  // Overload 3: NEW! Get BOTH indices and scores (for Top-K ranking)
+  def avxScanVectorCosine(blockPtr: Long, colIdx: Int, query: Array[Float], threshold: Float, outIndicesPtr: Long, outScoresPtr: Long): Int = {
+    instance.avxScanVectorCosineNative(blockPtr, colIdx, query, threshold, outIndicesPtr, outScoresPtr)
   }
 
   def computeHash(blockPtr: Long, colIdx: Int): Array[Long] = {

@@ -116,7 +116,7 @@ object SQLHandler {
                     
                  case eq: EqualsTo =>
                     val left = eq.getLeftExpression
-                    // [NEW] VECTOR SEARCH INTERCEPTOR
+                    // VECTOR SEARCH INTERCEPTOR
                     if (left.isInstanceOf[Function] && left.asInstanceOf[Function].getName.equalsIgnoreCase("VECTOR_SEARCH")) {
                        val func = left.asInstanceOf[Function]
                        val params = func.getParameters.getExpressions
@@ -259,6 +259,9 @@ object SQLHandler {
           // 1.5. CHECK FOR GRAPH BFS
           var isGraphBfs = false
           var bfsStartNode = 0
+          var srcCol = ""
+          var dstCol = ""
+          
           for (item <- plain.getSelectItems.asScala) {
             val expr = item.getExpression
             if (expr != null && expr.isInstanceOf[Function]) {
@@ -266,7 +269,13 @@ object SQLHandler {
               if (func.getName.equalsIgnoreCase("BFS_DISTANCE")) {
                 isGraphBfs = true
                 val params = func.getParameters.getExpressions
+                
+                // 1st Parameter: Start Node ID
                 bfsStartNode = params.get(0).asInstanceOf[LongValue].getValue.toInt
+                
+                // 2nd and 3rd Parameters: Source and Destination Columns
+                srcCol = cleanColName(params.get(1).asInstanceOf[Column].getFullyQualifiedName)
+                dstCol = cleanColName(params.get(2).asInstanceOf[Column].getFullyQualifiedName)
               }
             }
           }
@@ -274,7 +283,8 @@ object SQLHandler {
           // GRAPH ENGINE INTERCEPTOR
           if (isGraphBfs) {
             try {
-                val graph = leftTable.projectToGraph("src_id", "dst_id")
+                // Dynamically wire the user's requested columns into the graph
+                val graph = leftTable.projectToGraph(srcCol, dstCol)
                 val distances = graph.bfs(bfsStartNode)
                 
                 val sb = new StringBuilder()
@@ -319,84 +329,88 @@ object SQLHandler {
                 i != rightKeyIdx && !rightTable.columns(rightTable.columnOrder(i)).isString && !rightTable.columns(rightTable.columnOrder(i)).isVector
             ).getOrElse(rightKeyIdx)
 
-            var totalMatches = 0
-            val sb = new StringBuilder()
-            sb.append(s"\n   JOIN Results (Probe Output):\n")
+            // [CRITICAL FIX] Wrap the entire JOIN execution to protect native blocks in both tables
+            return leftTable.withEpoch {
+              rightTable.withEpoch {
+                var totalMatches = 0
+                val sb = new StringBuilder()
+                sb.append(s"\n   JOIN Results (Probe Output):\n")
 
-            // --- 1. BUILD PHASE (Right Table - Disk Only) ---
-            val rightScan = new TableScanOperator(rightTable.blockManager, rightTable.blockManager.getLoadedBlocks.toArray, rightKeyIdx, rightPayloadIdx)
-            val buildOp = new HashJoinBuildOperator(rightScan)
+                // --- 1. BUILD PHASE (Right Table - Disk Only) ---
+                val rightScan = new TableScanOperator(rightTable.blockManager, rightTable.blockManager.getLoadedBlocks.toArray, rightKeyIdx, rightPayloadIdx)
+                val buildOp = new HashJoinBuildOperator(rightScan)
 
-            // --- 2. PROBE PHASE A (Left Table - Disk) ---
-            val leftScan = new TableScanOperator(leftTable.blockManager, leftTable.blockManager.getLoadedBlocks.toArray, leftKeyIdx, leftPayloadIdx)
-            val probeOp = new HashJoinProbeOperator(leftScan, buildOp)
-            probeOp.open() 
-            
-            var batch = probeOp.next()
-            while (batch != null && batch.count > 0) {
-              totalMatches += batch.count
-              val keys = new Array[Int](batch.count)
-              val payloads = new Array[Long](batch.count)
-              NativeBridge.copyToScala(batch.keysPtr, keys, batch.count)
-              NativeBridge.copyToScalaLong(batch.valuesPtr, payloads, batch.count)
-              for (i <- 0 until math.min(batch.count, 3)) { 
-                sb.append(s"   [Disk] Match -> LeftKey: ${keys(i)} | RightPayload: ${payloads(i)}\n")
-              }
-              batch = probeOp.next()
-            }
-            // [CRITICAL FIX] Do NOT call probeOp.close() here! 
-
-            // --- 3. PROBE PHASE B (Left Table - RAM) ---
-            val ramKeysBuffer = leftTable.columns(leftJoinCol).deltaIntBuffer
-            val validRamKeys = new scala.collection.mutable.ArrayBuffer[Int]()
-            
-            for (i <- 0 until ramKeysBuffer.length) {
-                if (!leftTable.ramDeleted.get(i)) {
-                    validRamKeys.append(ramKeysBuffer(i))
+                // --- 2. PROBE PHASE A (Left Table - Disk) ---
+                val leftScan = new TableScanOperator(leftTable.blockManager, leftTable.blockManager.getLoadedBlocks.toArray, leftKeyIdx, leftPayloadIdx)
+                val probeOp = new HashJoinProbeOperator(leftScan, buildOp)
+                probeOp.open() 
+                
+                var batch = probeOp.next()
+                while (batch != null && batch.count > 0) {
+                  totalMatches += batch.count
+                  val keys = new Array[Int](batch.count)
+                  val payloads = new Array[Long](batch.count)
+                  NativeBridge.copyToScala(batch.keysPtr, keys, batch.count)
+                  NativeBridge.copyToScalaLong(batch.valuesPtr, payloads, batch.count)
+                  for (i <- 0 until math.min(batch.count, 3)) { 
+                    sb.append(s"   [Disk] Match -> LeftKey: ${keys(i)} | RightPayload: ${payloads(i)}\n")
+                  }
+                  batch = probeOp.next()
                 }
-            }
-            
-            val mapPtr = buildOp.getMapPtr()
-            if (mapPtr != 0L && validRamKeys.nonEmpty) {
-                val maxProbeSize = 4096
-                val maxFanOut = 100 // Handle up to 1:100 duplicate keys safely
-                val outCapacity = maxProbeSize * maxFanOut
+
+                // --- 3. PROBE PHASE B (Left Table - RAM) ---
+                val ramKeysBuffer = leftTable.columns(leftJoinCol).deltaIntBuffer
+                val validRamKeys = new scala.collection.mutable.ArrayBuffer[Int]()
                 
-                val probeKeysPtr = NativeBridge.allocMainStore(maxProbeSize)
-                val outPayloadsPtr = NativeBridge.allocMainStore(outCapacity * 2) 
-                val outIndicesPtr = NativeBridge.allocMainStore(outCapacity)
-                
-                var offset = 0
-                while (offset < validRamKeys.length) {
-                    val chunkLen = math.min(maxProbeSize, validRamKeys.length - offset)
-                    val chunk = validRamKeys.slice(offset, offset + chunkLen).toArray
-                    
-                    NativeBridge.loadData(probeKeysPtr, chunk)
-                    
-                    val ramMatches = NativeBridge.joinProbe(mapPtr, probeKeysPtr, chunkLen, outPayloadsPtr, outIndicesPtr)
-                    totalMatches += ramMatches
-                    
-                    if (ramMatches > 0 && totalMatches <= 10) {
-                        val toRead = math.min(ramMatches, 2)
-                        val matchedPayloads = new Array[Long](toRead)
-                        NativeBridge.copyToScalaLong(outPayloadsPtr, matchedPayloads, toRead)
-                        for (i <- 0 until toRead) {
-                           sb.append(s"   [RAM] Match -> RightPayload: ${matchedPayloads(i)}\n")
-                        }
+                for (i <- 0 until ramKeysBuffer.length) {
+                    if (!leftTable.ramDeleted.get(i)) {
+                        validRamKeys.append(ramKeysBuffer(i))
                     }
-                    offset += chunkLen
                 }
                 
-                NativeBridge.freeMainStore(probeKeysPtr)
-                NativeBridge.freeMainStore(outPayloadsPtr)
-                NativeBridge.freeMainStore(outIndicesPtr)
-            }
-            
-            // [CRITICAL FIX] Close and clean up memory AFTER both phases are complete!
-            probeOp.close()
+                val mapPtr = buildOp.getMapPtr()
+                if (mapPtr != 0L && validRamKeys.nonEmpty) {
+                    val maxProbeSize = 4096
+                    val maxFanOut = 100 // Handle up to 1:100 duplicate keys safely
+                    val outCapacity = maxProbeSize * maxFanOut
+                    
+                    val probeKeysPtr = NativeBridge.allocMainStore(maxProbeSize)
+                    val outPayloadsPtr = NativeBridge.allocMainStore(outCapacity * 2) 
+                    val outIndicesPtr = NativeBridge.allocMainStore(outCapacity)
+                    
+                    var offset = 0
+                    while (offset < validRamKeys.length) {
+                        val chunkLen = math.min(maxProbeSize, validRamKeys.length - offset)
+                        val chunk = validRamKeys.slice(offset, offset + chunkLen).toArray
+                        
+                        NativeBridge.loadData(probeKeysPtr, chunk)
+                        
+                        val ramMatches = NativeBridge.joinProbe(mapPtr, probeKeysPtr, chunkLen, outPayloadsPtr, outIndicesPtr)
+                        totalMatches += ramMatches
+                        
+                        if (ramMatches > 0 && totalMatches <= 10) {
+                            val toRead = math.min(ramMatches, 2)
+                            val matchedPayloads = new Array[Long](toRead)
+                            NativeBridge.copyToScalaLong(outPayloadsPtr, matchedPayloads, toRead)
+                            for (i <- 0 until toRead) {
+                               sb.append(s"   [RAM] Match -> RightPayload: ${matchedPayloads(i)}\n")
+                            }
+                        }
+                        offset += chunkLen
+                    }
+                    
+                    NativeBridge.freeMainStore(probeKeysPtr)
+                    NativeBridge.freeMainStore(outPayloadsPtr)
+                    NativeBridge.freeMainStore(outIndicesPtr)
+                }
+                
+                // Clean up memory while still safely under epoch protection!
+                probeOp.close()
 
-            sb.append(s"   Total Matches Found: $totalMatches\n")
-            return SQLResult(false, sb.toString(), totalMatches.toLong)
+                sb.append(s"   Total Matches Found: $totalMatches\n")
+                SQLResult(false, sb.toString(), totalMatches.toLong)
+              }
+            }
           }
 
           // -------------------------------------------------------

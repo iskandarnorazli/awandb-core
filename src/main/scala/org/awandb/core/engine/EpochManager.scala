@@ -28,8 +28,9 @@ class EpochManager(releaser: MemoryReleaser) {
   // Tracks which epoch each thread is currently operating in.
   private val localEpochs = new ConcurrentHashMap[Long, Long]()
 
-  // Memory waiting to be freed. Tuple of (MemoryPointer, RetiredEpoch)
-  private val retirementList = new ConcurrentLinkedQueue[(Long, Long)]()
+  // Memory waiting to be freed. Tuple of (MemoryPointer, RetiredEpoch, isBlock)
+  // [FIX] Update tuple to include an `isBlock: Boolean` flag
+  private val retirementList = new ConcurrentLinkedQueue[(Long, Long, Boolean)]()
 
   // [NEW] Non-blocking lock for the garbage collector
   private val isReclaiming = new AtomicBoolean(false)
@@ -67,9 +68,10 @@ class EpochManager(releaser: MemoryReleaser) {
 
   /**
    * Marks a native pointer for deletion. It is NOT freed yet.
+   * [FIX] Add isBlock parameter with a default of false to safely differentiate object deletion
    */
-  def retire(ptr: Long): Unit = {
-    retirementList.offer((ptr, globalEpoch.get()))
+  def retire(ptr: Long, isBlock: Boolean = false): Unit = {
+    retirementList.offer((ptr, globalEpoch.get(), isBlock))
   }
 
   /**
@@ -83,21 +85,15 @@ class EpochManager(releaser: MemoryReleaser) {
     if (!isReclaiming.compareAndSet(false, true)) return
 
     try {
-      // Find the oldest epoch currently being viewed by any active thread.
-      // If no threads are active, the safe epoch is the current global epoch.
-      val minActiveEpoch = if (localEpochs.isEmpty) {
-        globalEpoch.get()
-      } else {
-        localEpochs.values().asScala.min
-      }
+      // [BUG FIX] Handle the race condition where localEpochs empties during the .min evaluation
+      val minActiveEpoch = scala.util.Try(localEpochs.values().asScala.min).getOrElse(globalEpoch.get())
 
       // We can only free memory that was retired strictly BEFORE the oldest active epoch.
-      // If memory was retired at Epoch N, and a thread is pinned at Epoch N, it might still have a reference.
       val it = retirementList.iterator()
       while (it.hasNext) {
-        val (ptr, retiredEpoch) = it.next()
+        val (ptr, retiredEpoch, isBlock) = it.next() // [NEW] Extract isBlock
         if (retiredEpoch < minActiveEpoch) {
-          releaser.free(ptr)
+          if (isBlock) releaser.freeBlock(ptr) else releaser.free(ptr) // [NEW] Route correctly
           it.remove() // Remove from the queue
         }
       }

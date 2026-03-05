@@ -78,7 +78,8 @@ class AISqlSpec extends AnyFunSuite with Matchers with BeforeAndAfterEach {
     graphTable.insertRow(Array(3, 2, 3))
     graphTable.flush()
 
-    val sql = "SELECT BFS_DISTANCE(0) FROM relationships"
+    // [UPDATED] Pass the dynamic column names to the function
+    val sql = "SELECT BFS_DISTANCE(0, src_id, dst_id) FROM relationships"
     val result = SQLHandler.execute(sql)
 
     result.isError shouldBe false
@@ -122,7 +123,8 @@ class AISqlSpec extends AnyFunSuite with Matchers with BeforeAndAfterEach {
     graphTable.insertRow(Array(3, 5, 6))
     graphTable.flush()
 
-    val sql = "SELECT BFS_DISTANCE(0) FROM relationships"
+    // [UPDATED] Pass the dynamic column names to the function
+    val sql = "SELECT BFS_DISTANCE(0, src_id, dst_id) FROM relationships"
     val result = SQLHandler.execute(sql)
 
     result.isError shouldBe false

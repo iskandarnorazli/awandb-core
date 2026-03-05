@@ -4,8 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,7 +22,7 @@ import org.apache.arrow.vector.{IntVector, VarCharVector, VectorSchemaRoot}
 import org.apache.arrow.flight._
 import org.awandb.core.engine.AwanTable
 import org.awandb.core.sql.SQLHandler
-import org.awandb.server.AwanFlightProducer
+import org.awandb.server.AwanFlightSqlProducer
 
 class DoPutStreamSpec extends AnyFunSuite with BeforeAndAfterAll {
 
@@ -37,13 +36,28 @@ class DoPutStreamSpec extends AnyFunSuite with BeforeAndAfterAll {
     // Setup isolated tables for each test
     val tables = Seq("stream_basic", "stream_pressure", "stream_error")
     for (tName <- tables) {
+      val dir = new java.io.File(s"target/data_$tName")
+      
+      // [FIX 1] Banish the ghosts! Clean directory before init.
+      if (dir.exists()) {
+        def deleteRecursively(f: java.io.File): Unit = {
+          if (f.isDirectory) {
+            val children = f.listFiles()
+            if (children != null) children.foreach(deleteRecursively)
+          }
+          f.delete()
+        }
+        deleteRecursively(dir)
+      }
+
       val table = new AwanTable(tName, 100_000, dataDir = s"target/data_$tName")
       table.addColumn("val", isString = false)
       SQLHandler.register(tName, table)
     }
-
+    
+    // [RESTORED] Setup server and client
     val location = Location.forGrpcInsecure("localhost", 33333)
-    server = FlightServer.builder(allocator, location, new AwanFlightProducer(allocator, location)).build()
+    server = FlightServer.builder(allocator, location, new AwanFlightSqlProducer(allocator, location)).build()
     server.start()
 
     client = FlightClient.builder(allocator, location).build()
@@ -68,7 +82,8 @@ class DoPutStreamSpec extends AnyFunSuite with BeforeAndAfterAll {
     )
     root.setRowCount(1000)
 
-    val clientStream = client.startPut(FlightDescriptor.path(tableName), root, new SyncPutListener())
+    val listener = new SyncPutListener() // [FIX 2] Assign to variable
+    val clientStream = client.startPut(FlightDescriptor.path(tableName), root, listener)
     clientStream.putNext()
     clientStream.completed()
 
@@ -79,7 +94,8 @@ class DoPutStreamSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(countRes.message.contains("1000"), "Failed to ingest single batch.")
     
     root.close()
-    intVector.close() // [FIX] Free the raw vector memory
+    intVector.close() // Free the raw vector memory
+    listener.close()  // [FIX 2] Plug the memory leak!
   }
 
   test("2. HTAP Feature: Sustained Stream Pressure (100,000 rows)") {
@@ -118,7 +134,8 @@ class DoPutStreamSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(countRes.message.contains("100000"), s"Lost rows during sustained pressure! Output: ${countRes.message}")
     
     root.close()
-    intVector.close() // [FIX] Free the raw vector memory
+    intVector.close() // Free the raw vector memory
+    listener.close()  // [FIX 2] Plug the memory leak!
   }
 
   test("3. Security/Stability: Reject Invalid Stream Schema Gracefully") {
@@ -148,13 +165,14 @@ class DoPutStreamSpec extends AnyFunSuite with BeforeAndAfterAll {
     }
     
     assert(thrown.status().code() == FlightStatusCode.INVALID_ARGUMENT, "Server did not return INVALID_ARGUMENT")
-    assert(thrown.getMessage.contains("Only IntVector streams are currently supported"), "Server returned wrong error message")
+    assert(thrown.getMessage.contains("Unsupported Arrow stream type. Found: VarCharVector on column 'val'"), "Server returned wrong error message")
     
     // Verify the engine didn't crash and the table is still empty
     val countRes = SQLHandler.execute(s"SELECT COUNT(*) FROM $tableName")
     assert(countRes.message.contains("NULL") || countRes.message.contains("0"), "Data polluted by invalid stream")
     
     root.close()
-    strVector.close() // [FIX] Free the malicious string vector memory
+    strVector.close() // Free the malicious string vector memory
+    listener.close()  // [FIX 2] Plug the memory leak!
   }
 }

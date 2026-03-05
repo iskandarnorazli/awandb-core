@@ -195,20 +195,15 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
     
     val descriptor = flightStream.getDescriptor
     
-    // [FIX] The Routing Switch:
-    // Flight SQL sends mutations as Commands (Protobuf Any messages).
-    // If it's a command, hand it back to the parent class so it can unpack 
-    // the protobuf and route it to our `acceptPutStatement` method!
+    // The Routing Switch:
     if (descriptor.isCommand) {
       return super.acceptPut(context, flightStream, ackStream)
     }
 
-    // Otherwise, it's a Path descriptor, which means it's our raw binary ingestion stream!
     new Runnable {
       override def run(): Unit = {
         try {
           val tableName = descriptor.getPath.get(0).toLowerCase()
-
           val table = SQLHandler.tables.get(tableName)
           if (table == null) throw CallStatus.NOT_FOUND.withDescription(s"Table '$tableName' does not exist.").toRuntimeException
 
@@ -218,14 +213,12 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
             val rowCount = root.getRowCount
 
             if (rowCount > 0) {
-              // Track which columns are actively being ingested in this batch
               val incomingCols = scala.collection.mutable.Set[String]()
 
               // 1. Ingest provided columns
               for (colIdx <- 0 until root.getFieldVectors.size()) {
                 val vector = root.getVector(colIdx)
                 
-                // Map Arrow vector name to DB column name, fallback to index
                 val vectorName = vector.getName.toLowerCase
                 val colName = if (table.columns.contains(vectorName)) {
                   vectorName
@@ -233,7 +226,6 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                   table.columnOrder(colIdx)
                 }
 
-                // Mark column as successfully received
                 incomingCols.add(colName)
 
                 vector match {
@@ -244,25 +236,64 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                       batchData(i) = intVector.get(i)
                       i += 1 
                     }
-                    
-                    // Routes through the table so the Primary Index gets updated
                     table.insertBatch(colName, batchData)
+                    
+                  // Add support for Vector Embeddings (ListVector of Floats)
+                  case listVector: org.apache.arrow.vector.complex.ListVector =>
+                    // Safely match the inner vector to prevent ClassCastExceptions
+                    listVector.getDataVector match {
+                      case innerVector: org.apache.arrow.vector.Float4Vector =>
+                        var i = 0
+                        while (i < rowCount) {
+                          // Check for null lists to prevent out-of-bounds reading
+                          if (listVector.isNull(i)) {
+                            table.columns(colName).insert(Array.empty[Float])
+                          } else {
+                            // Get the start and end index of the float array for this specific row
+                            val startIdx = listVector.getOffsetBuffer.getInt(i * 4L)
+                            val endIdx = listVector.getOffsetBuffer.getInt((i + 1) * 4L)
+                            val dim = endIdx - startIdx
+                            
+                            val floatArr = new Array[Float](dim)
+                            var j = 0
+                            while (j < dim) {
+                              floatArr(j) = innerVector.get(startIdx + j)
+                              j += 1
+                            }
+                            
+                            table.columns(colName).insert(floatArr)
+                          }
+                          i += 1
+                        }
+                      case _ =>
+                        root.clear()
+                        throw CallStatus.INVALID_ARGUMENT
+                          .withDescription(s"Vector column '$colName' expects a List of Floats (Float4).")
+                          .toRuntimeException
+                    }
                     
                   case _ => 
                     root.clear()
-                    throw CallStatus.INVALID_ARGUMENT.withDescription(s"Only IntVector streams are currently supported. Found: ${vector.getClass.getSimpleName} on column '$colName'").toRuntimeException
+                    throw CallStatus.INVALID_ARGUMENT.withDescription(s"Unsupported Arrow stream type. Found: ${vector.getClass.getSimpleName} on column '$colName'").toRuntimeException
                 }
               }
 
-              // [FIX] 2. Pad missing columns with default values to prevent jagged arrays
+              // 2. Pad missing columns with default values to maintain row alignment
               val missingCols = table.columnOrder.filterNot(incomingCols.contains)
               for (colName <- missingCols) {
-                 // Allocate a blank array (defaults to 0) to keep memory aligned
-                 val padData = new Array[Int](rowCount) 
-                 table.insertBatch(colName, padData)
+                 if (table.columns(colName).isVector) {
+                    val emptyVec = Array.empty[Float]
+                    var i = 0
+                    while (i < rowCount) {
+                       table.columns(colName).insert(emptyVec)
+                       i += 1
+                    }
+                 } else {
+                    val padData = new Array[Int](rowCount) 
+                    table.insertBatch(colName, padData)
+                 }
               }
 
-              // Add row count only once per batch, not per column
               totalRowsIngested += rowCount 
             }
           }

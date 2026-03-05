@@ -25,7 +25,13 @@ class EpochManagerSpec extends AnyFunSuite with Matchers with BeforeAndAfterEach
 
   class MockMemoryReleaser extends MemoryReleaser {
     val freedPointers = ArrayBuffer[Long]()
+    
     override def free(ptr: Long): Unit = synchronized {
+      freedPointers.append(ptr)
+    }
+    
+    // Add the block freer for the mock
+    override def freeBlock(ptr: Long): Unit = synchronized {
       freedPointers.append(ptr)
     }
   }

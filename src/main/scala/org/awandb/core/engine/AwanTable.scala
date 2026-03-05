@@ -62,6 +62,19 @@ class AwanTable(
   @inline private def unpackBlockIdx(loc: Long): Int = (loc >> 32).toInt
   @inline private def unpackRowId(loc: Long): Int = loc.toInt
 
+  // ---------------------------------------------------------
+  // EPOCH MEMORY PROTECTION (EBMM)
+  // ---------------------------------------------------------
+  @inline private[awandb] def withEpoch[T](block: => T): T = {
+    val threadId = Thread.currentThread().getId
+    epochManager.registerThread(threadId)
+    try {
+      block
+    } finally {
+      epochManager.deregisterThread(threadId)
+    }
+  }
+
   // [DELETION] RAM Deletion Bitmap (For rows in Delta Buffer)
   val ramDeleted = new java.util.BitSet()
 
@@ -108,27 +121,40 @@ class AwanTable(
     val blocks = blockManager.getLoadedBlocks.toList
     var blockIdx = 0
     
+    // 1. Map all Disk Rows
     for (blockPtr <- blocks) {
-      val rowCount = NativeBridge.getRowCount(blockPtr)
+      val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
       if (rowCount > 0) {
         // We know Column 0 is the Primary Key (Int)
-        val colPtr = NativeBridge.getColumnPtr(blockPtr, 0)
+        val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, 0)
         
         // Fetch the entire ID column in one massive swoop
         val ids = new Array[Int](rowCount)
-        NativeBridge.copyToScala(colPtr, ids, rowCount)
+        org.awandb.core.jni.NativeBridge.copyToScala(colPtr, ids, rowCount)
         
         // Re-populate the ConcurrentHashMap
         var i = 0
         while (i < rowCount) {
           if (!blockManager.isDeleted(blockPtr, i)) {
-            // [FIX] Use packLocation instead of RowLocation case class
             primaryIndex.put(ids(i), packLocation(blockIdx, i))
           }
           i += 1
         }
       }
       blockIdx += 1
+    }
+
+    // 2. [NEW] Restore surviving RAM Rows back into the Index!
+    if (columns.nonEmpty) {
+      val ramIds = columns.values.head.deltaIntBuffer
+      var i = 0
+      while (i < ramIds.length) {
+        if (!ramDeleted.get(i)) {
+          // Pack location: Block -1 (RAM), Row ID
+          primaryIndex.put(ramIds(i), packLocation(-1, i))
+        }
+        i += 1
+      }
     }
   }
 
@@ -166,7 +192,7 @@ class AwanTable(
 
   /**
    * Retrieves a full row by ID.
-   * Used by UPDATE to perform Read-Modify-Write.
+   * Used by UPDATE to perform Read-Modify-Write and by SELECT for late materialization.
    */
   def getRow(id: Int): Option[Array[Any]] = {
     rwLock.readLock().lock()
@@ -188,7 +214,9 @@ class AwanTable(
         
         if (blockPtr == 0) {
            // RAM READ
-           if (col.isString) {
+           if (col.isVector) {
+             result(colIdx) = col.deltaVectorBuffer(rowId)
+           } else if (col.isString) {
              result(colIdx) = col.deltaStringBuffer(rowId)
            } else {
              result(colIdx) = col.deltaIntBuffer(rowId)
@@ -198,9 +226,14 @@ class AwanTable(
            val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
            val stride = NativeBridge.getColumnStride(blockPtr, colIdx)
            val cellPtr = NativeBridge.getOffsetPointer(colPtr, rowId * stride.toLong)
-           // ... (rest of the method remains identical)
            
-           if (col.isString) {
+           if (col.isVector) {
+             // Calculate vector dimension (Stride is in bytes, Float is 4 bytes)
+             val dim = stride / 4
+             val tempBuf = new Array[Float](dim)
+             NativeBridge.copyToScalaFloat(cellPtr, tempBuf, dim)
+             result(colIdx) = tempBuf
+           } else if (col.isString) {
              // TODO: String Disk Read support. For now return placeholder.
              result(colIdx) = "N/A (Disk)"
            } else {
@@ -222,11 +255,10 @@ class AwanTable(
    * Scans ALL rows (RAM + Disk).
    * Used by SELECT *.
    */
-  def scanAll(): Iterator[Array[Any]] = {
-      // 1. RAM Iterator
-      val ramIter = (0 until columns.values.head.deltaIntBuffer.length).iterator.collect {
+  def scanAll(): Iterator[Array[Any]] = withEpoch {
+      // 1. RAM Iterator (Forced eager evaluation with .toList)
+      val ramList = (0 until columns.values.head.deltaIntBuffer.length).collect {
          case i if !ramDeleted.get(i) =>
-            // Reconstruct Row
             val row = new Array[Any](columns.size)
             var c = 0
             for(colName <- columnOrder) {
@@ -236,12 +268,12 @@ class AwanTable(
                c += 1
             }
             row
-      }
+      }.toList
 
-      // 2. Disk Iterator
-      val diskIter = blockManager.getLoadedBlocks.iterator.flatMap { blockPtr =>
+      // 2. Disk Iterator (Forced eager evaluation with .toList)
+      val diskList = blockManager.getLoadedBlocks.toList.flatMap { blockPtr =>
           val rowCount = NativeBridge.getRowCount(blockPtr)
-          (0 until rowCount).iterator.collect {
+          (0 until rowCount).collect {
              case i if !blockManager.isDeleted(blockPtr, i) =>
                  val row = new Array[Any](columns.size)
                  var c = 0
@@ -251,14 +283,14 @@ class AwanTable(
                      val cellPtr = NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
                      val temp = new Array[Int](1)
                      NativeBridge.copyToScala(cellPtr, temp, 1)
-                     row(c) = temp(0) // Assume Int for MVP
+                     row(c) = temp(0)
                      c += 1
                  }
                  row
           }
       }
       
-      ramIter ++ diskIter
+      (ramList ++ diskList).iterator
   }
 
   // ---------------------------------------------------------
@@ -499,7 +531,7 @@ class AwanTable(
       }
   }
 
-  private def queryIntEquality(colName: String, target: Int): Int = {
+  private def queryIntEquality(colName: String, target: Int): Int = withEpoch {
     var ramCount = 0
     var snapshotBlocks: Seq[Long] = Seq.empty 
     var colIdx = 0
@@ -561,7 +593,7 @@ class AwanTable(
     ramCount + diskCount
   }
 
-  private def queryStringEquality(colName: String, value: String): Int = {
+  private def queryStringEquality(colName: String, value: String): Int = withEpoch {
     var ramCount = 0
     var snapshotBlocks: Seq[Long] = Seq.empty 
     var colIdx = 0
@@ -621,7 +653,7 @@ class AwanTable(
     ramCount + diskCount
   }
 
-  def query(threshold: Int): Int = {
+  def query(threshold: Int): Int = withEpoch {
     if (columns.isEmpty) return 0
     val firstColName = columns.keys.head
     
@@ -649,7 +681,7 @@ class AwanTable(
     val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
        val rowCount = NativeBridge.getRowCount(blockPtr)
        
-       // [NEW] Fetch the cached native pointer instantly
+       // Fetch the cached native pointer instantly
        val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
        
        if (bitmaskPtr == 0L) {
@@ -663,7 +695,7 @@ class AwanTable(
     ramCount + diskCount
   }
 
-  def queryShared(thresholds: Array[Int]): Array[Int] = {
+  def queryShared(thresholds: Array[Int]): Array[Int] = withEpoch {
      val totalCounts = new Array[Int](thresholds.length)
      var snapshotBlocks: Seq[Long] = Seq.empty
      rwLock.readLock().lock()
@@ -696,7 +728,7 @@ class AwanTable(
      totalCounts
   }
 
-  def executeGroupBy(keyCol: String, valCol: String): Map[Int, Long] = {
+  def executeGroupBy(keyCol: String, valCol: String): Map[Int, Long] = withEpoch {
     val keyIdx = columnOrder.indexOf(keyCol)
     val valIdx = columnOrder.indexOf(valCol)
     if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
@@ -771,43 +803,60 @@ class AwanTable(
     finalMap.toMap
   }
 
-  def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = {
+  def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Iterator.empty
 
-    // 1. RAM Filter (Unchanged)
-    val ramIter = (0 until columns(colName).deltaIntBuffer.length).iterator.collect {
-       case i if !ramDeleted.get(i) =>
-         val v = columns(colName).deltaIntBuffer(i)
-         val matchFound = opType match {
-           case 0 => v == targetVal
-           case 1 => v > targetVal
-           case 2 => v >= targetVal
-           case 3 => v < targetVal
-           case 4 => v <= targetVal
-           case _ => false
-         }
-         if (matchFound) {
-           val row = new Array[Any](columns.size)
-           var c = 0
-           for(cn <- columnOrder) {
-               val col = columns(cn)
-               if(col.isString) row(c) = col.deltaStringBuffer(i)
-               else row(c) = col.deltaIntBuffer(i)
-               c += 1
-           }
-           row
-         } else null
-    }.filter(_ != null)
+    var ramIter: Iterator[Array[Any]] = Iterator.empty
+    var snapshotBlocks: List[Long] = Nil
 
-    // 2. Disk Filter (Predicate Pushdown)
-    val snapshotBlocks = blockManager.getLoadedBlocks.toList
-    
+    rwLock.readLock().lock()
+    try {
+      if (isClosed) throw new IllegalStateException("Table is closed")
+
+      // 1. RAM Filter (Eager evaluation under lock)
+      val ramRows = new scala.collection.mutable.ArrayBuffer[Array[Any]]()
+      val colIntBuf = columns(colName).deltaIntBuffer
+      var i = 0
+      while (i < colIntBuf.length) {
+         if (!ramDeleted.get(i)) {
+           val v = colIntBuf(i)
+           val matchFound = opType match {
+             case 0 => v == targetVal
+             case 1 => v > targetVal
+             case 2 => v >= targetVal
+             case 3 => v < targetVal
+             case 4 => v <= targetVal
+             case _ => false
+           }
+           if (matchFound) {
+             val row = new Array[Any](columns.size)
+             var c = 0
+             for(cn <- columnOrder) {
+                 val col = columns(cn)
+                 if(col.isVector) row(c) = col.deltaVectorBuffer(i)
+                 else if(col.isString) row(c) = col.deltaStringBuffer(i)
+                 else row(c) = col.deltaIntBuffer(i)
+                 c += 1
+             }
+             ramRows.append(row)
+           }
+         }
+         i += 1
+      }
+      ramIter = ramRows.iterator
+
+      // 2. Snapshot Native Blocks
+      snapshotBlocks = blockManager.getLoadedBlocks.toList
+    } finally {
+      rwLock.readLock().unlock()
+    }
+
+    // 3. Disk Filter (Predicate Pushdown) safely protected by withEpoch
     val diskIter = snapshotBlocks.flatMap { blockPtr =>
        val rowCount = NativeBridge.getRowCount(blockPtr)
-       val outIndicesPtr = NativeBridge.allocMainStore(rowCount)
+       val outIndicesPtr = NativeBridge.allocMainStore(rowCount * 4) // [FIX] Multiply by 4 for bytes
        
-       // [NEW] Fetch the cached pointer instantly from BlockManager
        val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
        
        try {
@@ -825,10 +874,10 @@ class AwanTable(
                
                for (c <- columnOrder.indices) {
                    val col = columns(columnOrder(c))
-                   if (!col.isString) { // Safe-guard against native string corruption
+                   if (!col.isString && !col.isVector) { // Safe-guard against native string/vector corruption
                        colsData(c) = new Array[Int](matchCount)
                        val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
-                       val tempValuesPtr = NativeBridge.allocMainStore(matchCount)
+                       val tempValuesPtr = NativeBridge.allocMainStore(matchCount * 4) // [FIX] Multiply by 4 for bytes
                        
                        NativeBridge.batchRead(colPtr, outIndicesPtr, matchCount, tempValuesPtr)
                        NativeBridge.copyToScala(tempValuesPtr, colsData(c), matchCount)
@@ -840,14 +889,14 @@ class AwanTable(
                (0 until matchCount).map { i =>
                    val row = new Array[Any](columnOrder.size)
                    for (c <- columnOrder.indices) {
-                       row(c) = colsData(c)(i)
+                       row(c) = if (colsData(c) != null) colsData(c)(i) else null
                    }
                    row
                }.toIterator
            }
        } finally {
            NativeBridge.freeMainStore(outIndicesPtr)
-           // [CRITICAL] Do NOT free bitmaskPtr here anymore! BlockManager owns it.
+           // Do NOT free bitmaskPtr here! BlockManager owns it.
        }
     }.iterator
 
@@ -855,43 +904,53 @@ class AwanTable(
   }
 
   /**
-   * [NEW] Late Materialization Filter
+   * Late Materialization Filter
    * Scans a column and returns ONLY the Primary Keys (Row IDs) that match.
    */
-  def scanFilteredIds(colName: String, opType: Int, targetVal: Int): Array[Int] = {
+  def scanFilteredIds(colName: String, opType: Int, targetVal: Int): Array[Int] = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Array.empty[Int]
     
     val idColName = columnOrder.head // Assumes Column 0 is the PK
 
-    // 1. RAM Filter (Primitive Array Loop)
     val ramIds = new scala.collection.mutable.ArrayBuffer[Int]()
-    val ramCol = columns(colName).deltaIntBuffer
-    val ramIdCol = columns(idColName).deltaIntBuffer
-    
-    var i = 0
-    while (i < ramCol.length) {
-       if (!ramDeleted.get(i)) {
-         val v = ramCol(i)
-         val matchFound = opType match {
-           case 0 => v == targetVal
-           case 1 => v > targetVal
-           case 2 => v >= targetVal
-           case 3 => v < targetVal
-           case 4 => v <= targetVal
-           case _ => false
-         }
-         if (matchFound) ramIds.append(ramIdCol(i))
+    var snapshotBlocks: List[Long] = Nil
+
+    rwLock.readLock().lock()
+    try {
+       if (isClosed) throw new IllegalStateException("Table is closed")
+
+       // 1. RAM Filter (Primitive Array Loop)
+       val ramCol = columns(colName).deltaIntBuffer
+       val ramIdCol = columns(idColName).deltaIntBuffer
+       
+       var i = 0
+       while (i < ramCol.length) {
+          if (!ramDeleted.get(i)) {
+            val v = ramCol(i)
+            val matchFound = opType match {
+              case 0 => v == targetVal
+              case 1 => v > targetVal
+              case 2 => v >= targetVal
+              case 3 => v < targetVal
+              case 4 => v <= targetVal
+              case _ => false
+            }
+            if (matchFound) ramIds.append(ramIdCol(i))
+          }
+          i += 1
        }
-       i += 1
+
+       // 2. Snapshot Native Blocks
+       snapshotBlocks = blockManager.getLoadedBlocks.toList
+    } finally {
+       rwLock.readLock().unlock()
     }
 
-    // 2. Disk Filter (Predicate Pushdown)
-    val snapshotBlocks = blockManager.getLoadedBlocks.toList
-    
+    // 3. Disk Filter (Predicate Pushdown) safely protected by withEpoch
     val diskIds = snapshotBlocks.flatMap { blockPtr =>
        val rowCount = NativeBridge.getRowCount(blockPtr)
-       val outIndicesPtr = NativeBridge.allocMainStore(rowCount)
+       val outIndicesPtr = NativeBridge.allocMainStore(rowCount * 4) // [FIX] Multiply by 4 for bytes
        val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
        
        try {
@@ -902,7 +961,7 @@ class AwanTable(
            } else {
                // ONLY Gather Column 0 (The Primary Key)
                val idColPtr = NativeBridge.getColumnPtr(blockPtr, 0)
-               val tempValuesPtr = NativeBridge.allocMainStore(matchCount)
+               val tempValuesPtr = NativeBridge.allocMainStore(matchCount * 4) // [FIX] Multiply by 4 for bytes
                
                NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
                
@@ -923,84 +982,144 @@ class AwanTable(
   def swapCompactedBlocks(oldBlocks: Array[Long], newBlockPtr: Long, epochManager: memory.EpochManager): Unit = {
     rwLock.writeLock().lock()
     try {
-      // 1. Swap the blocks safely inside BlockManager
-      blockManager.swapBlocks(oldBlocks, newBlockPtr)
-
-      // 2. Hand the old blocks to the EpochManager for safe Lock-Free garbage collection!
+      // 1. Gather all pointers to retire BEFORE swapping (so we can find indices for filters)
       oldBlocks.foreach { ptr =>
-        epochManager.retire(ptr)
+        epochManager.retire(ptr, isBlock = true) // [NEW] Mark as Block!
         
-        // Also retire the native bitmasks to prevent memory leaks
+        // Retire the native bitmasks to prevent memory leaks (these are raw memory, not blocks)
         val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
         val bitmaskPtr = blockManager.getNativeDeletionBitmap(ptr, rowCount)
-        if (bitmaskPtr != 0L) epochManager.retire(bitmaskPtr)
-      }
-      
-      // 3. Rebuild the Primary Index for surviving rows
-      if (newBlockPtr != 0L) {
-        // We know Column 0 is the Primary Key
-        val newBlockIdx = blockManager.getLoadedBlocks.size - 1 
-        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(newBlockPtr)
-        val idColPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(newBlockPtr, 0)
+        if (bitmaskPtr != 0L) epochManager.retire(bitmaskPtr, isBlock = false) // [NEW] Mark as Raw Memory!
         
-        val survivingIds = new Array[Int](rowCount)
-        org.awandb.core.jni.NativeBridge.copyToScala(idColPtr, survivingIds, rowCount)
-        
-        var i = 0
-        while (i < rowCount) {
-          primaryIndex.put(survivingIds(i), packLocation(newBlockIdx, i))
-          i += 1
+        // [NEW] Find the block index to retire its Cuckoo Filter to prevent memory leaks!
+        val blockIdx = blockManager.getLoadedBlocks.indexOf(ptr)
+        if (blockIdx != -1) {
+          val filterPtr = blockManager.getFilterPtr(blockIdx)
+          if (filterPtr != 0L) {
+             // We can safely route Cuckoo Filters through standard 'free' (isBlock = false) 
+             // because they are flat memory arrays.
+             epochManager.retire(filterPtr, isBlock = false) 
+          }
         }
       }
+
+      // 2. Swap the blocks safely inside BlockManager
+      blockManager.swapBlocks(oldBlocks, newBlockPtr)
+      
+      // 3. Rebuild the Primary Index for ALL rows to fix shifted block indices
+      primaryIndex.clear()
+      rebuildPrimaryIndex()
       
     } finally {
       rwLock.writeLock().unlock()
     }
   }
 
-  def queryVector(colName: String, query: Array[Float], threshold: Float): Array[Int] = {
+  def queryVector(colName: String, query: Array[Float], threshold: Float, limit: Int = 100): Array[Int] = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Array.empty[Int]
+
+    var snapshotBlocks: List[Long] = Nil
+    val ramMatches = scala.collection.mutable.ArrayBuffer[(Int, Float)]()
+
+    // 1. Lock the table for reading
+    rwLock.readLock().lock()
+    try {
+      if (isClosed) throw new IllegalStateException("Table is closed")
+
+      // --- RAM VECTOR SEARCH ---
+      val col = columns(colName)
+      if (col.isVector && col.deltaVectorBuffer.nonEmpty) {
+        val ramVectors = col.deltaVectorBuffer
+        val ramIdCol = columns(columnOrder.head).deltaIntBuffer // Assumes Col 0 is PK
+        
+        var i = 0
+        while (i < ramVectors.length) {
+          if (!ramDeleted.get(i)) {
+             val vec = ramVectors(i)
+             if (vec != null && vec.length == query.length) {
+                 var dotProduct = 0.0f
+                 var normA = 0.0f
+                 var normB = 0.0f
+                 var d = 0
+                 
+                 // Compute Cosine Similarity strictly for vectors in RAM
+                 while (d < vec.length) {
+                    dotProduct += vec(d) * query(d)
+                    normA += vec(d) * vec(d)
+                    normB += query(d) * query(d)
+                    d += 1
+                 }
+                 if (normA > 0 && normB > 0) {
+                     val score = dotProduct / (math.sqrt(normA) * math.sqrt(normB)).toFloat
+                     if (score >= threshold) {
+                         ramMatches.append((ramIdCol(i), score))
+                     }
+                 }
+             }
+          }
+          i += 1
+        }
+      }
+
+      snapshotBlocks = blockManager.getLoadedBlocks.toList
+
+    } finally {
+      rwLock.readLock().unlock()
+    }
     
-    val snapshotBlocks = blockManager.getLoadedBlocks.toList
-    
-    val rawIds = snapshotBlocks.flatMap { blockPtr =>
+    // 2. DISK VECTOR SEARCH (JNI)
+    // Protected safely by the outer withEpoch wrapper!
+    val diskMatches = snapshotBlocks.flatMap { blockPtr =>
        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
-       val outIndicesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount)
+       
+       val outIndicesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4)
+       val outScoresPtr  = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4) 
        
        try {
-           val matchCount = org.awandb.core.jni.NativeBridge.avxScanVectorCosine(blockPtr, colIdx, query, threshold, outIndicesPtr)
+           val matchCount = org.awandb.core.jni.NativeBridge.avxScanVectorCosine(
+             blockPtr, colIdx, query, threshold, outIndicesPtr, outScoresPtr
+           )
            
            if (matchCount == 0) {
-               Array.empty[Int]
+               Array.empty[(Int, Float)] 
            } else {
                val idColPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, 0)
-               val tempValuesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(matchCount)
+               val tempValuesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(matchCount * 4)
                org.awandb.core.jni.NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
                
                val ids = new Array[Int](matchCount)
                org.awandb.core.jni.NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
                org.awandb.core.jni.NativeBridge.freeMainStore(tempValuesPtr)
-               ids
+               
+               val scores = new Array[Float](matchCount)
+               org.awandb.core.jni.NativeBridge.copyToScalaFloat(outScoresPtr, scores, matchCount) 
+               
+               ids.zip(scores)
            }
        } finally {
            org.awandb.core.jni.NativeBridge.freeMainStore(outIndicesPtr)
+           org.awandb.core.jni.NativeBridge.freeMainStore(outScoresPtr)
        }
     }
     
-    // [CRITICAL FIX] Late-Stage Filtering
-    // 1. Removes Tombstoned (Deleted) rows by verifying they still exist in the Primary Index.
-    // 2. Removes Phantom IDs (ID 0) caused by AVX memory alignment padding.
-    rawIds.filter { id =>
-      getRow(id).isDefined
-    }.distinct.toArray
+    // 3. Late-Stage Filtering & Top-K Ranking (Merging RAM and Disk)
+    val allMatches = ramMatches ++ diskMatches
+
+    allMatches
+      .filter { case (id, _) => getRow(id).isDefined } 
+      .distinctBy { case (id, _) => id }               
+      .sortBy { case (_, score) => -score }            
+      .take(limit)                                     
+      .map { case (id, _) => id }                      
+      .toArray
   }
 
   // ---------------------------------------------------------
   // GRAPH PROJECTION
   // ---------------------------------------------------------
   
-  def projectToGraph(srcColName: String, dstColName: String): org.awandb.core.graph.GraphTable = {
+  def projectToGraph(srcColName: String, dstColName: String): org.awandb.core.graph.GraphTable = withEpoch {
     val srcIdx = columnOrder.indexOf(srcColName)
     val dstIdx = columnOrder.indexOf(dstColName)
     
@@ -1010,7 +1129,7 @@ class AwanTable(
 
     // 1. Gather all active edges (Reads from both RAM and Disk, automatically skipping tombstones)
     val edges = scala.collection.mutable.ArrayBuffer[(Int, Int)]()
-    val it = scanAll()
+    val it = scanAll() // scanAll lazy iterator is safely consumed inside withEpoch
     
     while (it.hasNext) {
        val row = it.next()
@@ -1062,16 +1181,19 @@ class AwanTable(
   // AGGREGATION PUSHDOWNS (Zero-Allocation)
   // ---------------------------------------------------------
   
-  def countAll(): Long = {
+  def countAll(): Long = withEpoch {
     var count = 0L
+    var snapshotBlocks: List[Long] = Nil
+    
     rwLock.readLock().lock()
     try {
         if (columns.nonEmpty) {
             count += columns.values.head.deltaIntBuffer.length - ramDeleted.cardinality()
         }
+        snapshotBlocks = blockManager.getLoadedBlocks.toList
     } finally { rwLock.readLock().unlock() }
     
-    blockManager.getLoadedBlocks.foreach { ptr =>
+    snapshotBlocks.foreach { ptr =>
        val total = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
        val delBitset = blockManager.getDeletionBitSet(ptr)
        val delCount = if (delBitset == null) 0 else delBitset.cardinality()
@@ -1080,10 +1202,11 @@ class AwanTable(
     count
   }
 
-  def sumColumn(colName: String): Long = {
+  def sumColumn(colName: String): Long = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return 0L
     var sum = 0L
+    var snapshotBlocks: List[Long] = Nil
     
     rwLock.readLock().lock()
     try {
@@ -1093,10 +1216,10 @@ class AwanTable(
           if (!ramDeleted.get(i)) sum += colData(i)
           i += 1
        }
+       snapshotBlocks = blockManager.getLoadedBlocks.toList
     } finally { rwLock.readLock().unlock() }
     
-    val blocks = blockManager.getLoadedBlocks
-    blocks.foreach { ptr =>
+    snapshotBlocks.foreach { ptr =>
        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
        val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(ptr, colIdx)
        val data = new Array[Int](rowCount)
@@ -1116,7 +1239,7 @@ class AwanTable(
     sum
   }
 
-  def sumFilteredIds(colName: String, matchedIds: Array[Int]): Long = {
+  def sumFilteredIds(colName: String, matchedIds: Array[Int]): Long = withEpoch {
      val colIdx = columnOrder.indexOf(colName)
      if (colIdx == -1) return 0L
      var sum = 0L
@@ -1146,10 +1269,11 @@ class AwanTable(
      sum
   }
 
-  def maxColumn(colName: String): Int = {
+  def maxColumn(colName: String): Int = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return 0
     var max = Int.MinValue
+    var snapshotBlocks: List[Long] = Nil
     
     rwLock.readLock().lock()
     try {
@@ -1161,10 +1285,10 @@ class AwanTable(
           }
           i += 1
        }
+       snapshotBlocks = blockManager.getLoadedBlocks.toList
     } finally { rwLock.readLock().unlock() }
     
-    val blocks = blockManager.getLoadedBlocks
-    blocks.foreach { ptr =>
+    snapshotBlocks.foreach { ptr =>
        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
        val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(ptr, colIdx)
        val data = new Array[Int](rowCount)
@@ -1186,10 +1310,11 @@ class AwanTable(
     if (max == Int.MinValue && countAll() == 0) 0 else max
   }
 
-  def minColumn(colName: String): Int = {
+  def minColumn(colName: String): Int = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return 0
     var min = Int.MaxValue
+    var snapshotBlocks: List[Long] = Nil
     
     rwLock.readLock().lock()
     try {
@@ -1201,10 +1326,10 @@ class AwanTable(
           }
           i += 1
        }
+       snapshotBlocks = blockManager.getLoadedBlocks.toList
     } finally { rwLock.readLock().unlock() }
     
-    val blocks = blockManager.getLoadedBlocks
-    blocks.foreach { ptr =>
+    snapshotBlocks.foreach { ptr =>
        val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
        val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(ptr, colIdx)
        val data = new Array[Int](rowCount)
@@ -1226,7 +1351,7 @@ class AwanTable(
     if (min == Int.MaxValue && countAll() == 0) 0 else min
   }
 
-  def maxFilteredIds(colName: String, matchedIds: Array[Int]): Int = {
+  def maxFilteredIds(colName: String, matchedIds: Array[Int]): Int = withEpoch {
      val colIdx = columnOrder.indexOf(colName)
      if (colIdx == -1) return 0
      var max = Int.MinValue
@@ -1257,7 +1382,7 @@ class AwanTable(
      if (max == Int.MinValue && matchedIds.length == 0) 0 else max
   }
 
-  def minFilteredIds(colName: String, matchedIds: Array[Int]): Int = {
+  def minFilteredIds(colName: String, matchedIds: Array[Int]): Int = withEpoch {
      val colIdx = columnOrder.indexOf(colName)
      if (colIdx == -1) return 0
      var min = Int.MaxValue
