@@ -874,7 +874,8 @@ class AwanTable(
     }
 
     // 3. Disk Filter (Predicate Pushdown) safely protected by withEpoch
-    val diskIter = snapshotBlocks.flatMap { blockPtr =>
+    // [PHASE 1 FIX] Change .iterator to .toList to force eager materialization!
+    val diskList = snapshotBlocks.flatMap { blockPtr =>
        val rowCount = NativeBridge.getRowCount(blockPtr)
        val outIndicesPtr = NativeBridge.allocMainStore(rowCount * 4) // [FIX] Multiply by 4 for bytes
        
@@ -884,7 +885,7 @@ class AwanTable(
            val matchCount = NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
            
            if (matchCount == 0) {
-               Iterator.empty
+               List.empty[Array[Any]]
            } else {
                // 1. First, pull the exact matched row indices into Scala
                val matchingIndices = new Array[Int](matchCount)
@@ -907,21 +908,22 @@ class AwanTable(
                }
                
                // 4. Transpose the columnar arrays into rows purely in Scala (Zero JNI overhead)
+               // Eagerly materialize into a List
                (0 until matchCount).map { i =>
                    val row = new Array[Any](columnOrder.size)
                    for (c <- columnOrder.indices) {
                        row(c) = if (colsData(c) != null) colsData(c)(i) else null
                    }
                    row
-               }.toIterator
+               }.toList
            }
        } finally {
            NativeBridge.freeMainStore(outIndicesPtr)
            // Do NOT free bitmaskPtr here! BlockManager owns it.
        }
-    }.iterator
+    }.toList // Force execution inside the EBMM boundary
 
-    ramIter ++ diskIter
+    ramIter ++ diskList.iterator
   }
 
   /**
@@ -1005,12 +1007,12 @@ class AwanTable(
     try {
       // 1. Gather all pointers to retire BEFORE swapping (so we can find indices for filters)
       oldBlocks.foreach { ptr =>
-        epochManager.retire(ptr, isBlock = true) // [NEW] Mark as Block!
+        epochManager.retire(ptr, 1) // [FIX] resourceType 1 = Block Object
         
         // Retire the native bitmasks to prevent memory leaks (these are raw memory, not blocks)
         val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(ptr)
         val bitmaskPtr = blockManager.getNativeDeletionBitmap(ptr, rowCount)
-        if (bitmaskPtr != 0L) epochManager.retire(bitmaskPtr, isBlock = false) // [NEW] Mark as Raw Memory!
+        if (bitmaskPtr != 0L) epochManager.retire(bitmaskPtr, 0) // [FIX] resourceType 0 = Raw Memory
         
         // [UPDATED] Find the block index to retire ALL its Cuckoo Filters!
         val blockIdx = blockManager.getLoadedBlocks.indexOf(ptr)
@@ -1019,9 +1021,9 @@ class AwanTable(
           if (filterArray != null) {
             filterArray.foreach { filterPtr =>
                if (filterPtr != 0L) {
-                 // We can safely route Cuckoo Filters through standard 'free' (isBlock = false) 
-                 // because they are flat memory arrays.
-                 epochManager.retire(filterPtr, isBlock = false) 
+                 // [CRITICAL FIX] Route Cuckoo Filters to their explicit C++ destructor 
+                 // to prevent native heap corruption!
+                 epochManager.retire(filterPtr, 2) // [FIX] resourceType 2 = Cuckoo Filter Object
                }
             }
           }

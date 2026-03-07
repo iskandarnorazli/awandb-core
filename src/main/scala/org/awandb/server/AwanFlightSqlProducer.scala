@@ -208,95 +208,142 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
           if (table == null) throw CallStatus.NOT_FOUND.withDescription(s"Table '$tableName' does not exist.").toRuntimeException
 
           var totalRowsIngested = 0L
-          while (flightStream.next()) {
-            val root = flightStream.getRoot
-            val rowCount = root.getRowCount
+          
+          // [PHASE 1 FIX] Wrap the entire Arrow ingestion loop inside the EBMM Epoch boundary!
+          table.withEpoch {
+            while (flightStream.next()) {
+              val root = flightStream.getRoot
+              val rowCount = root.getRowCount
 
-            if (rowCount > 0) {
-              val incomingCols = scala.collection.mutable.Set[String]()
+              if (rowCount > 0) {
+                val incomingCols = scala.collection.mutable.Set[String]()
 
-              // 1. Ingest provided columns
-              for (colIdx <- 0 until root.getFieldVectors.size()) {
-                val vector = root.getVector(colIdx)
-                
-                val vectorName = vector.getName.toLowerCase
-                val colName = if (table.columns.contains(vectorName)) {
-                  vectorName
-                } else {
-                  table.columnOrder(colIdx)
-                }
+                // 1. Ingest provided columns
+                for (colIdx <- 0 until root.getFieldVectors.size()) {
+                  val vector = root.getVector(colIdx)
+                  
+                  val vectorName = vector.getName.toLowerCase
+                  val colName = if (table.columns.contains(vectorName)) {
+                    vectorName
+                  } else {
+                    table.columnOrder(colIdx)
+                  }
 
-                incomingCols.add(colName)
+                  incomingCols.add(colName)
 
-                vector match {
-                  case intVector: org.apache.arrow.vector.IntVector =>
-                    val batchData = new Array[Int](rowCount)
-                    var i = 0
-                    while (i < rowCount) { 
-                      batchData(i) = intVector.get(i)
-                      i += 1 
-                    }
-                    table.insertBatch(colName, batchData)
-                    
-                  // Add support for Vector Embeddings (ListVector of Floats)
-                  case listVector: org.apache.arrow.vector.complex.ListVector =>
-                    // Safely match the inner vector to prevent ClassCastExceptions
-                    listVector.getDataVector match {
-                      case innerVector: org.apache.arrow.vector.Float4Vector =>
-                        var i = 0
-                        while (i < rowCount) {
-                          // Check for null lists to prevent out-of-bounds reading
-                          if (listVector.isNull(i)) {
-                            table.columns(colName).insert(Array.empty[Float])
-                          } else {
-                            // Get the start and end index of the float array for this specific row
-                            val startIdx = listVector.getOffsetBuffer.getInt(i * 4L)
-                            val endIdx = listVector.getOffsetBuffer.getInt((i + 1) * 4L)
-                            val dim = endIdx - startIdx
-                            
-                            val floatArr = new Array[Float](dim)
-                            var j = 0
-                            while (j < dim) {
-                              floatArr(j) = innerVector.get(startIdx + j)
-                              j += 1
-                            }
-                            
-                            table.columns(colName).insert(floatArr)
-                          }
-                          i += 1
-                        }
-                      case _ =>
+                  vector match {
+                    case intVector: org.apache.arrow.vector.IntVector =>
+                      // [FIX] Validate schema before processing to prevent native crashes
+                      if (table.columns(colName).isString || table.columns(colName).isVector) {
                         root.clear()
                         throw CallStatus.INVALID_ARGUMENT
-                          .withDescription(s"Vector column '$colName' expects a List of Floats (Float4).")
+                          .withDescription(s"Unsupported Arrow stream type. Found: IntVector on column '$colName'")
                           .toRuntimeException
-                    }
+                      }
+
+                      val batchData = new Array[Int](rowCount)
+                      var i = 0
+                      while (i < rowCount) { 
+                        batchData(i) = intVector.get(i)
+                        i += 1 
+                      }
+                      table.insertBatch(colName, batchData)
                     
-                  case _ => 
-                    root.clear()
-                    throw CallStatus.INVALID_ARGUMENT.withDescription(s"Unsupported Arrow stream type. Found: ${vector.getClass.getSimpleName} on column '$colName'").toRuntimeException
+                    // [PHASE 2 FIX] Add support for String Ingestion
+                    case stringVector: org.apache.arrow.vector.VarCharVector =>
+                      // [FIX] Validate schema to prevent memory leaks and return 400 Bad Request
+                      if (!table.columns(colName).isString) {
+                        root.clear()
+                        throw CallStatus.INVALID_ARGUMENT
+                          .withDescription(s"Unsupported Arrow stream type. Found: VarCharVector on column '$colName'")
+                          .toRuntimeException
+                      }
+
+                      var i = 0
+                      while (i < rowCount) {
+                        val bytes = stringVector.get(i)
+                        val strVal = if (bytes == null) "" else new String(bytes, "UTF-8")
+                        table.columns(colName).insert(strVal)
+                        i += 1
+                      }
+                      
+                    // Add support for Vector Embeddings (ListVector of Floats)
+                    case listVector: org.apache.arrow.vector.complex.ListVector =>
+                      // [FIX] Validate schema
+                      if (!table.columns(colName).isVector) {
+                        root.clear()
+                        throw CallStatus.INVALID_ARGUMENT
+                          .withDescription(s"Unsupported Arrow stream type. Found: ListVector on column '$colName'")
+                          .toRuntimeException
+                      }
+
+                      // Safely match the inner vector to prevent ClassCastExceptions
+                      listVector.getDataVector match {
+                        case innerVector: org.apache.arrow.vector.Float4Vector =>
+                          var i = 0
+                          while (i < rowCount) {
+                            // Check for null lists to prevent out-of-bounds reading
+                            if (listVector.isNull(i)) {
+                              table.columns(colName).insert(Array.empty[Float])
+                            } else {
+                              // Get the start and end index of the float array for this specific row
+                              val startIdx = listVector.getOffsetBuffer.getInt(i * 4L)
+                              val endIdx = listVector.getOffsetBuffer.getInt((i + 1) * 4L)
+                              val dim = endIdx - startIdx
+                              
+                              val floatArr = new Array[Float](dim)
+                              var j = 0
+                              while (j < dim) {
+                                floatArr(j) = innerVector.get(startIdx + j)
+                                j += 1
+                              }
+                              
+                              table.columns(colName).insert(floatArr)
+                            }
+                            i += 1
+                          }
+                        case _ =>
+                          root.clear()
+                          throw CallStatus.INVALID_ARGUMENT
+                            .withDescription(s"Vector column '$colName' expects a List of Floats (Float4).")
+                            .toRuntimeException
+                      }
+                      
+                    case _ => 
+                      root.clear()
+                      throw CallStatus.INVALID_ARGUMENT.withDescription(s"Unsupported Arrow stream type. Found: ${vector.getClass.getSimpleName} on column '$colName'").toRuntimeException
+                  }
                 }
-              }
 
-              // 2. Pad missing columns with default values to maintain row alignment
-              val missingCols = table.columnOrder.filterNot(incomingCols.contains)
-              for (colName <- missingCols) {
-                 if (table.columns(colName).isVector) {
-                    val emptyVec = Array.empty[Float]
-                    var i = 0
-                    while (i < rowCount) {
-                       table.columns(colName).insert(emptyVec)
-                       i += 1
-                    }
-                 } else {
-                    val padData = new Array[Int](rowCount) 
-                    table.insertBatch(colName, padData)
-                 }
-              }
+                // 2. Pad missing columns with default values to maintain row alignment
+                val missingCols = table.columnOrder.filterNot(incomingCols.contains)
+                for (colName <- missingCols) {
+                   val col = table.columns(colName)
+                   if (col.isVector) {
+                      val emptyVec = Array.empty[Float]
+                      var i = 0
+                      while (i < rowCount) {
+                         col.insert(emptyVec)
+                         i += 1
+                      }
+                   } else if (col.isString) {
+                      // [PHASE 2 FIX] Properly pad missing string columns to avoid ClassCastExceptions
+                      var i = 0
+                      while (i < rowCount) {
+                         col.insert("")
+                         i += 1
+                      }
+                   } else {
+                      val padData = new Array[Int](rowCount) 
+                      table.insertBatch(colName, padData)
+                   }
+                }
 
-              totalRowsIngested += rowCount 
+                totalRowsIngested += rowCount 
+              }
             }
-          }
+          } // End of withEpoch block
+
           ackStream.onNext(PutResult.empty())
           ackStream.onCompleted()
 

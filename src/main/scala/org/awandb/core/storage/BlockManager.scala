@@ -188,7 +188,8 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
     } catch {
         case e: Throwable =>
-            NativeBridge.freeMainStore(blockPtr)
+            // [CRITICAL FIX] Use destroyBlock instead of freeMainStore to prevent native heap corruption
+            NativeBridge.destroyBlock(blockPtr) 
             throw e
     }
   }

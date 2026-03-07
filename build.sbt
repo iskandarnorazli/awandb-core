@@ -25,9 +25,6 @@ Test / javaOptions += s"-Djava.library.path=${baseDirectory.value}/lib/Release"
 // Forces SBT to spawn a brand new, pristine JVM for every single test suite.
 // This prevents C++ memory leaks, double-frees, and static state bleed.
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// JNI TEST ISOLATION CONFIGURATION
-// ---------------------------------------------------------------------------
 Test / fork := true
 Test / parallelExecution := false
 Test / testGrouping := {
@@ -58,6 +55,7 @@ val arrowVersion = "15.0.0"
 libraryDependencies ++= Seq(
   // Testing
   "org.scalatest" %% "scalatest" % "3.2.17" % Test,
+  "org.scalatestplus" %% "mockito-4-11" % "3.2.17.0" % Test, // Added Mockito integration
   
   // Parallel Collections (Required for Scala-side grouping/sorting)
   "org.scala-lang.modules" %% "scala-parallel-collections" % "1.0.4",

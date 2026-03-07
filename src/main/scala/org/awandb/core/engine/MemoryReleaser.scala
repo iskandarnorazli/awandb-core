@@ -16,16 +16,28 @@
 package org.awandb.core.engine.memory
 
 trait MemoryReleaser {
-  def free(ptr: Long): Unit
-  def freeBlock(ptr: Long): Unit
+  /**
+   * Frees native memory based on the resource type.
+   * @param ptr The native memory pointer.
+   * @param resourceType 0 = Raw Memory, 1 = Data Block, 2 = Cuckoo Filter
+   */
+  def free(ptr: Long, resourceType: Int): Unit
 }
 
 class NativeMemoryReleaser extends MemoryReleaser {
-  override def free(ptr: Long): Unit = {
-    org.awandb.core.jni.NativeBridge.freeMainStore(ptr)
-  }
-  
-  override def freeBlock(ptr: Long): Unit = { // [NEW]
-    org.awandb.core.jni.NativeBridge.destroyBlock(ptr)
+  override def free(ptr: Long, resourceType: Int): Unit = {
+    resourceType match {
+      case 0 => 
+        // Free raw memory buffers (e.g., bitmasks, temporary query buffers)
+        org.awandb.core.jni.NativeBridge.freeMainStore(ptr)
+      case 1 => 
+        // Invoke the C++ destructor for AwanDB Blocks
+        org.awandb.core.jni.NativeBridge.destroyBlock(ptr)
+      case 2 => 
+        // Invoke the C++ destructor for Cuckoo Filters
+        org.awandb.core.jni.NativeBridge.cuckooDestroy(ptr)
+      case _ => 
+        throw new IllegalArgumentException(s"Unknown resource type for memory reclamation: $resourceType")
+    }
   }
 }

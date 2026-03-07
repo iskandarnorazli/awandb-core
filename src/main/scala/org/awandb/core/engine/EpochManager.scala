@@ -28,9 +28,9 @@ class EpochManager(releaser: MemoryReleaser) {
   // Tracks which epoch each thread is currently operating in.
   private val localEpochs = new ConcurrentHashMap[Long, Long]()
 
-  // Memory waiting to be freed. Tuple of (MemoryPointer, RetiredEpoch, isBlock)
-  // [FIX] Update tuple to include an `isBlock: Boolean` flag
-  private val retirementList = new ConcurrentLinkedQueue[(Long, Long, Boolean)]()
+  // Memory waiting to be freed. Tuple of (MemoryPointer, RetiredEpoch, resourceType)
+  // [FIX] Update tuple to include `resourceType: Int` instead of `isBlock: Boolean`
+  private val retirementList = new ConcurrentLinkedQueue[(Long, Long, Int)]()
 
   // [NEW] Non-blocking lock for the garbage collector
   private val isReclaiming = new AtomicBoolean(false)
@@ -68,10 +68,10 @@ class EpochManager(releaser: MemoryReleaser) {
 
   /**
    * Marks a native pointer for deletion. It is NOT freed yet.
-   * [FIX] Add isBlock parameter with a default of false to safely differentiate object deletion
+   * [FIX] Add resourceType parameter: 0 = Raw, 1 = Block, 2 = Cuckoo
    */
-  def retire(ptr: Long, isBlock: Boolean = false): Unit = {
-    retirementList.offer((ptr, globalEpoch.get(), isBlock))
+  def retire(ptr: Long, resourceType: Int = 0): Unit = {
+    retirementList.offer((ptr, globalEpoch.get(), resourceType))
   }
 
   /**
@@ -91,9 +91,9 @@ class EpochManager(releaser: MemoryReleaser) {
       // We can only free memory that was retired strictly BEFORE the oldest active epoch.
       val it = retirementList.iterator()
       while (it.hasNext) {
-        val (ptr, retiredEpoch, isBlock) = it.next() // [NEW] Extract isBlock
+        val (ptr, retiredEpoch, resourceType) = it.next() // [NEW] Extract resourceType
         if (retiredEpoch < minActiveEpoch) {
-          if (isBlock) releaser.freeBlock(ptr) else releaser.free(ptr) // [NEW] Route correctly
+          releaser.free(ptr, resourceType) // [NEW] Route to unified releaser
           it.remove() // Remove from the queue
         }
       }
