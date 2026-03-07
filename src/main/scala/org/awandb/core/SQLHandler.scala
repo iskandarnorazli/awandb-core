@@ -434,11 +434,27 @@ object SQLHandler {
                 finalResultSeq = finalResultSeq.take(limitVal)
               }
             }
-
+            
             val sb = new StringBuilder()
             sb.append(s"\n   GROUP BY Results ($rawKey | SUM($rawValCol)):\n")
             finalResultSeq.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
-            return SQLResult(false, sb.toString(), finalResultSeq.size.toLong)
+            
+            // 🚀 DYNAMIC COLUMNAR TRANSPOSITION FOR GROUP BY
+            val outSchema = Array((keyCol, "INT"), (s"SUM($valCol)", "STRING"))
+            val numRows = finalResultSeq.size
+            val keyArr = new Array[Int](numRows)
+            val valArr = new Array[String](numRows)
+            
+            var i = 0
+            for ((k, v) <- finalResultSeq) {
+                keyArr(i) = k
+                valArr(i) = v.toString
+                i += 1
+            }
+            val columnarData = Array[Any](keyArr, valArr)
+
+            // Return the Native Columnar Arrays!
+            return SQLResult(false, sb.toString(), numRows.toLong, outSchema, columnarData)
           }
 
           // 1.5. CHECK FOR GRAPH BFS
@@ -712,7 +728,17 @@ object SQLHandler {
               val sb = new StringBuilder()
               sb.append(s"\n   Found Rows ($headers):\n")
               sb.append("   " + finalAggRow.mkString(" | ") + "\n")
-              return SQLResult(false, sb.toString(), 1L)
+              
+              // 🚀 DYNAMIC COLUMNAR TRANSPOSITION FOR PURE AGGREGATIONS
+              val outSchema = pushdownAggregators.map { case (f, c, r, alias) => 
+                 val header = if (alias != null) alias else if (r == "*") s"$f(*)" else s"$f($r)"
+                 (header, "STRING") 
+              }.toArray
+              
+              val columnarData = finalAggRow.map(v => Array[String](v)).toArray[Any]
+
+              // Return the Native Columnar Arrays!
+              return SQLResult(false, sb.toString(), 1L, outSchema, columnarData)
           }
 
           // -------------------------------------------------------
@@ -1013,19 +1039,29 @@ object SQLHandler {
              val tableName = drop.getName.getName.toLowerCase
              val table = tables.get(tableName)
              
-             if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
+             // 1. Clean up JVM memory if the table is currently loaded
+             if (table != null) {
+                 table.close() 
+                 tables.remove(tableName)
+             }
              
-             val dir = new java.io.File(table.dataDir)
-             
-             table.close() 
-             tables.remove(tableName)
+             // 2. ALWAYS wipe the directory from disk, even if the server just rebooted!
+             // Fallback to the standard data directory pattern if table was null
+             val dirPath = if (table != null) table.dataDir else s"data/$tableName"
+             val dir = new java.io.File(dirPath)
              
              def deleteRecursively(f: java.io.File): Unit = {
                if (f.isDirectory) {
                  val children = f.listFiles()
                  if (children != null) children.foreach(deleteRecursively)
                }
-               f.delete()
+               
+               // Windows File-Lock Defeater
+               if (f.exists() && !f.delete()) {
+                   System.gc() // Force JVM to release any lingering streams
+                   Thread.sleep(50) // Give the OS a millisecond to catch up
+                   f.delete() // Try again!
+               }
              }
              deleteRecursively(dir)
              

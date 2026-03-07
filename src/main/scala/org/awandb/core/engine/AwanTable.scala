@@ -407,7 +407,7 @@ class AwanTable(
     if (columnOrder.nonEmpty) insertBatch(columnOrder.head, values)
   }
 
-  // [NEW] Column-aware batch insertion that populates the Primary Index
+  // Column-aware batch insertion that populates the Primary Index
   def insertBatch(colName: String, values: Array[Int]): Unit = {
     rwLock.writeLock().lock()
     try {
@@ -433,6 +433,70 @@ class AwanTable(
           }
         }
       }
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 🚀 ZERO-COPY INGESTION PATH
+  // ---------------------------------------------------------
+  def insertBatchFromPointer(colName: String, dataPtr: Long, rowCount: Int): Unit = {
+    // 1. Allocate a single contiguous JVM array
+    val arr = new Array[Int](rowCount)
+    
+    // 2. Blast the data from Arrow's off-heap memory straight into the array via JNI
+    org.awandb.core.jni.NativeBridge.copyToScala(dataPtr, arr, rowCount)
+    
+    // 3. Route to the standard batch insert to ensure WAL logging and Primary Indexing
+    insertBatch(colName, arr)
+  }
+
+  // ---------------------------------------------------------
+  // 🚀 TRUE ZERO-COPY BULK INGESTION (Bypasses WAL & Delta Store)
+  // ---------------------------------------------------------
+  def bulkLoadFromArrowPointers(colNames: Array[String], rawPointers: Array[Long], rowCount: Int): Unit = {
+    rwLock.writeLock().lock()
+    try {
+      if (isClosed) throw new IllegalStateException("Table is closed")
+
+      // 1. Align the incoming Arrow pointers with the physical table.columnOrder
+      val alignedPointers = new Array[Long](columnOrder.size)
+      val colTypes = new Array[Int](columnOrder.size)
+
+      for (i <- columnOrder.indices) {
+        val name = columnOrder(i)
+        val inIdx = colNames.indexOf(name)
+        if (inIdx == -1) throw new IllegalArgumentException(s"Missing column in bulk load: $name")
+        
+        alignedPointers(i) = rawPointers(inIdx)
+
+        val col = columns(name)
+        if (col.isVector) colTypes(i) = 3
+        else if (col.isString) colTypes(i) = 2
+        else colTypes(i) = 0
+      }
+
+      // 2. Delegate to BlockManager for 100% Native C++ block creation & memcpy
+      val blockPtr = blockManager.createAndPersistBlockFromPointers(rowCount, colTypes, alignedPointers)
+
+      // 3. Update Primary Index (Fetch ONLY the ID column into the JVM)
+      if (blockPtr != 0L) {
+        val idColIdx = 0 // Assuming Col 0 is PK
+        val idDestPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, idColIdx)
+
+        val idArray = new Array[Int](rowCount)
+        org.awandb.core.jni.NativeBridge.copyToScala(idDestPtr, idArray, rowCount)
+
+        val newBlockIdx = blockManager.getLoadedBlocks.size - 1
+
+        var i = 0
+        while (i < rowCount) {
+          primaryIndex.put(idArray(i), packLocation(newBlockIdx, i))
+          i += 1
+        }
+      }
+      
     } finally {
       rwLock.writeLock().unlock()
     }
@@ -1652,6 +1716,10 @@ class AwanTable(
     } finally {
       rwLock.writeLock().unlock()
     }
+    
+    // [CRITICAL FIX] Wait for the daemon to fully die before allowing JVM to delete files!
+    // We do this OUTSIDE the write lock to prevent deadlocks.
+    try { daemonThread.join(2000) } catch { case _: Exception => }
   }
 
   def persist(dir: String): Unit = flush() 

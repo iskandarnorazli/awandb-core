@@ -194,6 +194,54 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     }
   }
 
+  /**
+   * [TRUE ZERO-COPY] Create and Persist Block directly from Off-Heap Pointers.
+   * Bypasses the JVM Heap entirely.
+   */
+  def createAndPersistBlockFromPointers(rowCount: Int, colTypes: Array[Int], pointers: Array[Long]): Long = {
+    if (rowCount == 0) return 0L
+    val colCount = colTypes.length
+
+    val colSizesBytes = new Array[Int](colCount)
+    for (i <- 0 until colCount) {
+      colTypes(i) match {
+        case 0 => colSizesBytes(i) = rowCount * 4 // INT is 4 bytes
+        case _ => throw new UnsupportedOperationException("Only INT supported for True Zero-Copy Bulk Load right now.")
+      }
+    }
+
+    // 1. Allocate the C++ Block natively
+    val blockPtr = NativeBridge.createBlock(rowCount, colCount, colSizesBytes)
+
+    try {
+      // 2. Blast memory from Arrow directly into the C++ Column offsets!
+      for (colIdx <- 0 until colCount) {
+        val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+        NativeBridge.memcpy(pointers(colIdx), colPtr, colSizesBytes(colIdx))
+      }
+
+      // 3. Save to disk (This implicitly computes Min/Max Zone Maps via C++)
+      val currentId = blockCounter.getAndIncrement()
+      val filename = router.getPathForBlock(currentId)
+      val saved = NativeBridge.saveColumn(blockPtr, NativeBridge.getBlockSize(blockPtr), filename)
+
+      if (!saved) throw new RuntimeException(s"Failed to save block: $filename")
+
+      loadedBlocks.add(blockPtr)
+
+      // Queue for Cuckoo Filter generation
+      if (enableIndex && rowCount > 0) {
+        pendingIndexes.offer(loadedBlocks.size() - 1)
+      }
+
+      blockPtr
+    } catch {
+      case e: Throwable =>
+        NativeBridge.destroyBlock(blockPtr)
+        throw e
+    }
+  }
+
   // Schema-Aware Index Builder
   def buildPendingIndexes(isVectorFlags: Array[Boolean]): Int = {
     val blockIdx = pendingIndexes.poll()
