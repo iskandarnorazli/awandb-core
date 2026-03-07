@@ -950,6 +950,72 @@ class AwanTable(
     ramIds.toArray ++ diskIds
   }
 
+  // ---------------------------------------------------------
+  // NATIVE MATH PUSHDOWN (UPDATE)
+  // ---------------------------------------------------------
+  def executeMathUpdate(colName: String, opChar: Char, operand: Int, matchedIds: Array[Int]): Unit = withEpoch {
+    val colIdx = columnOrder.indexOf(colName)
+    if (colIdx == -1 || columns(colName).isString || columns(colName).isVector) return
+
+    rwLock.writeLock().lock()
+    try {
+      if (isClosed) throw new IllegalStateException("Table is closed")
+
+      // Group IDs by their physical block location
+      val blockGroups = scala.collection.mutable.Map[Int, scala.collection.mutable.ArrayBuffer[Int]]()
+      
+      var i = 0
+      while (i < matchedIds.length) {
+        val packedLoc = primaryIndex.get(matchedIds(i))
+        if (packedLoc != null) {
+          val bIdx = unpackBlockIdx(packedLoc)
+          val rId = unpackRowId(packedLoc)
+          blockGroups.getOrElseUpdate(bIdx, scala.collection.mutable.ArrayBuffer[Int]()).append(rId)
+        }
+        i += 1
+      }
+
+      // 1. Update RAM (Block -1)
+      blockGroups.get(-1).foreach { ramRowIds =>
+        val ramBuffer = columns(colName).deltaIntBuffer
+        ramRowIds.foreach { rId =>
+          if (!ramDeleted.get(rId)) {
+            opChar match {
+              case '+' => ramBuffer(rId) += operand
+              case '-' => ramBuffer(rId) -= operand
+              case '*' => ramBuffer(rId) *= operand
+              case '/' => if (operand != 0) ramBuffer(rId) /= operand
+            }
+          }
+        }
+      }
+
+      // 2. Update Disk Blocks via Native AVX Engine
+      blockGroups.foreach { case (bIdx, diskRowIds) =>
+        if (bIdx != -1) {
+          val blockPtr = blockManager.getBlockPtr(bIdx)
+          if (blockPtr != 0L) {
+             val matchCount = diskRowIds.length
+             val tempIndicesPtr = NativeBridge.allocMainStore(matchCount)
+             
+             try {
+                // Copy the specific Row IDs to a C++ buffer
+                NativeBridge.loadData(tempIndicesPtr, diskRowIds.toArray)
+                
+                // Blast the math natively!
+                NativeBridge.avxUpdateMath(blockPtr, colIdx, opChar, operand, tempIndicesPtr, matchCount)
+             } finally {
+                NativeBridge.freeMainStore(tempIndicesPtr)
+             }
+          }
+        }
+      }
+
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
   def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Iterator.empty

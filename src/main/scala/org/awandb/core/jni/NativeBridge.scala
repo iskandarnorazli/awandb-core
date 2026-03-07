@@ -152,6 +152,12 @@ class NativeBridge {
   @native def csrBfsNative(rowPtrs: Long, colIdxs: Long, numVertices: Int, startNode: Int, outDistances: Long): Unit
 
   @native def avxCompositeFilterNative(blockPtr: Long, rpnInstructions: Array[Int], outIndicesPtr: Long, deletedBitmaskPtr: Long): Int
+
+  // --- SCALAR PROJECTION ENGINES ---
+  @native def applyScalarNative(dataPtr: Long, count: Int, widthBytes: Int, funcName: String): Unit
+
+  // --- NATIVE MATH MUTATION ---
+  @native def avxUpdateMathNative(blockPtr: Long, colIdx: Int, opChar: Char, operand: Int, indicesPtr: Long, count: Int): Unit
 }
 
 // -----------------------------------------------------------
@@ -454,5 +460,19 @@ object NativeBridge {
   def avxCompositeFilter(blockPtr: Long, rpnInstructions: Array[Int], outIndicesPtr: Long, deletedBitmaskPtr: Long): Int = {
   if (blockPtr == 0) return 0
   instance.avxCompositeFilterNative(blockPtr, rpnInstructions, outIndicesPtr, deletedBitmaskPtr)
-}
+  }
+
+  // --- SCALAR PROJECTION ENGINES ---
+  def applyScalar(dataPtr: Long, count: Int, widthBytes: Int, funcName: String): Unit = {
+    if (dataPtr != 0 && count > 0) {
+      instance.applyScalarNative(dataPtr, count, widthBytes, funcName)
+    }
+  }
+
+  // --- NATIVE MATH MUTATION ---
+  def avxUpdateMath(blockPtr: Long, colIdx: Int, opChar: Char, operand: Int, indicesPtr: Long, count: Int): Unit = {
+    if (blockPtr != 0 && count > 0) {
+      instance.avxUpdateMathNative(blockPtr, colIdx, opChar, operand, indicesPtr, count)
+    }
+  }
 }

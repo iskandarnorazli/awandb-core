@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include <limits>
+#include <string>
 
 // --- ARCHITECTURE SPECIFIC HEADERS ---
 #ifdef ARCH_X86
@@ -599,5 +600,105 @@ extern "C" {
             }
         }
         return matchCount;
+    }
+
+    // ==========================================================
+    // IN-PLACE SCALAR PROJECTION (ABS, NEGATE, SQUARE)
+    // ==========================================================
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_applyScalarNative(
+        JNIEnv* env, jobject obj, jlong dataPtr, jint count, jint widthBytes, jstring jFuncName
+    ) {
+        if (dataPtr == 0 || count <= 0) return;
+        
+        const char* funcName = env->GetStringUTFChars(jFuncName, nullptr);
+        std::string func(funcName);
+        env->ReleaseStringUTFChars(jFuncName, funcName);
+        
+        if (widthBytes == 4) { // 32-bit Integers
+            int32_t* data = (int32_t*)dataPtr;
+            if (func == "ABS") {
+                for (int i = 0; i < count; i++) {
+                    if (data[i] < 0) data[i] = -data[i];
+                }
+            } else if (func == "NEGATE") {
+                for (int i = 0; i < count; i++) {
+                    data[i] = -data[i];
+                }
+            } else if (func == "SQUARE") {
+                for (int i = 0; i < count; i++) {
+                    data[i] = data[i] * data[i];
+                }
+            }
+            // (Note: AVX intrinsics can be dropped in here later for 10x speedups)
+            
+        } else if (widthBytes == 8) { // 64-bit Longs (Result of Aggregations)
+            int64_t* data = (int64_t*)dataPtr;
+            if (func == "ABS") {
+                for (int i = 0; i < count; i++) {
+                    if (data[i] < 0) data[i] = -data[i];
+                }
+            } else if (func == "NEGATE") {
+                for (int i = 0; i < count; i++) {
+                    data[i] = -data[i];
+                }
+            } else if (func == "SQUARE") {
+                for (int i = 0; i < count; i++) {
+                    data[i] = data[i] * data[i];
+                }
+            }
+        }
+    }
+
+    // ==========================================================
+    // IN-PLACE AVX MATH MUTATION (UPDATE SET col = col + X)
+    // ==========================================================
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxUpdateMathNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jchar opChar, jint operand, jlong indicesPtr, jint count
+    ) {
+        if (blockPtr == 0 || indicesPtr == 0 || count <= 0) return;
+
+        uint8_t* basePtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)basePtr;
+        
+        if (colIdx < 0 || colIdx >= (int)header->column_count) return;
+
+        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
+        ColumnHeader& col = colHeaders[colIdx];
+        
+        if (col.type != TYPE_INT || col.data_offset == 0) return; // Only support Int math for now
+
+        int32_t* data = (int32_t*)(basePtr + col.data_offset);
+        int32_t* indices = (int32_t*)indicesPtr;
+
+        // Perform Math based on Operator
+        // [Optimization] We use a switch outside the loop to keep the inner loop branchless
+        switch (opChar) {
+            case '+':
+                for (int i = 0; i < count; i++) data[indices[i]] += operand;
+                break;
+            case '-':
+                for (int i = 0; i < count; i++) data[indices[i]] -= operand;
+                break;
+            case '*':
+                for (int i = 0; i < count; i++) data[indices[i]] *= operand;
+                break;
+            case '/':
+                if (operand != 0) { // Safe-guard against Division by Zero
+                    for (int i = 0; i < count; i++) data[indices[i]] /= operand;
+                }
+                break;
+        }
+
+        // Recompute Zone Maps (Min/Max) after bulk update
+        int32_t currentMin = std::numeric_limits<int32_t>::max();
+        int32_t currentMax = std::numeric_limits<int32_t>::min();
+        int totalRows = header->row_count;
+        
+        for (int i = 0; i < totalRows; i++) {
+            if (data[i] < currentMin) currentMin = data[i];
+            if (data[i] > currentMax) currentMax = data[i];
+        }
+        col.min_int = currentMin;
+        col.max_int = currentMax;
     }
 }

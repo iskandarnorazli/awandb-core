@@ -57,6 +57,14 @@ import org.awandb.core.query.{
   HashJoinProbeOperator,
   TableScanOperator
 }
+import net.sf.jsqlparser.expression.operators.arithmetic.{
+  Addition,
+  Subtraction,
+  Multiplication,
+  Division
+}
+import net.sf.jsqlparser.expression.operators.relational.ParenthesedExpressionList
+import net.sf.jsqlparser.statement.select.ParenthesedSelect
 import org.awandb.core.jni.NativeBridge
 import scala.jdk.CollectionConverters._
 
@@ -195,10 +203,60 @@ object SQLHandler {
                val colName = cleanColName(rawName)
                if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
                
-               val inStr = in.toString 
-               val content = inStr.substring(inStr.indexOf('(') + 1, inStr.lastIndexOf(')'))
-               val targetVals = content.split(",").map(_.trim.replace("'", "")).toSet
+               // [FIX] In JSqlParser 4.7+, we use getRightExpression() instead of getRightItemsList()
+               val rightExpr = in.getRightExpression
 
+               // Determine the target values by evaluating the right side of the IN clause
+               val targetVals: Set[String] = rightExpr match {
+                   
+                   // SCENARIO 1: Standard List -> IN ('A', 'B', 'C')
+                   case exprList: ParenthesedExpressionList[_] =>
+                       // [FIX] ExpressionList now directly extends java.util.List
+                       exprList.asScala.map {
+                           case s: StringValue => s.getValue
+                           case l: LongValue => l.getValue.toString
+                           case e => e.toString
+                       }.toSet
+
+                   // SCENARIO 2: Recursive Subquery -> IN (SELECT id FROM other_table WHERE ...)
+                   case subSelect: ParenthesedSelect =>
+                       // [FIX] Extract the PlainSelect from the new Parenthesed wrapper
+                       val plain = subSelect.getSelect.asInstanceOf[PlainSelect]
+                       val subTableName = plain.getFromItem.asInstanceOf[Table].getName.toLowerCase
+                       val subTable = tables.get(subTableName)
+                       if (subTable == null) throw new RuntimeException(s"Subquery Error: Table '$subTableName' not found.")
+
+                       // Identify which column the subquery is projecting
+                       val selectItem = plain.getSelectItems.get(0)
+                       val subColRaw = selectItem.getExpression.asInstanceOf[Column].getFullyQualifiedName
+                       val subColName = cleanColName(subColRaw)
+                       val subColIdx = subTable.columnOrder.indexOf(subColName)
+
+                       if (subColIdx == -1) throw new RuntimeException(s"Subquery Error: Column '$subColName' not found.")
+
+                       // RECURSION: Evaluate the subquery's WHERE clause to get matching IDs natively!
+                       val subWhere = plain.getWhere
+                       val subMatchedIds = if (subWhere == null) {
+                           subTable.scanFilteredIds(subTable.columnOrder.head, 2, 0)
+                       } else {
+                           val subAst = parseWhere(subWhere, subTable) // Recursion happens here
+                           subTable.executeCompositeFilter(subAst.toRPN(subTable))
+                       }
+
+                       // Extract the physical values from the subquery's matched rows
+                       val vals = scala.collection.mutable.Set[String]()
+                       for (id <- subMatchedIds) {
+                           val rowOpt = subTable.getRow(id)
+                           if (rowOpt.isDefined) {
+                               vals.add(rowOpt.get(subColIdx).toString)
+                           }
+                       }
+                       vals.toSet
+
+                   case _ => throw new RuntimeException(s"Unsupported IN clause format: ${rightExpr.getClass.getSimpleName}")
+               }
+
+               // Finally, evaluate the Outer Query's IN filter using the resolved targetVals
                val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
                val colIdx = table.columnOrder.indexOf(colName)
                
@@ -206,6 +264,7 @@ object SQLHandler {
                   val rowOpt = table.getRow(id)
                   rowOpt.isDefined && targetVals.contains(rowOpt.get(colIdx).toString)
                }
+               
                MaterializedAST(matched)
 
             case like: LikeExpression =>
@@ -249,6 +308,31 @@ object SQLHandler {
          }
       }
 
+      // ---------------------------------------------------------
+      // QUERY ROUTER: O(1) PK vs O(N) AVX Pushdown
+      // ---------------------------------------------------------
+      def executeWhereFast(where: Expression, table: AwanTable): Array[Int] = {
+        if (where == null) return table.scanFilteredIds(table.columnOrder.head, 2, 0)
+
+        // O(1) PRIMARY KEY FAST-PATH
+        where match {
+          case eq: EqualsTo if eq.getLeftExpression.isInstanceOf[Column] && eq.getRightExpression.isInstanceOf[LongValue] =>
+            val rawName = eq.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
+            val colName = cleanColName(rawName)
+            
+            // If the query is exactly `WHERE id = X`, bypass AVX entirely and do a Hash Map lookup
+            if (colName == table.columnOrder.head) {
+              val targetVal = eq.getRightExpression.asInstanceOf[LongValue].getValue.toInt
+              return if (table.getRow(targetVal).isDefined) Array(targetVal) else Array.empty[Int]
+            }
+          case _ => // Fall through to AST compiler
+        }
+
+        // Standard O(N) AVX Composite Filter Pushdown
+        val ast = parseWhere(where, table)
+        table.executeCompositeFilter(ast.toRPN(table))
+      }
+
       statement match {
         case select: Select =>
           val plain = select.getSelectBody.asInstanceOf[PlainSelect]
@@ -280,9 +364,46 @@ object SQLHandler {
             val resultMap = leftTable.executeGroupBy(keyCol, valCol)
             if (resultMap.isEmpty) return SQLResult(false, "   GROUP BY Results: (Empty)", 0L)
 
-            // --- [NEW] Apply ORDER BY and LIMIT to GROUP BY results ---
             var finalResultSeq = resultMap.toSeq
 
+            // ---------------------------------------------------------
+            // [NEW] HAVING Clause Evaluator (Scala-side execution)
+            // ---------------------------------------------------------
+            val havingExpr = plain.getHaving
+            if (havingExpr != null) {
+                
+                // Recursive evaluator for the HAVING AST
+                def evaluateHaving(expr: Expression, k: Int, v: Long): Boolean = {
+                    def extractValue(e: Expression): Long = e match {
+                        case l: LongValue => l.getValue
+                        case f: Function if f.getName.toUpperCase == "SUM" => v
+                        case c: Column if cleanColName(c.getFullyQualifiedName) == keyCol => k.toLong
+                        case p: Parenthesis => extractValue(p.getExpression)
+                        case _ => throw new RuntimeException(s"Unsupported expression in HAVING: $e")
+                    }
+
+                    expr match {
+                        case p: Parenthesis => evaluateHaving(p.getExpression, k, v)
+                        case and: AndExpression => evaluateHaving(and.getLeftExpression, k, v) && evaluateHaving(and.getRightExpression, k, v)
+                        case or: OrExpression => evaluateHaving(or.getLeftExpression, k, v) || evaluateHaving(or.getRightExpression, k, v)
+                        
+                        case gt: GreaterThan => extractValue(gt.getLeftExpression) > extractValue(gt.getRightExpression)
+                        case gte: GreaterThanEquals => extractValue(gte.getLeftExpression) >= extractValue(gte.getRightExpression)
+                        case lt: MinorThan => extractValue(lt.getLeftExpression) < extractValue(lt.getRightExpression)
+                        case lte: MinorThanEquals => extractValue(lte.getLeftExpression) <= extractValue(lte.getRightExpression)
+                        case eq: EqualsTo => extractValue(eq.getLeftExpression) == extractValue(eq.getRightExpression)
+                        case neq: net.sf.jsqlparser.expression.operators.relational.NotEqualsTo => 
+                             extractValue(neq.getLeftExpression) != extractValue(neq.getRightExpression)
+                             
+                        case _ => throw new RuntimeException(s"Unsupported operator in HAVING: ${expr.getClass.getSimpleName}")
+                    }
+                }
+
+                // Filter the grouped results in memory
+                finalResultSeq = finalResultSeq.filter { case (k, v) => evaluateHaving(havingExpr, k, v) }
+            }
+
+            // --- Apply ORDER BY and LIMIT to GROUP BY results ---
             // Handle ORDER BY
             val orderByElements = plain.getOrderByElements
             if (orderByElements != null && !orderByElements.isEmpty) {
@@ -489,17 +610,22 @@ object SQLHandler {
           val isAsterisk = plain.getSelectItems.get(0).toString == "*"
           
           // [FIX] Added a 4th String tuple element to hold the Alias
+          val AGGREGATES = Set("SUM", "AVG", "MAX", "MIN", "COUNT")
           val pushdownAggregators = scala.collection.mutable.ArrayBuffer[(String, String, String, String)]() 
+          
+          // [NEW] Track scalar projections
+          val scalarProjections = scala.collection.mutable.ArrayBuffer[(String, String, String)]() 
           var isPureAggregation = true 
           
           if (!isAsterisk) {
              for (item <- plain.getSelectItems.asScala) {
                  val expr = item.getExpression
-                 // [FIX] Extract the alias here
                  val alias = if (item.getAlias != null) item.getAlias.getName else null
 
                  if (expr != null && expr.isInstanceOf[Function]) {
                      val func = expr.asInstanceOf[Function]
+                     val funcName = func.getName.toUpperCase
+                     
                      val rawParam = if (func.isAllColumns) "*" else {
                          val params = func.getParameters
                          if (params != null && params.getExpressions != null && params.getExpressions.size() > 0) {
@@ -511,8 +637,15 @@ object SQLHandler {
                              }
                          } else "*"
                      }
-                     // [FIX] Append the alias to the list
-                     pushdownAggregators.append((func.getName.toUpperCase, cleanColName(rawParam), rawParam, alias))
+
+                     if (AGGREGATES.contains(funcName)) {
+                         // It's a true aggregate (SUM, MAX, COUNT, etc.)
+                         pushdownAggregators.append((funcName, cleanColName(rawParam), rawParam, alias))
+                     } else {
+                         // It's a row-level scalar (UPPER, ROUND, etc.)
+                         isPureAggregation = false
+                         scalarProjections.append((funcName, cleanColName(rawParam), alias))
+                     }
                  } else {
                      isPureAggregation = false
                  }
@@ -523,12 +656,8 @@ object SQLHandler {
 
           // FAST PATH: Pure Aggregation (No GROUP BY, No raw columns requested)
           if (isPureAggregation && groupBy == null && pushdownAggregators.nonEmpty) {
-              val matchedIds = if (where != null) {
-                  val ast = parseWhere(where, leftTable)
-                  leftTable.executeCompositeFilter(ast.toRPN(leftTable))
-               } else {
-                  null
-               }
+              // [FIX] Use the O(1) Router, but keep null check to preserve O(1) countAll()
+              val matchedIds = if (where != null) executeWhereFast(where, leftTable) else null
               
               // O(1) Count resolution!
               val count = if (matchedIds != null) matchedIds.length.toLong else leftTable.countAll()
@@ -587,8 +716,8 @@ object SQLHandler {
               leftTable.scanFiltered(leftTable.columnOrder.head, 2, 0).toSeq
           } else {
               try { 
-                  val ast = parseWhere(where, leftTable)
-                  val matchedIds = leftTable.executeCompositeFilter(ast.toRPN(leftTable))
+                  // [FIX] Route to O(1) Interceptor
+                  val matchedIds = executeWhereFast(where, leftTable)
                   matchedIds.flatMap(id => leftTable.getRow(id)).toSeq
               } 
               catch { case e: RuntimeException => return SQLResult(true, "Error: " + e.getMessage) }
@@ -888,16 +1017,12 @@ object SQLHandler {
           if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
           
           val where = delete.getWhere
-          // [FIX] Execute the AST to get the raw Array[Int]
-          val idsToDelete = if (where == null) {
-             table.scanFilteredIds(table.columnOrder.head, 2, 0)
-          } else {
-             val ast = parseWhere(where, table)
-             table.executeCompositeFilter(ast.toRPN(table))
-          }
+          
+          // [FIX] Route to O(1) Interceptor for fast Primary Key deletion
+          val idsToDelete = executeWhereFast(where, table)
           
           var affected = 0L
-          for (id <- idsToDelete) { // Now this is safely an Array[Int]
+          for (id <- idsToDelete) { 
              if (table.delete(id)) affected += 1
           }
           
@@ -909,13 +1034,9 @@ object SQLHandler {
            if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
            
            val where = update.getWhere
-           // [FIX] Execute the AST to get the raw Array[Int]
-           val idsToUpdate = if (where == null) {
-              table.scanFilteredIds(table.columnOrder.head, 2, 0)
-           } else {
-              val ast = parseWhere(where, table)
-              table.executeCompositeFilter(ast.toRPN(table))
-           }
+           
+           // [FIX] Route to O(1) Interceptor
+           val idsToUpdate = executeWhereFast(where, table)
 
            val cols = update.getColumns.asScala
            val exprs = update.getExpressions.asScala
@@ -923,24 +1044,73 @@ object SQLHandler {
            var affected = 0L
            val sb = new StringBuilder()
            if (hasReturning) sb.append(s"\n   Found Rows:\n")
-           
+
+           // ---------------------------------------------------------
+           // AVX MATH INTERCEPTOR (Fast Path)
+           // ---------------------------------------------------------
+           val standardCols = scala.collection.mutable.ArrayBuffer[Column]()
+           val standardExprs = scala.collection.mutable.ArrayBuffer[Expression]()
+           var mathPushedDown = false
+
+           for (i <- cols.indices) {
+              val rawName = cols(i).getFullyQualifiedName
+              val colName = cleanColName(rawName)
+              val expr = exprs(i)
+
+              expr match {
+                  case add: Addition if add.getRightExpression.isInstanceOf[LongValue] =>
+                      table.executeMathUpdate(colName, '+', add.getRightExpression.asInstanceOf[LongValue].getValue.toInt, idsToUpdate)
+                      mathPushedDown = true
+                  case sub: Subtraction if sub.getRightExpression.isInstanceOf[LongValue] =>
+                      table.executeMathUpdate(colName, '-', sub.getRightExpression.asInstanceOf[LongValue].getValue.toInt, idsToUpdate)
+                      mathPushedDown = true
+                  case mul: Multiplication if mul.getRightExpression.isInstanceOf[LongValue] =>
+                      table.executeMathUpdate(colName, '*', mul.getRightExpression.asInstanceOf[LongValue].getValue.toInt, idsToUpdate)
+                      mathPushedDown = true
+                  case div: Division if div.getRightExpression.isInstanceOf[LongValue] =>
+                      table.executeMathUpdate(colName, '/', div.getRightExpression.asInstanceOf[LongValue].getValue.toInt, idsToUpdate)
+                      mathPushedDown = true
+                  case _ =>
+                      // Not a math operation, keep it for the standard row-by-row update loop
+                      standardCols.append(cols(i))
+                      standardExprs.append(expr)
+              }
+           }
+
+           // If the entire UPDATE statement was just AVX math, skip the JVM loop entirely!
+           if (standardCols.isEmpty && mathPushedDown) {
+               affected = idsToUpdate.length
+               if (hasReturning) {
+                   for (id <- idsToUpdate) {
+                       val rowOpt = table.getRow(id)
+                       if (rowOpt.isDefined) sb.append("   " + rowOpt.get.mkString(" | ") + "\n")
+                   }
+                   return SQLResult(false, sb.toString(), affected)
+               } else {
+                   return SQLResult(false, s"Updated $affected rows (AVX Math Engine).", affected)
+               }
+           }
+
+           // ---------------------------------------------------------
+           // STANDARD TUPLE RECONSTRUCTION (Slow Path for Strings/Mixed)
+           // ---------------------------------------------------------
            for (id <- idsToUpdate) {
               val oldRowOpt = table.getRow(id)
-              // ... rest of the update logic ...
               if (oldRowOpt.isDefined) {
                  val row = oldRowOpt.get
-                 for (i <- cols.indices) {
-                    val rawName = cols(i).getFullyQualifiedName
+                 for (i <- standardCols.indices) {
+                    val rawName = standardCols(i).getFullyQualifiedName
                     val colName = cleanColName(rawName)
                     val colIdx = table.columnOrder.indexOf(colName)
                     if (colIdx != -1) {
-                        exprs(i) match {
+                        standardExprs(i) match {
                             case l: LongValue => row(colIdx) = l.getValue.toInt
                             case s: StringValue => row(colIdx) = s.getValue
                             case _ => // Ignore unsupported types
                         }
                     }
                  }
+                 // Physically delete and re-insert the modified row
                  table.delete(id)
                  table.insertRow(row)
                  affected += 1
