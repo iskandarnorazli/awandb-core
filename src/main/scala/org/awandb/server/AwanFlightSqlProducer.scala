@@ -11,6 +11,7 @@ import org.awandb.core.sql.SQLHandler
 import scala.jdk.CollectionConverters._
 import org.apache.arrow.vector.IntVector
 import org.apache.arrow.flight.{CallStatus, FlightRuntimeException, FlightStream, PutResult}
+import org.awandb.server.middleware.FormatMiddleware
 
 class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) extends FlightSqlProducer {
 
@@ -54,22 +55,97 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       // PHASE 2 (Engine Execution Boundary)
       AwanDBInternalProfiler.stampPhase2()
       
-      // [FIX 3] Hard failure on actual boolean error
+      // Hard failure on actual boolean error
       if (result.isError) {
         throw new IllegalArgumentException(result.message)
       }
 
-      val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
-      root = VectorSchemaRoot.create(schema, allocator)
-      
-      // [BUG FIX 1] Check affectedRows directly to see if result set is empty
+      // 1. Intercept the Requested Format from Middleware
+      val mw = context.getMiddleware(FormatMiddleware.Key)
+      val format = if (mw != null) mw.asInstanceOf[FormatMiddleware].getFormat() else "string"
+
       if (result.affectedRows == 0L) {
         // [EMPTY PATH] Safely close stream without sending data payloads
+        // Must return the correct schema format even if empty, otherwise Pandas/Polars will crash!
+        val emptySchema = if (format == "arrow") {
+           new Schema(result.schema.map { case (colName, colType) =>
+              val arrowType = colType match {
+                case "INT" => new ArrowType.Int(32, true)
+                case "STRING" => new ArrowType.Utf8()
+                case _ => new ArrowType.Utf8()
+              }
+              Field.nullable(colName, arrowType)
+           }.toList.asJava)
+        } else {
+           new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
+        }
+        
+        root = VectorSchemaRoot.create(emptySchema, allocator)
         root.setRowCount(0)
         listener.start(root) // Sends the Schema only
         listener.completed()
-      } else {
-        // [DATA PATH] Send the row payload
+      } 
+      else if (format == "arrow") {
+        // ---------------------------------------------------------
+        // [OLAP PATH] DYNAMIC COLUMNAR ARROW PAYLOAD
+        // ---------------------------------------------------------
+        val fields = result.schema.map { case (colName, colType) =>
+          val arrowType = colType match {
+            case "INT" => new ArrowType.Int(32, true)
+            case "STRING" => new ArrowType.Utf8()
+            case _ => new ArrowType.Utf8() // Fallback
+          }
+          Field.nullable(colName, arrowType)
+        }.toList.asJava
+
+        val schema = new Schema(fields)
+        root = VectorSchemaRoot.create(schema, allocator)
+        val rowCount = result.affectedRows.toInt
+        root.setRowCount(rowCount)
+
+        // Populate Arrow Vectors natively from the transposed arrays
+        for (c <- result.schema.indices) {
+            val vector = root.getVector(c)
+            val colType = result.schema(c)._2
+            val rawData = result.columnarData(c)
+
+            colType match {
+                case "INT" =>
+                    val intVec = vector.asInstanceOf[IntVector]
+                    intVec.allocateNew(rowCount)
+                    val arr = rawData.asInstanceOf[Array[Int]]
+                    var i = 0
+                    while (i < rowCount) {
+                        intVec.setSafe(i, arr(i))
+                        i += 1
+                    }
+                    intVec.setValueCount(rowCount)
+                case "STRING" =>
+                    val strVec = vector.asInstanceOf[VarCharVector]
+                    strVec.allocateNew(rowCount)
+                    val arr = rawData.asInstanceOf[Array[String]]
+                    var i = 0
+                    while (i < rowCount) {
+                        val s = if (arr(i) == null) "" else arr(i)
+                        strVec.setSafe(i, s.getBytes("UTF-8"))
+                        i += 1
+                    }
+                    strVec.setValueCount(rowCount)
+                case _ => // Handled via string fallback for now
+            }
+        }
+
+        listener.start(root)
+        listener.putNext()
+        listener.completed()
+      } 
+      else {
+        // ---------------------------------------------------------
+        // [OLTP PATH] LEGACY STRING PAYLOAD
+        // ---------------------------------------------------------
+        val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
+        root = VectorSchemaRoot.create(schema, allocator)
+        
         val resultVector = root.getVector("query_result").asInstanceOf[VarCharVector]
         resultVector.allocateNew()
         resultVector.setSafe(0, result.message.getBytes("UTF-8"))

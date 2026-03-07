@@ -69,7 +69,13 @@ import org.awandb.core.jni.NativeBridge
 import scala.jdk.CollectionConverters._
 
 // Structured Result Class
-case class SQLResult(isError: Boolean, message: String, affectedRows: Long = 0L)
+case class SQLResult(
+    isError: Boolean, 
+    message: String, 
+    affectedRows: Long = 0L,
+    schema: Array[(String, String)] = Array.empty,
+    columnarData: Array[Any] = Array.empty
+)
 
 sealed trait FilterAST {
   // Returns a flattened RPN instruction array
@@ -845,6 +851,45 @@ object SQLHandler {
           val projectionIndices = requestedColumns.map(col => leftTable.columnOrder.indexOf(col)).toArray
           if (projectionIndices.contains(-1)) return SQLResult(true, s"Error: One or more projected columns do not exist.")
           
+          // ---------------------------------------------------------
+          // [NEW] DYNAMIC COLUMNAR TRANSPOSITION (For Arrow Zero-Copy)
+          // ---------------------------------------------------------
+          val outSchema = requestedColumns.zip(requestedHeaders).map { case (col, header) =>
+            val isString = leftTable.columns(col).isString
+            val isVector = leftTable.columns(col).isVector
+            val typ = if (isVector) "VECTOR" else if (isString) "STRING" else "INT"
+            (header, typ)
+          }.toArray
+
+          val numCols = projectionIndices.length
+          val numRows = finalRows.length
+          val columnarData = new Array[Any](numCols)
+          
+          for (c <- 0 until numCols) {
+             val colName = requestedColumns(c)
+             val isString = leftTable.columns(colName).isString
+             val isVector = leftTable.columns(colName).isVector
+             
+             if (isVector) {
+                val arr = new Array[Array[Float]](numRows)
+                for (r <- 0 until numRows) arr(r) = finalRows(r)(projectionIndices(c)).asInstanceOf[Array[Float]]
+                columnarData(c) = arr
+             } else if (isString) {
+                val arr = new Array[String](numRows)
+                for (r <- 0 until numRows) arr(r) = finalRows(r)(projectionIndices(c)).toString
+                columnarData(c) = arr
+             } else {
+                val arr = new Array[Int](numRows)
+                for (r <- 0 until numRows) arr(r) = finalRows(r)(projectionIndices(c)) match {
+                  case i: Int => i
+                  case n: Number => n.intValue()
+                  case _ => 0
+                }
+                columnarData(c) = arr
+             }
+          }
+
+          // Legacy String Builder for standard backwards compatibility
           val sb = new StringBuilder()
           sb.append(s"\n   Found Rows (${requestedHeaders.mkString(" | ")}):\n")
           
@@ -852,7 +897,9 @@ object SQLHandler {
              val projectedRow = projectionIndices.map(idx => row(idx))
              sb.append("   " + projectedRow.mkString(" | ") + "\n") 
           }
-          return SQLResult(false, sb.toString(), finalRows.length.toLong)
+          
+          // Return the new fully-loaded SQLResult!
+          return SQLResult(false, sb.toString(), finalRows.length.toLong, outSchema, columnarData)
 
         case insert: Insert =>
           val tableName = insert.getTable.getName.toLowerCase

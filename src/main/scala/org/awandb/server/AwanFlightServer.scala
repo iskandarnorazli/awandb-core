@@ -65,9 +65,10 @@ object AwanFlightServer {
     // 2. Initialize the Auth Handler
     val authHandler = new org.awandb.server.auth.AwanAuthHandler()
 
-    // 3. Build the server with Auth Enabled
+    // 3. Build the server with Auth & Middleware Enabled
     val server = FlightServer.builder(allocator, location, producer)
       .headerAuthenticator(authHandler) 
+      .middleware(org.awandb.server.middleware.FormatMiddleware.Key, new org.awandb.server.middleware.FormatMiddlewareFactory())
       .build()
 
     try {
