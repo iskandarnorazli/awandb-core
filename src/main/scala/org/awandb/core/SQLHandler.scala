@@ -247,13 +247,42 @@ object SQLHandler {
             }
             if (valCol.isEmpty)
               return SQLResult(true, "Error: GROUP BY currently requires a SUM(column) aggregate.")
+            
             val resultMap = leftTable.executeGroupBy(keyCol, valCol)
             if (resultMap.isEmpty) return SQLResult(false, "   GROUP BY Results: (Empty)", 0L)
 
+            // --- [NEW] Apply ORDER BY and LIMIT to GROUP BY results ---
+            var finalResultSeq = resultMap.toSeq
+
+            // Handle ORDER BY
+            val orderByElements = plain.getOrderByElements
+            if (orderByElements != null && !orderByElements.isEmpty) {
+              val orderBy = orderByElements.get(0)
+              val isAsc = orderBy.isAsc
+              val sortExprStr = orderBy.getExpression.toString.toLowerCase
+              
+              // Heuristic: If they sort by the Key column name, sort by Key. Otherwise, sort by the Value.
+              if (sortExprStr.contains(keyCol.toLowerCase) || sortExprStr == "1") {
+                 finalResultSeq = if (isAsc) finalResultSeq.sortBy(_._1) else finalResultSeq.sortBy(_._1).reverse
+              } else {
+                 finalResultSeq = if (isAsc) finalResultSeq.sortBy(_._2) else finalResultSeq.sortBy(_._2).reverse
+              }
+            }
+
+            // Handle LIMIT
+            val limit = plain.getLimit
+            if (limit != null) {
+              val limitExpr = limit.getRowCount
+              if (limitExpr != null && limitExpr.isInstanceOf[LongValue]) {
+                val limitVal = limitExpr.asInstanceOf[LongValue].getValue.toInt
+                finalResultSeq = finalResultSeq.take(limitVal)
+              }
+            }
+
             val sb = new StringBuilder()
             sb.append(s"\n   GROUP BY Results ($rawKey | SUM($rawValCol)):\n")
-            resultMap.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
-            return SQLResult(false, sb.toString(), resultMap.size.toLong)
+            finalResultSeq.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
+            return SQLResult(false, sb.toString(), finalResultSeq.size.toLong)
           }
 
           // 1.5. CHECK FOR GRAPH BFS
@@ -273,9 +302,19 @@ object SQLHandler {
                 // 1st Parameter: Start Node ID
                 bfsStartNode = params.get(0).asInstanceOf[LongValue].getValue.toInt
                 
-                // 2nd and 3rd Parameters: Source and Destination Columns
-                srcCol = cleanColName(params.get(1).asInstanceOf[Column].getFullyQualifiedName)
-                dstCol = cleanColName(params.get(2).asInstanceOf[Column].getFullyQualifiedName)
+                // 2nd and 3rd Parameters: Source and Destination Columns (Optional)
+                if (params.size() >= 3) {
+                  srcCol = cleanColName(params.get(1).asInstanceOf[Column].getFullyQualifiedName)
+                  dstCol = cleanColName(params.get(2).asInstanceOf[Column].getFullyQualifiedName)
+                } else {
+                  // Fallback: assume the 2nd and 3rd columns in the schema are src and dst
+                  if (leftTable.columnOrder.size >= 3) {
+                     srcCol = leftTable.columnOrder(1)
+                     dstCol = leftTable.columnOrder(2)
+                  } else {
+                     throw new RuntimeException("Table does not have enough columns for implicit BFS edges.")
+                  }
+                }
               }
             }
           }

@@ -23,7 +23,7 @@ import org.awandb.core.util.UnsafeHelper
 
 trait StorageRouter {
   def getPathForBlock(blockId: Int): String
-  def getPathForFilter(blockId: Int): String
+  def getPathForFilter(blockId: Int, colIdx: Int): String
   def getPathForBitmap(blockId: Int): String 
   def getDataDir: String
   def initialize(): Unit
@@ -33,7 +33,7 @@ class SimpleStorageRouter(val dataDir: String) extends StorageRouter {
   override def initialize(): Unit = new File(dataDir).mkdirs()
   override def getDataDir: String = dataDir
   override def getPathForBlock(blockId: Int): String = f"$dataDir/block_$blockId%05d.udb"
-  override def getPathForFilter(blockId: Int): String = f"$dataDir/block_$blockId%05d.cuckoo"
+  override def getPathForFilter(blockId: Int, colIdx: Int): String = f"$dataDir/block_$blockId%05d_col$colIdx.cuckoo"
   override def getPathForBitmap(blockId: Int): String = f"$dataDir/block_$blockId%05d.del" 
 }
 
@@ -49,7 +49,11 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
   private val blockCounter = new java.util.concurrent.atomic.AtomicInteger(0)
   
   private val loadedBlocks = new CopyOnWriteArrayList[Long]() 
-  private val loadedFilters = new ConcurrentHashMap[Int, Long]() 
+  // Maps blockIdx -> Array of Cuckoo Pointers (one per column)
+  private val loadedFilters = new ConcurrentHashMap[Int, Array[Long]]() 
+
+  // Maps blockIdx -> Array of (Min, Max) tuples (one per column)
+  private val loadedZoneMaps = new ConcurrentHashMap[Int, Array[(Int, Int)]]()
   private val pendingIndexes = new ConcurrentLinkedQueue[java.lang.Integer]()
   private val deletionBitmaps = new ConcurrentHashMap[Long, java.util.BitSet]()
 
@@ -91,13 +95,8 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
           if (id > maxId) maxId = id
           
           if (enableIndex) {
-              val filterPath = router.getPathForFilter(id)
-              if (new File(filterPath).exists()) {
-                  val filterPtr = NativeBridge.cuckooLoad(filterPath)
-                  if (filterPtr != 0) loadedFilters.put(blockIdx, filterPtr)
-              } else {
-                  pendingIndexes.offer(blockIdx)
-              }
+              // We defer loading to the daemon so it can use the isVector flags
+              pendingIndexes.offer(blockIdx)
           }
       }
     }
@@ -194,7 +193,8 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     }
   }
 
-  def buildPendingIndexes(): Int = {
+  // Schema-Aware Index Builder
+  def buildPendingIndexes(isVectorFlags: Array[Boolean]): Int = {
     val blockIdx = pendingIndexes.poll()
     if (blockIdx == null) return 0
     if (blockIdx >= loadedBlocks.size()) return 0 
@@ -204,27 +204,71 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     val rowCount = NativeBridge.getRowCount(blockPtr)
     if (rowCount == 0) return 0
 
-    val colPtr = NativeBridge.getColumnPtr(blockPtr, 0)
-    val data = new Array[Int](rowCount)
-    NativeBridge.copyToScala(colPtr, data, rowCount)
+    val colCount = isVectorFlags.length
+    val filterArray = new Array[Long](colCount)
+    val zoneMapArray = new Array[(Int, Int)](colCount)
 
-    val filterPtr = NativeBridge.cuckooCreate((rowCount * 1.5).toInt)
-    NativeBridge.cuckooBuildBatch(filterPtr, data)
+    for (colIdx <- 0 until colCount) {
+      if (!isVectorFlags(colIdx)) {
+        // 1. Fetch native column data
+        val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+        val data = new Array[Int](rowCount)
+        NativeBridge.copyToScala(colPtr, data, rowCount)
+
+        // 2. Build Cuckoo Filter for this specific column
+        val filterPtr = NativeBridge.cuckooCreate(math.max((rowCount * 1.5).toInt, 1024))
+        NativeBridge.cuckooBuildBatch(filterPtr, data)
+        filterArray(colIdx) = filterPtr
+
+        // 3. Save Cuckoo Filter 
+        val path = router.getPathForFilter(blockIdx, colIdx) 
+        NativeBridge.cuckooSave(filterPtr, path)
+
+        // 4. Fetch and cache Zone Map natively
+        zoneMapArray(colIdx) = NativeBridge.getZoneMap(blockPtr, colIdx)
+      } else {
+        // Vectors skip Cuckoo Filters and standard Min/Max Maps
+        filterArray(colIdx) = 0L
+        zoneMapArray(colIdx) = (0, 0)
+      }
+    }
+
+    loadedFilters.put(blockIdx, filterArray)
+    loadedZoneMaps.put(blockIdx, zoneMapArray)
     
-    val path = router.getPathForFilter(blockIdx) 
-    NativeBridge.cuckooSave(filterPtr, path)
-    loadedFilters.put(blockIdx, filterPtr)
     1 
   }
 
-  def mightContain(blockIndex: Int, key: Int): Boolean = {
+  def getLoadedBlocks: scala.collection.Seq[Long] = loadedBlocks.asScala.toSeq
+
+  //  Retrieve O(1) Zone Map bounds for a specific block and column
+  def getZoneMap(blockIdx: Int, colIdx: Int): (Int, Int) = {
+    val maps = loadedZoneMaps.get(blockIdx)
+    if (maps != null && colIdx < maps.length) {
+      maps(colIdx)
+    } else {
+      // Fallback if not loaded/indexed yet
+      (Int.MinValue, Int.MaxValue) 
+    }
+  }
+
+  // Multi-Column Cuckoo Filter check
+  def mightContain(blockIdx: Int, colIdx: Int, key: Int): Boolean = {
     if (!enableIndex) return true
-    val ptr = loadedFilters.get(blockIndex)
+    
+    val filterArray = loadedFilters.get(blockIdx)
+    if (filterArray == null || colIdx >= filterArray.length) return true 
+    
+    val ptr = filterArray(colIdx)
     if (ptr == 0L) return true 
+    
     NativeBridge.cuckooContains(ptr, key)
   }
 
-  def getLoadedBlocks: scala.collection.Seq[Long] = loadedBlocks.asScala.toSeq
+  // Safely retrieve the full array of Cuckoo Filters for Compaction
+  def getFilterArray(blockIdx: Int): Array[Long] = {
+    loadedFilters.get(blockIdx)
+  }
 
   def saveBitmaps(): Unit = {
     val it = loadedBlocks.iterator()
@@ -330,10 +374,10 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
   // Safely swap blocks during compaction without breaking encapsulation
   def swapBlocks(oldBlocks: Array[Long], newBlockPtr: Long): Unit = {
+    val removedIndices = oldBlocks.map(ptr => loadedBlocks.indexOf(ptr)).filter(_ != -1).sorted.reverse
+    
     oldBlocks.foreach { ptr => 
       loadedBlocks.remove(ptr)
-      
-      // [NEW] Sever links to old memory addresses to prevent Use-After-Free
       deletionBitmaps.remove(ptr)
       nativeBitmaps.remove(ptr)
       bitmapDirty.remove(ptr)
@@ -343,42 +387,64 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
       loadedBlocks.add(newBlockPtr)
     }
 
-    // [NEW] Physical indices shifted, so all Cuckoo Filters are mapped to the wrong Block IDs!
-    // We must clear the filter map and requeue all active blocks for lazy index rebuild.
-    loadedFilters.clear()
-    pendingIndexes.clear()
     if (enableIndex) {
-      for (i <- 0 until loadedBlocks.size()) pendingIndexes.offer(i)
+      // Temporarily extract surviving 2D Arrays
+      val survivingFilters = new java.util.HashMap[Int, Array[Long]]()
+      val survivingZoneMaps = new java.util.HashMap[Int, Array[(Int, Int)]]()
+      var currentIdx = 0
+      
+      val oldSize = loadedBlocks.size() + oldBlocks.length - (if (newBlockPtr != 0L) 1 else 0)
+      for (i <- 0 until oldSize) {
+        if (!removedIndices.contains(i)) {
+          val filterArr = loadedFilters.get(i)
+          val zoneMapArr = loadedZoneMaps.get(i)
+          
+          if (filterArr != null) survivingFilters.put(currentIdx, filterArr)
+          if (zoneMapArr != null) survivingZoneMaps.put(currentIdx, zoneMapArr)
+          
+          currentIdx += 1
+        } else {
+          // Old arrays retired by AwanTable
+          loadedFilters.remove(i)
+          loadedZoneMaps.remove(i)
+        }
+      }
+      
+      loadedFilters.clear()
+      loadedFilters.putAll(survivingFilters)
+      
+      loadedZoneMaps.clear()
+      loadedZoneMaps.putAll(survivingZoneMaps)
+      
+      if (newBlockPtr != 0L) {
+         pendingIndexes.offer(loadedBlocks.size() - 1)
+      }
     }
-  }
-
-  // Helper to retrieve the active Cuckoo Filter for garbage collection
-  def getFilterPtr(blockIdx: Int): Long = {
-    loadedFilters.getOrDefault(blockIdx, 0L)
   }
 
   def close(): Unit = {
     var idx = 0
     val activeBlocks = loadedBlocks.asScala.toSeq
     
-    // Iterate ONLY over currently active blocks to prevent Double Free
     activeBlocks.foreach { ptr =>
-      // 1. Free the Block
       NativeBridge.freeMainStore(ptr)
 
-      // 2. Free the Active Native Bitmask
       val bitmaskPtr = nativeBitmaps.getOrDefault(ptr, 0L)
       if (bitmaskPtr != 0L) NativeBridge.freeMainStore(bitmaskPtr)
 
-      // 3. Free the Active Cuckoo Filter
-      val filterPtr = loadedFilters.getOrDefault(idx, 0L)
-      if (filterPtr != 0L) NativeBridge.cuckooDestroy(filterPtr)
-
+      // [FIX] Loop through the Filter Array to destroy all active columns
+      val filterArray = loadedFilters.get(idx)
+      if (filterArray != null) {
+        filterArray.foreach { filterPtr =>
+          if (filterPtr != 0L) NativeBridge.cuckooDestroy(filterPtr)
+        }
+      }
       idx += 1
     }
 
     loadedBlocks.clear()
     loadedFilters.clear()
+    loadedZoneMaps.clear()
     deletionBitmaps.clear()
     nativeBitmaps.clear()
     bitmapDirty.clear()

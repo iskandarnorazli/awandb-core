@@ -62,9 +62,8 @@ class AsyncPerformanceSpec extends AnyFlatSpec with Matchers {
 
     // 4. Force Index Build (Simulate background worker finishing)
     println("| ... Background Worker Building Index ...")
-    while(table.blockManager.buildPendingIndexes() > 0) {
-        // busy wait
-    }
+    // [NEW]
+    while (table.blockManager.buildPendingIndexes(Array(false)) > 0) {}
     
     // 5. Indexed Read
     val t3 = System.nanoTime()

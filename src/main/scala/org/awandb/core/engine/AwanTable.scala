@@ -94,6 +94,14 @@ class AwanTable(
           Thread.sleep(daemonIntervalMs)
           epochManager.advanceGlobalEpoch()
           
+          // Drain the queue and build pending Cuckoo Filters
+          // Extract schema flags and build Multi-Column Indexes
+          var built = 0
+          val isVectorFlags = columnOrder.map(c => columns(c).isVector).toArray
+          
+          while (blockManager.buildPendingIndexes(isVectorFlags) > 0) { built += 1 }
+          // if (built > 0) println(s"[Daemon] Built $built Cuckoo Filters in table '$name'.")
+          
           val compacted = compactor.compact(0.3)
           if (compacted > 0) println(s"[Daemon] Compacted $compacted blocks in table '$name'.")
           
@@ -558,7 +566,20 @@ class AwanTable(
     }
 
     val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-       if (blockManager.isClean(blockPtr)) {
+       
+       val blockIdx = blockManager.getLoadedBlocks.indexOf(blockPtr)
+       
+       // [NEW] Check 1: Zone Map Short-Circuit
+       val (min, max) = if (blockIdx != -1) blockManager.getZoneMap(blockIdx, colIdx) else (Int.MinValue, Int.MaxValue)
+       
+       if (target < min || target > max) {
+           0 // FASTEST PATH: Target is completely out of bounds. Skip AVX scan!
+       } 
+       // [NEW] Check 2: Multi-Column Cuckoo Filter Short-Circuit
+       else if (blockIdx != -1 && !blockManager.mightContain(blockIdx, colIdx, target)) {
+           0 // FAST PATH: Filter says the key is definitely not here. Skip AVX scan!
+       } 
+       else if (blockManager.isClean(blockPtr)) {
            // FAST PATH: Manual loop over Clean Block (Avoids Bitmap Check overhead)
            val rowCount = NativeBridge.getRowCount(blockPtr)
            val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
@@ -991,14 +1012,18 @@ class AwanTable(
         val bitmaskPtr = blockManager.getNativeDeletionBitmap(ptr, rowCount)
         if (bitmaskPtr != 0L) epochManager.retire(bitmaskPtr, isBlock = false) // [NEW] Mark as Raw Memory!
         
-        // [NEW] Find the block index to retire its Cuckoo Filter to prevent memory leaks!
+        // [UPDATED] Find the block index to retire ALL its Cuckoo Filters!
         val blockIdx = blockManager.getLoadedBlocks.indexOf(ptr)
         if (blockIdx != -1) {
-          val filterPtr = blockManager.getFilterPtr(blockIdx)
-          if (filterPtr != 0L) {
-             // We can safely route Cuckoo Filters through standard 'free' (isBlock = false) 
-             // because they are flat memory arrays.
-             epochManager.retire(filterPtr, isBlock = false) 
+          val filterArray = blockManager.getFilterArray(blockIdx)
+          if (filterArray != null) {
+            filterArray.foreach { filterPtr =>
+               if (filterPtr != 0L) {
+                 // We can safely route Cuckoo Filters through standard 'free' (isBlock = false) 
+                 // because they are flat memory arrays.
+                 epochManager.retire(filterPtr, isBlock = false) 
+               }
+            }
           }
         }
       }

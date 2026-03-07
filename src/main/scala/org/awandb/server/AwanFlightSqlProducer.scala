@@ -88,7 +88,7 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       case e: net.sf.jsqlparser.parser.ParseException =>
         println(s"[Network] 🔴 SQL Parse Error: ${e.getMessage}")
         listener.error(CallStatus.INVALID_ARGUMENT.withDescription(e.getMessage).toRuntimeException)
-      case e: Exception =>
+      case e: Throwable =>
         println(s"[Network] 🔴 Engine Crash: ${e.getMessage}")
         listener.error(CallStatus.INTERNAL.withDescription(e.getMessage).toRuntimeException)
     } finally {
@@ -131,7 +131,7 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
           }
           
         } catch {
-          case e: Exception =>
+          case e: Throwable =>
             println(s"[Network] 🔴 Engine Crash: ${e.getMessage}")
             listener.onError(CallStatus.INTERNAL.withDescription(e.getMessage).toRuntimeException)
         }
@@ -302,7 +302,7 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
 
         } catch {
           case fre: FlightRuntimeException => ackStream.onError(fre)
-          case e: Exception => ackStream.onError(CallStatus.INTERNAL.withCause(e).withDescription(e.getMessage).toRuntimeException)
+          case e: Throwable => ackStream.onError(CallStatus.INTERNAL.withCause(e).withDescription(e.getMessage).toRuntimeException)
         } finally {
           try { flightStream.close() } catch { case _: Exception => }
         }
