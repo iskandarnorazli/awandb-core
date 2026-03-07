@@ -621,10 +621,10 @@ extern "C" {
                             c4 = vcleq_s32(v4, vT); c5 = vcleq_s32(v5, vT); c6 = vcleq_s32(v6, vT); c7 = vcleq_s32(v7, vT);
                         }
 
-                        int m0 = neon_movemask_epi32_comp(c0); int m1 = neon_movemask_epi32_comp(c1);
-                        int m2 = neon_movemask_epi32_comp(c2); int m3 = neon_movemask_epi32_comp(c3);
-                        int m4 = neon_movemask_epi32_comp(c4); int m5 = neon_movemask_epi32_comp(c5);
-                        int m6 = neon_movemask_epi32_comp(c6); int m7 = neon_movemask_epi32_comp(c7);
+                        int m0 = neon_movemask_epi32(c0); int m1 = neon_movemask_epi32(c1);
+                        int m2 = neon_movemask_epi32(c2); int m3 = neon_movemask_epi32(c3);
+                        int m4 = neon_movemask_epi32(c4); int m5 = neon_movemask_epi32(c5);
+                        int m6 = neon_movemask_epi32(c6); int m7 = neon_movemask_epi32(c7);
 
                         word = (m0) | (m1 << 4) | (m2 << 8) | (m3 << 12) | (m4 << 16) | (m5 << 20) | (m6 << 24) | (m7 << 28);
 #endif
