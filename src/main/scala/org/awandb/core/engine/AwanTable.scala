@@ -824,6 +824,132 @@ class AwanTable(
     finalMap.toMap
   }
 
+  // ---------------------------------------------------------
+  // COMPOSITE PREDICATE PUSHDOWN (AST / RPN)
+  // ---------------------------------------------------------
+
+  def executeCompositeFilter(rpnInstructions: Array[Int]): Array[Int] = withEpoch {
+    val ramIds = new scala.collection.mutable.ArrayBuffer[Int]()
+    var snapshotBlocks: List[Long] = Nil
+
+    rwLock.readLock().lock()
+    try {
+      if (isClosed) throw new IllegalStateException("Table is closed")
+
+      // 1. Pre-process Materialized ASTs (Opcode 4) into HashSets to avoid O(N^2) lookups
+      val matSets = scala.collection.mutable.Map[Int, Set[Int]]()
+      var pc = 0
+      while (pc < rpnInstructions.length) {
+        val op = rpnInstructions(pc)
+        if (op == 1) pc += 4
+        else if (op == 2 || op == 3) pc += 1
+        else if (op == 4) {
+          val len = rpnInstructions(pc + 1)
+          val slice = rpnInstructions.slice(pc + 2, pc + 2 + len)
+          matSets(pc) = slice.toSet
+          pc += 2 + len
+        } else {
+          throw new RuntimeException(s"Unknown RPN Opcode: $op")
+        }
+      }
+
+      // 2. RAM Evaluator (Evaluates the RPN stack per row)
+      val pkCol = columns(columnOrder.head).deltaIntBuffer
+      val numRows = pkCol.length
+      
+      var i = 0
+      while (i < numRows) {
+        if (!ramDeleted.get(i)) {
+          var execPc = 0
+          val stack = new java.util.BitSet() 
+          var sp = 0
+
+          while (execPc < rpnInstructions.length) {
+            val op = rpnInstructions(execPc)
+            if (op == 1) { // PREDICATE: [1, colIdx, opType, targetVal]
+              val colIdx = rpnInstructions(execPc + 1)
+              val opType = rpnInstructions(execPc + 2)
+              val targetVal = rpnInstructions(execPc + 3)
+              
+              val v = columns(columnOrder(colIdx)).deltaIntBuffer(i)
+              val res = opType match {
+                case 0 => v == targetVal
+                case 1 => v > targetVal
+                case 2 => v >= targetVal
+                case 3 => v < targetVal
+                case 4 => v <= targetVal
+                case _ => false
+              }
+              stack.set(sp, res)
+              sp += 1
+              execPc += 4
+            } else if (op == 2) { // AND: [2]
+              val b2 = stack.get(sp - 1)
+              val b1 = stack.get(sp - 2)
+              sp -= 2
+              stack.set(sp, b1 && b2)
+              sp += 1
+              execPc += 1
+            } else if (op == 3) { // OR: [3]
+              val b2 = stack.get(sp - 1)
+              val b1 = stack.get(sp - 2)
+              sp -= 2
+              stack.set(sp, b1 || b2)
+              sp += 1
+              execPc += 1
+            } else if (op == 4) { // MATERIALIZED: [4, len, id1, id2...]
+              val len = rpnInstructions(execPc + 1)
+              val rowId = pkCol(i)
+              val res = matSets(execPc).contains(rowId)
+              stack.set(sp, res)
+              sp += 1
+              execPc += 2 + len
+            }
+          }
+
+          if (sp > 0 && stack.get(0)) {
+            ramIds.append(pkCol(i))
+          }
+        }
+        i += 1
+      }
+
+      snapshotBlocks = blockManager.getLoadedBlocks.toList
+    } finally {
+      rwLock.readLock().unlock()
+    }
+
+    // 3. DISK Evaluator (JNI AVX Pushdown)
+    val diskIds = snapshotBlocks.flatMap { blockPtr =>
+      val rowCount = NativeBridge.getRowCount(blockPtr)
+      val outIndicesPtr = NativeBridge.allocMainStore(rowCount * 4) // 4 bytes per Int
+      val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
+
+      try {
+        val matchCount = NativeBridge.avxCompositeFilter(blockPtr, rpnInstructions, outIndicesPtr, bitmaskPtr)
+
+        if (matchCount == 0) {
+          Array.empty[Int]
+        } else {
+          // Extract only the matching Primary Keys (Col 0)
+          val idColPtr = NativeBridge.getColumnPtr(blockPtr, 0)
+          val tempValuesPtr = NativeBridge.allocMainStore(matchCount * 4)
+          
+          NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
+          val ids = new Array[Int](matchCount)
+          NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
+          
+          NativeBridge.freeMainStore(tempValuesPtr)
+          ids
+        }
+      } finally {
+        NativeBridge.freeMainStore(outIndicesPtr)
+      }
+    }
+
+    ramIds.toArray ++ diskIds
+  }
+
   def scanFiltered(colName: String, opType: Int, targetVal: Int): Iterator[Array[Any]] = withEpoch {
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Iterator.empty

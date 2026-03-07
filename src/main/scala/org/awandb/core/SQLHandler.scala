@@ -63,6 +63,40 @@ import scala.jdk.CollectionConverters._
 // Structured Result Class
 case class SQLResult(isError: Boolean, message: String, affectedRows: Long = 0L)
 
+sealed trait FilterAST {
+  // Returns a flattened RPN instruction array
+  def toRPN(table: AwanTable): Array[Int]
+}
+
+case class AndAST(left: FilterAST, right: FilterAST) extends FilterAST {
+  // OP_AND = 2
+  def toRPN(table: AwanTable): Array[Int] = left.toRPN(table) ++ right.toRPN(table) ++ Array(2)
+}
+
+case class OrAST(left: FilterAST, right: FilterAST) extends FilterAST {
+  // OP_OR = 3
+  def toRPN(table: AwanTable): Array[Int] = left.toRPN(table) ++ right.toRPN(table) ++ Array(3)
+}
+
+case class PredicateAST(colName: String, opType: Int, targetVal: Int) extends FilterAST {
+  // OP_PRED = 1
+  // Layout: [OP_CODE, COL_IDX, OP_TYPE, TARGET_VAL]
+  def toRPN(table: AwanTable): Array[Int] = {
+    val colIdx = table.columnOrder.indexOf(colName)
+    if (colIdx == -1) throw new RuntimeException(s"Column '$colName' not found.")
+    Array(1, colIdx, opType, targetVal)
+  }
+}
+
+// Fallback for operations we haven't ported to AVX yet (like VECTOR_SEARCH or LIKE)
+case class MaterializedAST(matchedIds: Array[Int]) extends FilterAST {
+  // OP_MAT = 4
+  // Layout: [OP_CODE, LENGTH, ID_1, ID_2, ... ID_N]
+  def toRPN(table: AwanTable): Array[Int] = {
+    Array(4, matchedIds.length) ++ matchedIds
+  }
+}
+
 object SQLHandler {
 
   val tables = new java.util.concurrent.ConcurrentHashMap[String, AwanTable]()
@@ -83,142 +117,137 @@ object SQLHandler {
       }
 
       // Shared WHERE evaluator for Unrestricted DML
-          def evaluateWhere(expr: Expression, table: AwanTable): Array[Int] = {
-              
-              // Helper to safely extract (ColumnName, TargetValue) and prevent ClassCastExceptions
-              def getColAndVal(op: net.sf.jsqlparser.expression.operators.relational.ComparisonOperator): (String, Int) = {
-                 if (!op.getLeftExpression.isInstanceOf[Column]) {
-                    throw new RuntimeException("Left side of condition must be a column name.")
-                 }
-                 if (!op.getRightExpression.isInstanceOf[LongValue]) {
-                    throw new RuntimeException("Right side of condition must be an integer.")
-                 }
-                 
-                 val rawName = op.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                 val colName = cleanColName(rawName)
-                 
-                 if (!table.columnOrder.contains(colName)) {
-                     throw new RuntimeException(s"Column '$colName' not found.")
-                 }
-                 (colName, op.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
-              }
+      def parseWhere(expr: Expression, table: AwanTable): FilterAST = {
+         
+         // Helper to safely extract (ColumnName, TargetValue) and prevent ClassCastExceptions
+         def getColAndVal(op: net.sf.jsqlparser.expression.operators.relational.ComparisonOperator): (String, Int) = {
+            if (!op.getLeftExpression.isInstanceOf[Column]) {
+               throw new RuntimeException("Left side of condition must be a column name.")
+            }
+            if (!op.getRightExpression.isInstanceOf[LongValue]) {
+               throw new RuntimeException("Right side of condition must be an integer.")
+            }
+            
+            val rawName = op.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
+            val colName = cleanColName(rawName)
+            
+            if (!table.columnOrder.contains(colName)) {
+                  throw new RuntimeException(s"Column '$colName' not found.")
+            }
+            (colName, op.getRightExpression.asInstanceOf[LongValue].getValue.toInt)
+         }
 
-              expr match {
-                 case p: Parenthesis => evaluateWhere(p.getExpression, table)
-                 case and: AndExpression =>
-                    val leftIds = evaluateWhere(and.getLeftExpression, table)
-                    val rightIdsSet = evaluateWhere(and.getRightExpression, table).toSet
-                    leftIds.filter(rightIdsSet.contains)
-                 case or: OrExpression =>
-                    val leftIds = evaluateWhere(or.getLeftExpression, table)
-                    val rightIds = evaluateWhere(or.getRightExpression, table)
-                    (leftIds.toSet ++ rightIds.toSet).toArray
-                    
-                 case eq: EqualsTo =>
-                    val left = eq.getLeftExpression
-                    // VECTOR SEARCH INTERCEPTOR
-                    if (left.isInstanceOf[Function] && left.asInstanceOf[Function].getName.equalsIgnoreCase("VECTOR_SEARCH")) {
-                       val func = left.asInstanceOf[Function]
-                       val params = func.getParameters.getExpressions
-                       
-                       val rawCol = params.get(0) match {
-                         case c: Column => c.getFullyQualifiedName
-                         case _ => params.get(0).toString
-                       }
-                       val colName = cleanColName(rawCol)
-                       
-                       if (!table.columnOrder.contains(colName)) {
-                           throw new RuntimeException(s"Column '$colName' not found.")
-                       }
-                       
-                       val vecStr = params.get(1).asInstanceOf[StringValue].getValue
-                       val threshold = params.get(2) match {
-                          case d: net.sf.jsqlparser.expression.DoubleValue => d.getValue.toFloat
-                          case l: net.sf.jsqlparser.expression.LongValue => l.getValue.toFloat
-                          case _ => 0.0f
-                       }
-                       val vecArray = vecStr.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
-                       return table.queryVector(colName, vecArray, threshold)
-                    }
+         expr match {
+            case p: Parenthesis => parseWhere(p.getExpression, table)
+            
+            // [NEW] Build AST instead of executing Scala set intersections
+            case and: AndExpression =>
+               AndAST(parseWhere(and.getLeftExpression, table), parseWhere(and.getRightExpression, table))
+            case or: OrExpression =>
+               OrAST(parseWhere(or.getLeftExpression, table), parseWhere(or.getRightExpression, table))
+               
+            case eq: EqualsTo =>
+               val left = eq.getLeftExpression
+               // VECTOR SEARCH INTERCEPTOR (Wrap in MaterializedAST)
+               if (left.isInstanceOf[Function] && left.asInstanceOf[Function].getName.equalsIgnoreCase("VECTOR_SEARCH")) {
+                  val func = left.asInstanceOf[Function]
+                  val params = func.getParameters.getExpressions
+                  
+                  val rawCol = params.get(0) match {
+                     case c: Column => c.getFullyQualifiedName
+                     case _ => params.get(0).toString
+                  }
+                  val colName = cleanColName(rawCol)
+                  
+                  if (!table.columnOrder.contains(colName)) {
+                        throw new RuntimeException(s"Column '$colName' not found.")
+                  }
+                  
+                  val vecStr = params.get(1).asInstanceOf[StringValue].getValue
+                  val threshold = params.get(2) match {
+                     case d: net.sf.jsqlparser.expression.DoubleValue => d.getValue.toFloat
+                     case l: net.sf.jsqlparser.expression.LongValue => l.getValue.toFloat
+                     case _ => 0.0f
+                  }
+                  val vecArray = vecStr.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
+                  return MaterializedAST(table.queryVector(colName, vecArray, threshold))
+               }
 
-                    val (colName, targetVal) = getColAndVal(eq)
-                    
-                    // 🚀 [O(1) INDEX OPTIMIZATION FIX]
-                    // If the WHERE clause targets the Primary Key (Column 0), do a direct O(1) lookup!
-                    if (colName == table.columnOrder.head) {
-                        if (table.getRow(targetVal).isDefined) Array(targetVal) else Array.empty[Int]
-                    } else {
-                        // Otherwise, fallback to O(N) AVX Scan
-                        table.scanFilteredIds(colName, 0, targetVal)
-                    }
-                 case gt: GreaterThan =>
-                    val (colName, targetVal) = getColAndVal(gt)
-                    table.scanFilteredIds(colName, 1, targetVal)
-                 case gte: GreaterThanEquals =>
-                    val (colName, targetVal) = getColAndVal(gte)
-                    table.scanFilteredIds(colName, 2, targetVal)
-                 case lt: MinorThan =>
-                    val (colName, targetVal) = getColAndVal(lt)
-                    table.scanFilteredIds(colName, 3, targetVal)
-                 case lte: MinorThanEquals =>
-                    val (colName, targetVal) = getColAndVal(lte)
-                    table.scanFilteredIds(colName, 4, targetVal)
+               val (colName, targetVal) = getColAndVal(eq)
+               PredicateAST(colName, 0, targetVal)
 
-                 case in: InExpression =>
-                    val rawName = in.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                    val colName = cleanColName(rawName)
-                    if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
-                    
-                    val inStr = in.toString 
-                    val content = inStr.substring(inStr.indexOf('(') + 1, inStr.lastIndexOf(')'))
-                    val targetVals = content.split(",").map(_.trim.replace("'", "")).toSet
+            case gt: GreaterThan =>
+               val (colName, targetVal) = getColAndVal(gt)
+               PredicateAST(colName, 1, targetVal)
+            case gte: GreaterThanEquals =>
+               val (colName, targetVal) = getColAndVal(gte)
+               PredicateAST(colName, 2, targetVal)
+            case lt: MinorThan =>
+               val (colName, targetVal) = getColAndVal(lt)
+               PredicateAST(colName, 3, targetVal)
+            case lte: MinorThanEquals =>
+               val (colName, targetVal) = getColAndVal(lte)
+               PredicateAST(colName, 4, targetVal)
 
-                    val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
-                    val colIdx = table.columnOrder.indexOf(colName)
-                    
-                    allIds.filter { id =>
-                       val rowOpt = table.getRow(id)
-                       rowOpt.isDefined && targetVals.contains(rowOpt.get(colIdx).toString)
-                    }
+            // Complex string operations fallback to eager materialization
+            case in: InExpression =>
+               val rawName = in.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
+               val colName = cleanColName(rawName)
+               if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
+               
+               val inStr = in.toString 
+               val content = inStr.substring(inStr.indexOf('(') + 1, inStr.lastIndexOf(')'))
+               val targetVals = content.split(",").map(_.trim.replace("'", "")).toSet
 
-                 case like: LikeExpression =>
-                    val rawName = like.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                    val colName = cleanColName(rawName)
-                    if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
-                    
-                    val targetVal = like.getRightExpression.asInstanceOf[StringValue].getValue
-                    val regexStr = "^" + targetVal.replace("%", ".*").replace("_", ".") + "$"
-                    val regex = regexStr.r
-                    
-                    val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
-                    val colIdx = table.columnOrder.indexOf(colName)
-                    
-                    allIds.filter { id =>
-                       val rowOpt = table.getRow(id)
-                       rowOpt.isDefined && regex.matches(rowOpt.get(colIdx).toString)
-                    }
+               val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
+               val colIdx = table.columnOrder.indexOf(colName)
+               
+               val matched = allIds.filter { id =>
+                  val rowOpt = table.getRow(id)
+                  rowOpt.isDefined && targetVals.contains(rowOpt.get(colIdx).toString)
+               }
+               MaterializedAST(matched)
 
-                 case isNull: IsNullExpression =>
-                    val rawName = isNull.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
-                    val colName = cleanColName(rawName)
-                    if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
-                    
-                    val isNot = isNull.isNot
-                    val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
-                    val colIdx = table.columnOrder.indexOf(colName)
-                    
-                    allIds.filter { id =>
-                       val rowOpt = table.getRow(id)
-                       if (rowOpt.isDefined) {
-                           val v = rowOpt.get(colIdx)
-                           val isNullEquivalent = v == null || v == "" || v == 0
-                           if (isNot) !isNullEquivalent else isNullEquivalent
-                       } else false
-                    }
-                    
-                 case _ => throw new RuntimeException(s"Unsupported WHERE clause operator: ${expr.getClass.getSimpleName}")
-              }
-          }
+            case like: LikeExpression =>
+               val rawName = like.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
+               val colName = cleanColName(rawName)
+               if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
+               
+               val targetVal = like.getRightExpression.asInstanceOf[StringValue].getValue
+               val regexStr = "^" + targetVal.replace("%", ".*").replace("_", ".") + "$"
+               val regex = regexStr.r
+               
+               val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
+               val colIdx = table.columnOrder.indexOf(colName)
+               
+               val matched = allIds.filter { id =>
+                  val rowOpt = table.getRow(id)
+                  rowOpt.isDefined && regex.matches(rowOpt.get(colIdx).toString)
+               }
+               MaterializedAST(matched)
+
+            case isNull: IsNullExpression =>
+               val rawName = isNull.getLeftExpression.asInstanceOf[Column].getFullyQualifiedName
+               val colName = cleanColName(rawName)
+               if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
+               
+               val isNot = isNull.isNot
+               val allIds = table.scanFilteredIds(table.columnOrder.head, 2, 0)
+               val colIdx = table.columnOrder.indexOf(colName)
+               
+               val matched = allIds.filter { id =>
+                  val rowOpt = table.getRow(id)
+                  if (rowOpt.isDefined) {
+                        val v = rowOpt.get(colIdx)
+                        val isNullEquivalent = v == null || v == "" || v == 0
+                        if (isNot) !isNullEquivalent else isNullEquivalent
+                  } else false
+               }
+               MaterializedAST(matched)
+               
+            case _ => throw new RuntimeException(s"Unsupported WHERE clause operator: ${expr.getClass.getSimpleName}")
+         }
+      }
 
       statement match {
         case select: Select =>
@@ -494,7 +523,12 @@ object SQLHandler {
 
           // FAST PATH: Pure Aggregation (No GROUP BY, No raw columns requested)
           if (isPureAggregation && groupBy == null && pushdownAggregators.nonEmpty) {
-              val matchedIds = if (where != null) evaluateWhere(where, leftTable) else null
+              val matchedIds = if (where != null) {
+                  val ast = parseWhere(where, leftTable)
+                  leftTable.executeCompositeFilter(ast.toRPN(leftTable))
+               } else {
+                  null
+               }
               
               // O(1) Count resolution!
               val count = if (matchedIds != null) matchedIds.length.toLong else leftTable.countAll()
@@ -553,7 +587,8 @@ object SQLHandler {
               leftTable.scanFiltered(leftTable.columnOrder.head, 2, 0).toSeq
           } else {
               try { 
-                  val matchedIds = evaluateWhere(where, leftTable)
+                  val ast = parseWhere(where, leftTable)
+                  val matchedIds = leftTable.executeCompositeFilter(ast.toRPN(leftTable))
                   matchedIds.flatMap(id => leftTable.getRow(id)).toSeq
               } 
               catch { case e: RuntimeException => return SQLResult(true, "Error: " + e.getMessage) }
@@ -853,14 +888,16 @@ object SQLHandler {
           if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
           
           val where = delete.getWhere
+          // [FIX] Execute the AST to get the raw Array[Int]
           val idsToDelete = if (where == null) {
              table.scanFilteredIds(table.columnOrder.head, 2, 0)
           } else {
-             evaluateWhere(where, table)
+             val ast = parseWhere(where, table)
+             table.executeCompositeFilter(ast.toRPN(table))
           }
           
           var affected = 0L
-          for (id <- idsToDelete) {
+          for (id <- idsToDelete) { // Now this is safely an Array[Int]
              if (table.delete(id)) affected += 1
           }
           
@@ -872,10 +909,12 @@ object SQLHandler {
            if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
            
            val where = update.getWhere
+           // [FIX] Execute the AST to get the raw Array[Int]
            val idsToUpdate = if (where == null) {
               table.scanFilteredIds(table.columnOrder.head, 2, 0)
            } else {
-              evaluateWhere(where, table)
+              val ast = parseWhere(where, table)
+              table.executeCompositeFilter(ast.toRPN(table))
            }
 
            val cols = update.getColumns.asScala
@@ -887,6 +926,7 @@ object SQLHandler {
            
            for (id <- idsToUpdate) {
               val oldRowOpt = table.getRow(id)
+              // ... rest of the update logic ...
               if (oldRowOpt.isDefined) {
                  val row = oldRowOpt.get
                  for (i <- cols.indices) {

@@ -150,6 +150,8 @@ class NativeBridge {
 
   // --- Graph Table ---
   @native def csrBfsNative(rowPtrs: Long, colIdxs: Long, numVertices: Int, startNode: Int, outDistances: Long): Unit
+
+  @native def avxCompositeFilterNative(blockPtr: Long, rpnInstructions: Array[Int], outIndicesPtr: Long, deletedBitmaskPtr: Long): Int
 }
 
 // -----------------------------------------------------------
@@ -448,4 +450,9 @@ object NativeBridge {
   def csrBfs(rowPtrs: Long, colIdxs: Long, numVertices: Int, startNode: Int, outDistances: Long): Unit = {
     instance.csrBfsNative(rowPtrs, colIdxs, numVertices, startNode, outDistances)
   }
+
+  def avxCompositeFilter(blockPtr: Long, rpnInstructions: Array[Int], outIndicesPtr: Long, deletedBitmaskPtr: Long): Int = {
+  if (blockPtr == 0) return 0
+  instance.avxCompositeFilterNative(blockPtr, rpnInstructions, outIndicesPtr, deletedBitmaskPtr)
+}
 }

@@ -15,7 +15,10 @@
 */
 
 #include "common.h"
-#include "block.h" 
+#include "block.h"
+#include <vector>
+#include <algorithm>
+#include <cstring>
 
 #ifdef ARCH_X86
     #include <immintrin.h>
@@ -474,6 +477,262 @@ extern "C" {
                 }
             }
         }
+        return matchCount;
+    }
+
+    // ==========================================================
+    // COMPOSITE PREDICATE PUSHDOWN (RPN AST EVALUATOR)
+    // ==========================================================
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxCompositeFilterNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jintArray jRpn, jlong outIndicesPtr, jlong deletedBitmaskPtr
+    ) {
+        if (blockPtr == 0 || jRpn == nullptr || outIndicesPtr == 0) return 0;
+
+        uint8_t* basePtr = (uint8_t*)blockPtr;
+        BlockHeader* header = (BlockHeader*)basePtr;
+        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
+        
+        int rows = header->row_count;
+        if (rows == 0) return 0;
+
+        // Fetch RPN Instructions
+        jint* rpn = (jint*)env->GetPrimitiveArrayCritical(jRpn, nullptr);
+        jsize rpnLen = env->GetArrayLength(jRpn);
+
+        // Calculate Bitmask Size (1 bit per row, packed into 32-bit words)
+        int numWords = (rows + 31) / 32;
+
+        // Pre-allocate a small pool of bitmasks for the RPN Stack (Max Depth 32)
+        const int MAX_DEPTH = 32;
+        uint32_t* maskPool[MAX_DEPTH];
+        for (int i = 0; i < MAX_DEPTH; i++) {
+            maskPool[i] = (uint32_t*)alloc_aligned(numWords * sizeof(uint32_t));
+        }
+
+        uint32_t* stack[MAX_DEPTH];
+        int sp = 0;
+        int poolIdx = 0;
+
+        int pc = 0;
+        while (pc < rpnLen) {
+            int op = rpn[pc];
+
+            if (op == 1) { // OP_PRED: [1, colIdx, opType, targetVal]
+                int colIdx = rpn[pc + 1];
+                int opType = rpn[pc + 2];
+                int targetVal = rpn[pc + 3];
+                pc += 4;
+
+                ColumnHeader& col = colHeaders[colIdx];
+                uint32_t* currentMask = maskPool[poolIdx++];
+                std::memset(currentMask, 0, numWords * sizeof(uint32_t));
+
+                // Zone Map Short-Circuiting (Extremely Fast)
+                bool allMatch = false;
+                bool noMatch = false;
+
+                if (opType == 0) { // ==
+                    if (targetVal < col.min_int || targetVal > col.max_int) noMatch = true;
+                    else if (col.min_int == col.max_int && targetVal == col.min_int) allMatch = true;
+                } else if (opType == 1) { // >
+                    if (col.max_int <= targetVal) noMatch = true;
+                    else if (col.min_int > targetVal) allMatch = true;
+                } else if (opType == 2) { // >=
+                    if (col.max_int < targetVal) noMatch = true;
+                    else if (col.min_int >= targetVal) allMatch = true;
+                } else if (opType == 3) { // <
+                    if (col.min_int >= targetVal) noMatch = true;
+                    else if (col.max_int < targetVal) allMatch = true;
+                } else if (opType == 4) { // <=
+                    if (col.min_int > targetVal) noMatch = true;
+                    else if (col.max_int <= targetVal) allMatch = true;
+                }
+
+                if (noMatch) {
+                    // memset already did the work
+                } else if (allMatch) {
+                    std::memset(currentMask, 0xFF, numWords * sizeof(uint32_t));
+                } else {
+                    // AVX/NEON Full Evaluation
+                    int32_t* data = (int32_t*)(basePtr + col.data_offset);
+                    
+                    for (int w = 0; w < numWords; w++) {
+                        int i = w * 32;
+                        if (i + 31 >= rows) break; // Leave tail for scalar
+
+                        uint32_t word = 0;
+
+#ifdef ARCH_X86
+                        __m256i vT = _mm256_set1_epi32(targetVal);
+                        __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
+                        __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
+                        __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
+                        __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+
+                        __m256i c0, c1, c2, c3;
+                        if (opType == 0) {
+                            c0 = _mm256_cmpeq_epi32(v0, vT); c1 = _mm256_cmpeq_epi32(v1, vT);
+                            c2 = _mm256_cmpeq_epi32(v2, vT); c3 = _mm256_cmpeq_epi32(v3, vT);
+                        } else if (opType == 1) {
+                            c0 = _mm256_cmpgt_epi32(v0, vT); c1 = _mm256_cmpgt_epi32(v1, vT);
+                            c2 = _mm256_cmpgt_epi32(v2, vT); c3 = _mm256_cmpgt_epi32(v3, vT);
+                        } else if (opType == 2) {
+                            __m256i vT1 = _mm256_set1_epi32(targetVal - 1);
+                            c0 = _mm256_cmpgt_epi32(v0, vT1); c1 = _mm256_cmpgt_epi32(v1, vT1);
+                            c2 = _mm256_cmpgt_epi32(v2, vT1); c3 = _mm256_cmpgt_epi32(v3, vT1);
+                        } else if (opType == 3) {
+                            c0 = _mm256_cmpgt_epi32(vT, v0); c1 = _mm256_cmpgt_epi32(vT, v1);
+                            c2 = _mm256_cmpgt_epi32(vT, v2); c3 = _mm256_cmpgt_epi32(vT, v3);
+                        } else if (opType == 4) {
+                            c0 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v0, vT), _mm256_setzero_si256());
+                            c1 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v1, vT), _mm256_setzero_si256());
+                            c2 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v2, vT), _mm256_setzero_si256());
+                            c3 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v3, vT), _mm256_setzero_si256());
+                        }
+
+                        int m0 = _mm256_movemask_ps(_mm256_castsi256_ps(c0));
+                        int m1 = _mm256_movemask_ps(_mm256_castsi256_ps(c1));
+                        int m2 = _mm256_movemask_ps(_mm256_castsi256_ps(c2));
+                        int m3 = _mm256_movemask_ps(_mm256_castsi256_ps(c3));
+
+                        word = (m0) | (m1 << 8) | (m2 << 16) | (m3 << 24);
+#elif defined(ARCH_ARM)
+                        int32x4_t vT = vdupq_n_s32(targetVal);
+                        int32x4_t v0 = vld1q_s32(&data[i]);    int32x4_t v1 = vld1q_s32(&data[i+4]);
+                        int32x4_t v2 = vld1q_s32(&data[i+8]);  int32x4_t v3 = vld1q_s32(&data[i+12]);
+                        int32x4_t v4 = vld1q_s32(&data[i+16]); int32x4_t v5 = vld1q_s32(&data[i+20]);
+                        int32x4_t v6 = vld1q_s32(&data[i+24]); int32x4_t v7 = vld1q_s32(&data[i+28]);
+
+                        uint32x4_t c0, c1, c2, c3, c4, c5, c6, c7;
+                        if (opType == 0) {
+                            c0 = vceqq_s32(v0, vT); c1 = vceqq_s32(v1, vT); c2 = vceqq_s32(v2, vT); c3 = vceqq_s32(v3, vT);
+                            c4 = vceqq_s32(v4, vT); c5 = vceqq_s32(v5, vT); c6 = vceqq_s32(v6, vT); c7 = vceqq_s32(v7, vT);
+                        } else if (opType == 1) {
+                            c0 = vcgtq_s32(v0, vT); c1 = vcgtq_s32(v1, vT); c2 = vcgtq_s32(v2, vT); c3 = vcgtq_s32(v3, vT);
+                            c4 = vcgtq_s32(v4, vT); c5 = vcgtq_s32(v5, vT); c6 = vcgtq_s32(v6, vT); c7 = vcgtq_s32(v7, vT);
+                        } else if (opType == 2) {
+                            c0 = vcgeq_s32(v0, vT); c1 = vcgeq_s32(v1, vT); c2 = vcgeq_s32(v2, vT); c3 = vcgeq_s32(v3, vT);
+                            c4 = vcgeq_s32(v4, vT); c5 = vcgeq_s32(v5, vT); c6 = vcgeq_s32(v6, vT); c7 = vcgeq_s32(v7, vT);
+                        } else if (opType == 3) {
+                            c0 = vcltq_s32(v0, vT); c1 = vcltq_s32(v1, vT); c2 = vcltq_s32(v2, vT); c3 = vcltq_s32(v3, vT);
+                            c4 = vcltq_s32(v4, vT); c5 = vcltq_s32(v5, vT); c6 = vcltq_s32(v6, vT); c7 = vcltq_s32(v7, vT);
+                        } else if (opType == 4) {
+                            c0 = vcleq_s32(v0, vT); c1 = vcleq_s32(v1, vT); c2 = vcleq_s32(v2, vT); c3 = vcleq_s32(v3, vT);
+                            c4 = vcleq_s32(v4, vT); c5 = vcleq_s32(v5, vT); c6 = vcleq_s32(v6, vT); c7 = vcleq_s32(v7, vT);
+                        }
+
+                        int m0 = neon_movemask_epi32_comp(c0); int m1 = neon_movemask_epi32_comp(c1);
+                        int m2 = neon_movemask_epi32_comp(c2); int m3 = neon_movemask_epi32_comp(c3);
+                        int m4 = neon_movemask_epi32_comp(c4); int m5 = neon_movemask_epi32_comp(c5);
+                        int m6 = neon_movemask_epi32_comp(c6); int m7 = neon_movemask_epi32_comp(c7);
+
+                        word = (m0) | (m1 << 4) | (m2 << 8) | (m3 << 12) | (m4 << 16) | (m5 << 20) | (m6 << 24) | (m7 << 28);
+#endif
+                        currentMask[w] = word;
+                    }
+
+                    // Scalar Tail
+                    int tailStart = (rows / 32) * 32;
+                    uint32_t tailWord = 0;
+                    for (int i = tailStart; i < rows; i++) {
+                        bool match = false;
+                        if (opType == 0) match = (data[i] == targetVal);
+                        else if (opType == 1) match = (data[i] > targetVal);
+                        else if (opType == 2) match = (data[i] >= targetVal);
+                        else if (opType == 3) match = (data[i] < targetVal);
+                        else if (opType == 4) match = (data[i] <= targetVal);
+
+                        if (match) tailWord |= (1U << (i - tailStart));
+                    }
+                    if (tailStart < rows) {
+                        currentMask[tailStart / 32] = tailWord;
+                    }
+                }
+                
+                stack[sp++] = currentMask;
+
+            } else if (op == 2) { // OP_AND: [2]
+                pc += 1;
+                uint32_t* mask2 = stack[--sp];
+                uint32_t* mask1 = stack[sp - 1]; // Peak top
+                for (int w = 0; w < numWords; w++) {
+                    mask1[w] &= mask2[w];
+                }
+                poolIdx--; // Recycle mask2
+            } else if (op == 3) { // OP_OR: [3]
+                pc += 1;
+                uint32_t* mask2 = stack[--sp];
+                uint32_t* mask1 = stack[sp - 1]; 
+                for (int w = 0; w < numWords; w++) {
+                    mask1[w] |= mask2[w];
+                }
+                poolIdx--; 
+            } else if (op == 4) { // OP_MAT: [4, len, id1, id2...]
+                int len = rpn[pc + 1];
+                std::vector<int> targetPKs(&rpn[pc + 2], &rpn[pc + 2 + len]);
+                std::sort(targetPKs.begin(), targetPKs.end());
+                pc += 2 + len;
+
+                uint32_t* currentMask = maskPool[poolIdx++];
+                std::memset(currentMask, 0, numWords * sizeof(uint32_t));
+
+                // Always match against Column 0 (Primary Key)
+                int32_t* pkData = (int32_t*)(basePtr + colHeaders[0].data_offset);
+
+                for (int w = 0; w < numWords; w++) {
+                    int i = w * 32;
+                    uint32_t word = 0;
+                    int bound = std::min(i + 32, rows);
+                    for (int bit = 0; bit < (bound - i); bit++) {
+                        if (std::binary_search(targetPKs.begin(), targetPKs.end(), pkData[i + bit])) {
+                            word |= (1U << bit);
+                        }
+                    }
+                    currentMask[w] = word;
+                }
+                stack[sp++] = currentMask;
+            } else {
+                break; // Safety escape
+            }
+        }
+
+        // Apply Deletion Bitmask & Extract Indices
+        int matchCount = 0;
+        int32_t* outIndices = (int32_t*)outIndicesPtr;
+        uint32_t* finalMask = stack[0];
+        uint32_t* delMaskArray = (uint32_t*)deletedBitmaskPtr;
+
+        for (int w = 0; w < numWords; w++) {
+            uint32_t validMask = finalMask[w];
+            
+            if (delMaskArray != nullptr) {
+                validMask &= ~(delMaskArray[w]);
+            }
+
+            // Optional: Mask out bits beyond 'rows' in the final word
+            if (w == numWords - 1 && (rows % 32) != 0) {
+                validMask &= ((1U << (rows % 32)) - 1);
+            }
+
+            int baseIdx = w * 32;
+            while (validMask) {
+#ifdef _MSC_VER
+                unsigned long tz;
+                _BitScanForward(&tz, validMask);
+#else
+                int tz = __builtin_ctz(validMask); 
+#endif
+                outIndices[matchCount++] = baseIdx + tz;
+                validMask &= (validMask - 1); // Clear lowest set bit
+            }
+        }
+
+        // Cleanup Pool
+        for (int i = 0; i < MAX_DEPTH; i++) {
+            free_aligned(maskPool[i]);
+        }
+
+        env->ReleasePrimitiveArrayCritical(jRpn, rpn, 0);
         return matchCount;
     }
 }
