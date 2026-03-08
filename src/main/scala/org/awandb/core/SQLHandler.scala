@@ -1285,40 +1285,78 @@ object SQLHandler {
            var mathPushedDown = false
 
            // ---------------------------------------------------------
-           // [FIX] JSqlParser 4.x Cross-Version Assignment Extractor
+           // [FIX] JSqlParser Cross-Version Assignment Extractor
            // ---------------------------------------------------------
            val colNamesList = scala.collection.mutable.ArrayBuffer[String]()
            val exprList = scala.collection.mutable.ArrayBuffer[Expression]()
 
            try {
-               // Try modern getUpdateSets() first (JSqlParser 4.6+)
-               val updateSetsMethod = update.getClass.getMethod("getUpdateSets")
-               val updateSets = updateSetsMethod.invoke(update).asInstanceOf[java.util.List[Any]].asScala
-               for (uSet <- updateSets) {
-                   val cs = uSet.getClass.getMethod("getColumns").invoke(uSet).asInstanceOf[java.util.List[Column]].asScala
-                   
-                   // [CRITICAL FIX] Locally catch getExpressions vs getValues!
-                   val es = try {
-                       uSet.getClass.getMethod("getExpressions").invoke(uSet).asInstanceOf[java.util.List[Expression]].asScala
-                   } catch {
-                       case _: Exception => 
-                           uSet.getClass.getMethod("getValues").invoke(uSet).asInstanceOf[java.util.List[Expression]].asScala
+               val methods = update.getClass.getMethods
+               // 1. ALWAYS check for Modern JSqlParser first!
+               val updateSetsMethodOpt = methods.find(_.getName == "getUpdateSets")
+
+               if (updateSetsMethodOpt.isDefined) {
+                   // Modern JSqlParser (>= 4.6 and 5.0+)
+                   val updateSetsObj = updateSetsMethodOpt.get.invoke(update)
+                   if (updateSetsObj != null) {
+                       val updateSets = updateSetsObj.asInstanceOf[java.util.List[Any]].asScala
+                       for (uSet <- updateSets) {
+                           if (uSet != null) {
+                               val uMethods = uSet.getClass.getMethods
+                               
+                               // Safely extract Columns
+                               val csOpt = uMethods.find(_.getName == "getColumns")
+                               val cs = if (csOpt.isDefined) {
+                                   val res = csOpt.get.invoke(uSet)
+                                   if (res != null) res.asInstanceOf[java.util.List[Column]].asScala else scala.collection.mutable.Buffer.empty[Column]
+                               } else scala.collection.mutable.Buffer.empty[Column]
+                               
+                               // Safely extract Values/Expressions
+                               val esOpt = uMethods.find(_.getName == "getValues").orElse(uMethods.find(_.getName == "getExpressions"))
+                               val es = if (esOpt.isDefined) {
+                                   val res = esOpt.get.invoke(uSet)
+                                   if (res != null) res.asInstanceOf[java.util.List[Expression]].asScala else scala.collection.mutable.Buffer.empty[Expression]
+                               } else scala.collection.mutable.Buffer.empty[Expression]
+                               
+                               // Handle Nested ExpressionLists natively (JSqlParser 4.7 tuple sets vs 5.0 flat inheritance)
+                               val finalEs = if (es.size == 1 && es(0) != null && es(0).getClass.getSimpleName.contains("ExpressionList")) {
+                                   val innerMethods = es(0).getClass.getMethods
+                                   val innerOpt = innerMethods.find(_.getName == "getExpressions").orElse(innerMethods.find(_.getName == "getValues"))
+                                   if (innerOpt.isDefined) {
+                                       val innerRes = innerOpt.get.invoke(es(0))
+                                       if (innerRes != null) innerRes.asInstanceOf[java.util.List[Expression]].asScala else es
+                                   } else if (es(0).isInstanceOf[java.util.List[_]]) {
+                                       es(0).asInstanceOf[java.util.List[Expression]].asScala
+                                   } else es
+                               } else es
+
+                               val len = math.min(cs.size, finalEs.size)
+                               for (i <- 0 until len) {
+                                   if (cs(i) != null && finalEs(i) != null) {
+                                       colNamesList.append(cleanColName(cs(i).getFullyQualifiedName))
+                                       exprList.append(finalEs(i))
+                                   }
+                               }
+                           }
+                       }
                    }
-                   
-                   for (i <- cs.indices) {
+               } else {
+                   // 2. Fallback to Legacy JSqlParser (< 4.6) ONLY if getUpdateSets doesn't exist
+                   val cs = update.getClass.getMethod("getColumns").invoke(update).asInstanceOf[java.util.List[Column]].asScala
+                   val es = update.getClass.getMethod("getExpressions").invoke(update).asInstanceOf[java.util.List[Expression]].asScala
+                   val len = math.min(cs.size, es.size)
+                   for (i <- 0 until len) {
                        colNamesList.append(cleanColName(cs(i).getFullyQualifiedName))
                        exprList.append(es(i))
                    }
                }
            } catch {
-               case _: Exception => 
-                   // Fallback for older JSqlParser versions
-                   val cs = update.getClass.getMethod("getColumns").invoke(update).asInstanceOf[java.util.List[Column]].asScala
-                   val es = update.getClass.getMethod("getExpressions").invoke(update).asInstanceOf[java.util.List[Expression]].asScala
-                   for (i <- cs.indices) {
-                       colNamesList.append(cleanColName(cs(i).getFullyQualifiedName))
-                       exprList.append(es(i))
-                   }
+               case e: Exception => 
+                   return SQLResult(true, s"Error parsing UPDATE assignments: ${e.getClass.getSimpleName} - ${e.getMessage}")
+           }
+
+           if (colNamesList.isEmpty) {
+              return SQLResult(true, "Error: No columns to update.")
            }
 
            // ---------------------------------------------------------
