@@ -327,5 +327,7 @@ extern "C" {
         if (blockPtr == 0) return;
         ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
         colHeaders[colIdx].vector_dim = dim;
+        colHeaders[colIdx].type = TYPE_VECTOR;
+        colHeaders[colIdx].stride = dim * sizeof(float);
     }
 }

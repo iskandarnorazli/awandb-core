@@ -476,7 +476,7 @@ class AwanTable(
   }
 
   // ---------------------------------------------------------
-  // 🚀 TRUE ZERO-COPY BULK INGESTION (Bypasses WAL & Delta Store)
+  // TRUE ZERO-COPY BULK INGESTION (Bypasses WAL & Delta Store)
   // ---------------------------------------------------------
   def bulkLoadFromArrowPointers(
       colNames: Array[String], 
@@ -520,6 +520,15 @@ class AwanTable(
       val blockPtr = blockManager.createAndPersistBlockFromPointers(
           rowCount, alignedTypes, alignedData, alignedOffsets, alignedSizes, alignedDims
       )
+
+      // [CRITICAL FIX] Bind the native vector metadata directly to the Arrow-copied block!
+      if (blockPtr != 0L) {
+          for (i <- columnOrder.indices) {
+              if (alignedTypes(i) == 3 && alignedDims(i) > 0) {
+                  org.awandb.core.jni.NativeBridge.setVectorDimNative(blockPtr, i, alignedDims(i))
+              }
+          }
+      }
 
       // Update Primary Index (Fetch ONLY the ID column into the JVM)
       if (blockPtr != 0L && !columns.values.head.isString && !columns.values.head.isVector) {
@@ -854,7 +863,7 @@ class AwanTable(
      totalCounts
   }
 
-  def executeGroupBy(keyCol: String, valCol: String): Map[Int, Long] = withEpoch {
+  def executeGroupBy(keyCol: String, valCol: String, aggFunc: String = "SUM"): Map[Int, Long] = withEpoch {
     val keyIdx = columnOrder.indexOf(keyCol)
     val valIdx = columnOrder.indexOf(valCol)
     if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
@@ -888,7 +897,8 @@ class AwanTable(
                var i = 0
                while (i < resultBatch.count) {
                  val k = keys(i)
-                 localMap(k) = localMap.getOrElse(k, 0L) + vals(i)
+                 val v = if (aggFunc == "COUNT") 1L else vals(i)
+                 localMap(k) = localMap.getOrElse(k, 0L) + v
                  i += 1
                }
                resultBatch = aggOp.next() 
@@ -916,7 +926,7 @@ class AwanTable(
       while (i < keyColData.length) {
         if (!ramDeleted.get(i)) {
           val k = keyColData(i)
-          val v = valColData(i).toLong
+          val v = if (aggFunc == "COUNT") 1L else valColData(i).toLong
           // Merge RAM values directly into the final C++ Map
           finalMap(k) = finalMap.getOrElse(k, 0L) + v
         }

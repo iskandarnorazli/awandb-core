@@ -257,4 +257,55 @@ class AwanSQLRegressionSpec extends AnyFlatSpec with Matchers {
     res.message should include("Match -> LeftKey: 1")
     res.message should include("Match -> LeftKey: 2")
   }
+
+  it should "execute multi-column UPDATEs including strings and AVX math without truncation" in {
+    clearDataDir("data/regression_update")
+    execSafe("CREATE TABLE regression_update (id INT, price INT, name STRING)")
+    
+    execSafe("INSERT INTO regression_update VALUES (1, 100, 'Alice')")
+    execSafe("INSERT INTO regression_update VALUES (2, 200, 'Bob')")
+    
+    // 1. Math Update (Proves AVX mutator works natively)
+    val resMath = execSafe("UPDATE regression_update SET price = price + 1000 WHERE id = 1 RETURNING")
+    resMath.affectedRows shouldBe 1L
+    resMath.message should include("1100")
+    
+    // 2. String Update (Proves the string quote fallback works)
+    val resStr = execSafe("UPDATE regression_update SET name = 'Alice_Updated' WHERE id = 1 RETURNING")
+    resStr.affectedRows shouldBe 1L
+    resStr.message should include("Alice_Updated")
+
+    // 3. Multi-Column Mixed Update (Proves JSqlParser doesn't truncate the column list!)
+    val resMulti = execSafe("UPDATE regression_update SET price = price + 500, name = 'Bob_Updated' WHERE id = 2 RETURNING")
+    resMulti.affectedRows shouldBe 1L
+    resMulti.message should include("700")
+    resMulti.message should include("Bob_Updated")
+  }
+
+  it should "correctly apply OLAP aggregations and evaluate LIMIT after aggregation" in {
+    clearDataDir("data/regression_olap")
+    execSafe("CREATE TABLE regression_olap (id INT, category INT, sales INT)")
+
+    // Insert 5 rows totaling 500 in sales
+    execSafe("INSERT INTO regression_olap VALUES (1, 10, 100)")
+    execSafe("INSERT INTO regression_olap VALUES (2, 10, 100)")
+    execSafe("INSERT INTO regression_olap VALUES (3, 20, 100)")
+    execSafe("INSERT INTO regression_olap VALUES (4, 20, 100)")
+    execSafe("INSERT INTO regression_olap VALUES (5, 20, 100)")
+
+    // 1. The LIMIT bug trap: LIMIT 2 should NOT slice the base table to 2 rows before summing
+    val resLimit = execSafe("SELECT SUM(sales) FROM regression_olap LIMIT 2")
+    resLimit.columnarData(0).asInstanceOf[Array[String]](0) shouldBe "500" // If the bug exists, this will equal "200"
+
+    // 2. The GROUP BY COUNT trap: Engine currently crashes expecting SUM
+    val resGroup = execSafe("SELECT category, COUNT(*) as cnt FROM regression_olap GROUP BY category ORDER BY category ASC")
+    resGroup.affectedRows shouldBe 2L
+    
+    val catArr = resGroup.columnarData(0).asInstanceOf[Array[Int]]
+    val cntArr = resGroup.columnarData(1).asInstanceOf[Array[String]]
+    catArr(0) shouldBe 10
+    cntArr(0) shouldBe "2"
+    catArr(1) shouldBe 20
+    cntArr(1) shouldBe "3"
+  }
 }

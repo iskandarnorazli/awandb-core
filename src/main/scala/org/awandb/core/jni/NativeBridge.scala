@@ -486,4 +486,13 @@ object NativeBridge {
   def setVectorDim(blockPtr: Long, colIdx: Int, dim: Int): Unit = {
     instance.setVectorDimNative(blockPtr, colIdx, dim)
   }
+
+  def bulkLoadArrowStringsNative(blockPtr: Long, colIdx: Int, offsetPtr: Long, dataPtr: Long, rowCount: Int): Unit = {
+    instance.bulkLoadArrowStringsNative(blockPtr, colIdx, offsetPtr, dataPtr, rowCount)
+  }
+  
+  // [CRITICAL FIX] Rename this from 'setVectorDim' to 'setVectorDimNative'
+  def setVectorDimNative(blockPtr: Long, colIdx: Int, dim: Int): Unit = {
+    instance.setVectorDimNative(blockPtr, colIdx, dim)
+  }
 }

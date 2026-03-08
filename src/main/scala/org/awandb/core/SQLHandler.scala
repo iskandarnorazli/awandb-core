@@ -153,6 +153,8 @@ object SQLHandler {
                 val func = expr.asInstanceOf[Function]
                 if (func.getName.equalsIgnoreCase("sum")) {
                    valCol = s"SUM(${cleanColName(func.getParameters.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName)})"
+                } else if (func.getName.equalsIgnoreCase("count")) {
+                   valCol = "COUNT(*)"
                 }
               }
             }
@@ -461,6 +463,15 @@ object SQLHandler {
 
         // Standard O(N) AVX Composite Filter Pushdown
         val ast = parseWhere(where, table)
+        
+        // 🚀 [CRITICAL FIX] FAST-PATH FOR PRE-COMPUTED MATERIALIZED ASTs
+        // If the entire WHERE clause was just a Vector Search or IN clause, 
+        // the IDs are already computed in Scala! Do NOT push OP_MAT down to C++!
+        ast match {
+           case mat: MaterializedAST => return mat.matchedIds
+           case _ => // Continue to AVX engine for composite trees (AND/OR)
+        }
+
         table.executeCompositeFilter(ast.toRPN(table))
       }
 
@@ -479,6 +490,8 @@ object SQLHandler {
             
             var valCol = ""
             var rawValCol = ""
+            var aggFunc = "SUM"
+            
             for (item <- plain.getSelectItems.asScala) {
               val expr = item.getExpression
               if (expr != null && expr.isInstanceOf[Function]) {
@@ -486,19 +499,24 @@ object SQLHandler {
                 if (func.getName.equalsIgnoreCase("sum")) {
                   rawValCol = func.getParameters.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName
                   valCol = cleanColName(rawValCol)
+                  aggFunc = "SUM"
+                } else if (func.getName.equalsIgnoreCase("count")) {
+                  rawValCol = "*"
+                  valCol = keyCol // Dummy column to prevent out of bounds
+                  aggFunc = "COUNT"
                 }
               }
             }
             if (valCol.isEmpty)
-              return SQLResult(true, "Error: GROUP BY currently requires a SUM(column) aggregate.")
+              return SQLResult(true, "Error: GROUP BY currently requires a SUM(column) or COUNT(*) aggregate.")
             
-            val resultMap = leftTable.executeGroupBy(keyCol, valCol)
+            val resultMap = leftTable.executeGroupBy(keyCol, valCol, aggFunc)
             if (resultMap.isEmpty) return SQLResult(false, "   GROUP BY Results: (Empty)", 0L)
 
             var finalResultSeq = resultMap.toSeq
 
             // ---------------------------------------------------------
-            // [NEW] HAVING Clause Evaluator (Scala-side execution)
+            // HAVING Clause Evaluator (Scala-side execution)
             // ---------------------------------------------------------
             val havingExpr = plain.getHaving
             if (havingExpr != null) {
@@ -507,7 +525,7 @@ object SQLHandler {
                 def evaluateHaving(expr: Expression, k: Int, v: Long): Boolean = {
                     def extractValue(e: Expression): Long = e match {
                         case l: LongValue => l.getValue
-                        case f: Function if f.getName.toUpperCase == "SUM" => v
+                        case f: Function if f.getName.toUpperCase == "SUM" || f.getName.toUpperCase == "COUNT" => v
                         case c: Column if cleanColName(c.getFullyQualifiedName) == keyCol => k.toLong
                         case p: Parenthesis => extractValue(p.getExpression)
                         case _ => throw new RuntimeException(s"Unsupported expression in HAVING: $e")
@@ -560,12 +578,13 @@ object SQLHandler {
               }
             }
             
+            val aggHeader = if (aggFunc == "COUNT") "COUNT(*)" else s"SUM($rawValCol)"
             val sb = new StringBuilder()
-            sb.append(s"\n   GROUP BY Results ($rawKey | SUM($rawValCol)):\n")
+            sb.append(s"\n   GROUP BY Results ($rawKey | $aggHeader):\n")
             finalResultSeq.foreach { case (k, v) => sb.append(s"   $k | $v\n") }
             
-            // 🚀 DYNAMIC COLUMNAR TRANSPOSITION FOR GROUP BY
-            val outSchema = Array((keyCol, "INT"), (s"SUM($valCol)", "STRING"))
+            // DYNAMIC COLUMNAR TRANSPOSITION FOR GROUP BY
+            val outSchema = Array((keyCol, "INT"), (aggHeader, "STRING"))
             val numRows = finalResultSeq.size
             val keyArr = new Array[Int](numRows)
             val valArr = new Array[String](numRows)

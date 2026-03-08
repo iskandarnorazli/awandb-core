@@ -112,11 +112,12 @@ class ComplexSQLSpec extends AnyFunSuite with BeforeAndAfterAll {
     assert(res.contains("SQL Error: Column not found"), "Engine did not catch missing group-by column")
   }
 
-  test("4. Aggregation: Should reject GROUP BY without a SUM function") {
+  test("4. Aggregation: Should reject GROUP BY without a SUM or COUNT function") {
     val sql = "SELECT customer_id FROM orders GROUP BY customer_id"
     val res = SQLHandler.execute(sql)
     
-    assert(res.contains("Error: GROUP BY currently requires a SUM(column) aggregate"), "Engine did not enforce MVP SUM requirement")
+    // [FIX] Updated assertion string to match the new SQLHandler error message for COUNT(*) support
+    assert(res.contains("Error: GROUP BY currently requires a SUM(column) or COUNT(*) aggregate."), "Engine did not enforce MVP SUM/COUNT requirement")
   }
 
   // -------------------------------------------------------------------------
