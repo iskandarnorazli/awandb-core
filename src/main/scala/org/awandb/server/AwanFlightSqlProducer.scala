@@ -35,14 +35,45 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
   // ========================================================================
   
   override def getFlightInfoStatement(command: CommandStatementQuery, context: FlightProducer.CallContext, descriptor: FlightDescriptor): FlightInfo = {
-    val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
+    val sql = command.getQuery
     
-    // [FIX] Pack a TicketStatementQuery into the Ticket (Required by Arrow Spec)
+    // 1. Intercept the requested format
+    val mw = context.getMiddleware(FormatMiddleware.Key)
+    val format = if (mw != null) mw.asInstanceOf[FormatMiddleware].getFormat() else "string"
+
+    // 2. 🚀 PREDICT THE SCHEMA USING THE INFERENCER!
+    val schemaFields = if (format == "arrow") {
+      val inferred = SQLHandler.inferSchema(sql)
+      
+      if (inferred.isEmpty) {
+         // DDL Fallback: Empty arrays still need the standard query_result confirmation
+         List(Field.nullable("query_result", new ArrowType.Utf8())).asJava
+      } else {
+         // Map our inferred AwanDB types into pure Arrow Flight Schema Fields
+         inferred.map { case (colName, colType) =>
+           val arrowType = colType match {
+             case "INT" => new ArrowType.Int(32, true)
+             case "STRING" => new ArrowType.Utf8()
+             case _ => new ArrowType.Utf8() // Fallback
+           }
+           Field.nullable(colName, arrowType)
+         }.toList.asJava
+      }
+    } else {
+      // Legacy path
+      List(Field.nullable("query_result", new ArrowType.Utf8())).asJava
+    }
+
+    val schema = new Schema(schemaFields)
+    
+    // 3. Pack a TicketStatementQuery into the Ticket (Required by Arrow Spec)
     val ticketMsg = TicketStatementQuery.newBuilder()
-      .setStatementHandle(com.google.protobuf.ByteString.copyFromUtf8(command.getQuery))
+      .setStatementHandle(com.google.protobuf.ByteString.copyFromUtf8(sql))
       .build()
       
     val ticket = new Ticket(com.google.protobuf.Any.pack(ticketMsg).toByteArray)
+    
+    // 4. Return the Promise!
     new FlightInfo(schema, descriptor, List(new FlightEndpoint(ticket, location)).asJava, -1, -1)
   }
 
@@ -82,15 +113,24 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       if (result.affectedRows == 0L) {
         // [EMPTY PATH] Safely close stream without sending data payloads
         val emptySchema = if (format == "arrow") {
-           new Schema(result.schema.map { case (colName, colType) =>
-              val arrowType = colType match {
-                case "INT" => new ArrowType.Int(32, true)
-                case "STRING" => new ArrowType.Utf8()
-                case _ => new ArrowType.Utf8()
-              }
-              Field.nullable(colName, arrowType)
-           }.toList.asJava)
+           if (result.schema.isEmpty) {
+              // 🚀 SCHEMA FALLBACK FIX: Match the getFlightInfo promise for DDL queries!
+              // If SQLHandler returned an empty schema (e.g., DROP TABLE), we must still 
+              // send the 1-column layout that the ADBC client is expecting.
+              new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
+           } else {
+               // Standard typed schema for 0-row SELECTs (e.g., SELECT * WHERE 1=0)
+               new Schema(result.schema.map { case (colName, colType) =>
+                  val arrowType = colType match {
+                    case "INT" => new ArrowType.Int(32, true)
+                    case "STRING" => new ArrowType.Utf8()
+                    case _ => new ArrowType.Utf8()
+                  }
+                  Field.nullable(colName, arrowType)
+               }.toList.asJava)
+           }
         } else {
+           // Legacy String Payload Format
            new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
         }
         

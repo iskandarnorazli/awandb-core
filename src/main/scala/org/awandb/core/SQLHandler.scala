@@ -119,6 +119,106 @@ object SQLHandler {
     tables.put(name.toLowerCase, table)
   }
 
+  // ---------------------------------------------------------
+  // [NEW] SCHEMATIC PRECOGNITION (For Arrow Flight Promises)
+  // ---------------------------------------------------------
+  def inferSchema(sql: String): Array[(String, String)] = {
+    try {
+      val statement = CCJSqlParserUtil.parse(sql)
+
+      def cleanColName(rawName: String): String = {
+        val lower = rawName.toLowerCase
+        if (lower.contains(".")) lower.split("\\.").last else lower
+      }
+
+      statement match {
+        case select: Select =>
+          val plain = select.getSelectBody.asInstanceOf[PlainSelect]
+          val tableName = plain.getFromItem.asInstanceOf[Table].getName.toLowerCase
+          val table = tables.get(tableName)
+          
+          // If table doesn't exist yet, fallback gracefully
+          if (table == null) return Array(("query_result", "STRING")) 
+
+          // 1. Check for GROUP BY
+          val groupBy = plain.getGroupBy
+          if (groupBy != null) {
+            val rawKey = groupBy.getGroupByExpressionList.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName
+            val keyCol = cleanColName(rawKey)
+            
+            var valCol = ""
+            for (item <- plain.getSelectItems.asScala) {
+              val expr = item.getExpression
+              if (expr != null && expr.isInstanceOf[Function]) {
+                val func = expr.asInstanceOf[Function]
+                if (func.getName.equalsIgnoreCase("sum")) {
+                   valCol = s"SUM(${cleanColName(func.getParameters.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName)})"
+                }
+              }
+            }
+            return Array((keyCol, "INT"), (valCol, "STRING"))
+          }
+
+          // 2. Check for pure aggregations or standard projections
+          val isAsterisk = plain.getSelectItems.get(0).toString == "*"
+          if (isAsterisk) {
+            return table.columnOrder.map(col => {
+              val isString = table.columns(col).isString
+              val isVector = table.columns(col).isVector
+              val typ = if (isVector) "VECTOR" else if (isString) "STRING" else "INT"
+              (col, typ)
+            }).toArray
+          }
+
+          val schemaFields = scala.collection.mutable.ArrayBuffer[(String, String)]()
+          for (item <- plain.getSelectItems.asScala) {
+            val expr = item.getExpression
+            val alias = if (item.getAlias != null) item.getAlias.getName else null
+
+            if (expr != null && expr.isInstanceOf[Function]) {
+              val func = expr.asInstanceOf[Function]
+              val funcName = func.getName.toUpperCase
+              val rawParam = if (func.isAllColumns) "*" else {
+                val params = func.getParameters
+                if (params != null && params.getExpressions != null && params.getExpressions.size() > 0) {
+                  val firstExpr = params.getExpressions.get(0)
+                  firstExpr match {
+                    case _: net.sf.jsqlparser.statement.select.AllColumns => "*"
+                    case c: Column => c.getFullyQualifiedName
+                    case _ => firstExpr.toString
+                  }
+                } else "*"
+              }
+              
+              val header = if (alias != null) alias else if (rawParam == "*") s"$funcName(*)" else s"$funcName($rawParam)"
+              schemaFields.append((header, "STRING")) 
+            } else if (expr != null && expr.isInstanceOf[Column]) {
+              val c = expr.asInstanceOf[Column]
+              val rawColName = c.getFullyQualifiedName
+              val cleanName = cleanColName(rawColName)
+              
+              val header = if (alias != null) alias else rawColName
+              val typ = if (table.columns.contains(cleanName)) {
+                val col = table.columns(cleanName)
+                if (col.isVector) "VECTOR" else if (col.isString) "STRING" else "INT"
+              } else "STRING"
+              
+              schemaFields.append((header, typ))
+            } else {
+               schemaFields.append((if(alias!=null) alias else expr.toString, "STRING"))
+            }
+          }
+          schemaFields.toArray
+
+        case _ => 
+          // DDL/DML queries like DROP TABLE return no columns
+          Array.empty[(String, String)]
+      }
+    } catch {
+      case _: Exception => Array(("query_result", "STRING")) // Safe fallback on parse error
+    }
+  }
+
   def execute(sql: String): SQLResult ={
     val hasReturning = sql.toUpperCase().contains(" RETURNING")
     try {

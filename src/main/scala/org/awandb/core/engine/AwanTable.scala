@@ -1697,29 +1697,38 @@ class AwanTable(
   }
 
   def close(): Unit = {
+    // 1. Mark as closed so threads know to stop immediately
+    // This breaks the while(!isClosed) loop in the daemon.
     rwLock.writeLock().lock()
     try {
       if (isClosed) return
-      
-      // [CRITICAL FIX] Mark as closed FIRST to break the daemon's while-loop
-      isClosed = true 
-      
-      // Now safely wake it up so it can instantly exit
-      daemonThread.interrupt() 
-      
-      engineManager.stopEngine()
-      engineManager.joinThread()
-      blockManager.close()
-      wal.close()
-      columns.values.foreach(_.close())
-      org.awandb.core.jni.NativeBridge.freeMainStore(resultIndexBuffer)
+      isClosed = true
     } finally {
       rwLock.writeLock().unlock()
     }
     
-    // [CRITICAL FIX] Wait for the daemon to fully die before allowing JVM to delete files!
-    // We do this OUTSIDE the write lock to prevent deadlocks.
-    try { daemonThread.join(2000) } catch { case _: Exception => }
+    // 2. Signal interruptions to break any Thread.sleep() delays instantly
+    daemonThread.interrupt() 
+    engineManager.stopEngine()
+    
+    // 3. WAIT for background threads to safely exit the C++ boundary!
+    // We MUST NOT use a timeout here. If the daemon is deep inside C++ 
+    // building filters, we must let it finish, otherwise we will Segfault!
+    try { daemonThread.join() } catch { case _: Exception => }
+    try { engineManager.joinThread() } catch { case _: Exception => }
+    
+    // 4. Safely free native memory now that no thread is using it
+    rwLock.writeLock().lock()
+    try {
+      blockManager.close()
+      wal.close()
+      columns.values.foreach(_.close())
+      if (resultIndexBuffer != 0L) {
+          org.awandb.core.jni.NativeBridge.freeMainStore(resultIndexBuffer)
+      }
+    } finally {
+      rwLock.writeLock().unlock()
+    }
   }
 
   def persist(dir: String): Unit = flush() 
