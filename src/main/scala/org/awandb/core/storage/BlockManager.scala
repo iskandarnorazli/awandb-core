@@ -196,28 +196,42 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
 
   /**
    * [TRUE ZERO-COPY] Create and Persist Block directly from Off-Heap Pointers.
-   * Bypasses the JVM Heap entirely.
+   * Bypasses the JVM Heap entirely. Supports Int, String, and Vector.
    */
-  def createAndPersistBlockFromPointers(rowCount: Int, colTypes: Array[Int], pointers: Array[Long]): Long = {
+  def createAndPersistBlockFromPointers(
+      rowCount: Int, 
+      colTypes: Array[Int], 
+      dataPointers: Array[Long],
+      offsetPointers: Array[Long],
+      colSizesBytes: Array[Int],
+      vectorDims: Array[Int]
+  ): Long = {
     if (rowCount == 0) return 0L
     val colCount = colTypes.length
 
-    val colSizesBytes = new Array[Int](colCount)
-    for (i <- 0 until colCount) {
-      colTypes(i) match {
-        case 0 => colSizesBytes(i) = rowCount * 4 // INT is 4 bytes
-        case _ => throw new UnsupportedOperationException("Only INT supported for True Zero-Copy Bulk Load right now.")
-      }
-    }
-
-    // 1. Allocate the C++ Block natively
+    // 1. Allocate the C++ Block natively (Memory sizing is dynamically calculated by the Network Layer)
     val blockPtr = NativeBridge.createBlock(rowCount, colCount, colSizesBytes)
 
     try {
       // 2. Blast memory from Arrow directly into the C++ Column offsets!
       for (colIdx <- 0 until colCount) {
-        val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
-        NativeBridge.memcpy(pointers(colIdx), colPtr, colSizesBytes(colIdx))
+        val colType = colTypes(colIdx)
+        val destPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
+        
+        colType match {
+            case 0 => // INT (Direct Memcpy)
+                NativeBridge.memcpy(dataPointers(colIdx), destPtr, colSizesBytes(colIdx))
+                
+            case 2 => // STRING (Offset Buffer + Data Buffer Translation)
+                NativeBridge.bulkLoadArrowStrings(blockPtr, colIdx, offsetPointers(colIdx), dataPointers(colIdx), rowCount)
+                
+            case 3 => // VECTOR (Set Dimension Metadata, then Direct Memcpy)
+                NativeBridge.setVectorDim(blockPtr, colIdx, vectorDims(colIdx))
+                NativeBridge.memcpy(dataPointers(colIdx), destPtr, colSizesBytes(colIdx))
+                
+            case _ => 
+                throw new UnsupportedOperationException(s"Unsupported colType $colType for True Zero-Copy Bulk Load.")
+        }
       }
 
       // 3. Save to disk (This implicitly computes Min/Max Zone Maps via C++)

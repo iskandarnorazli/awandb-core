@@ -153,4 +153,63 @@ class AwanBulkEgressSpec extends AnyFlatSpec with Matchers {
     nameVector.close()
     allocator.close()
   }
+
+  it should "safely egress AI Vectors (Array[Float] into Arrow ListVector)" in {
+    val allocator = new RootAllocator()
+    
+    // Create an Arrow ListVector of Floats
+    val listVector = org.apache.arrow.vector.complex.ListVector.empty("embeddings", allocator)
+    val innerFloatVec = listVector.addOrGetVector[org.apache.arrow.vector.Float4Vector](
+      org.apache.arrow.vector.types.pojo.FieldType.nullable(
+        // [FIX] Removed .pojo from the FloatingPointPrecision path
+        new org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint(org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE)
+      )
+    ).getVector
+
+    val rowCount = 2
+    val dim = 3
+    
+    // Mock the Array[Array[Float]] output from AwanTable.getRow()
+    val engineOutput = Array(
+        Array(0.1f, 0.2f, 0.3f),
+        Array(0.9f, 0.8f, 0.7f)
+    )
+
+    listVector.allocateNew()
+    innerFloatVec.allocateNew(rowCount * dim)
+
+    // Simulate the AwanFlightSqlProducer Vector packing loop
+    var i = 0
+    var floatOffset = 0
+    while (i < rowCount) {
+        val vec = engineOutput(i)
+        
+        // Write Offsets
+        listVector.getOffsetBuffer.setInt(i * 4L, floatOffset)
+        
+        // Write Floats
+        var j = 0
+        while (j < dim) {
+            innerFloatVec.setSafe(floatOffset + j, vec(j))
+            j += 1
+        }
+        
+        listVector.getOffsetBuffer.setInt((i + 1) * 4L, floatOffset + dim)
+        listVector.setNotNull(i)
+        
+        floatOffset += dim
+        i += 1
+    }
+    
+    innerFloatVec.setValueCount(floatOffset)
+    listVector.setValueCount(rowCount)
+
+    // Assertions
+    listVector.getValueCount shouldBe 2
+    innerFloatVec.getValueCount shouldBe 6
+    innerFloatVec.get(4) shouldBe 0.8f
+
+    listVector.close()
+    allocator.close()
+  }
 }

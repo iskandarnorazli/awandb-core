@@ -346,30 +346,68 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
 
               if (rowCount > 0) {
                 // ---------------------------------------------------------
-                // 🚀 PRE-CHECK: CAN WE USE THE BULK FAST-PATH?
+                // UNIVERSAL ZERO-COPY FAST-PATH DETECTOR
                 // ---------------------------------------------------------
                 var canBulkLoad = true
-                val colNames = new Array[String](root.getFieldVectors.size())
-                val pointers = new Array[Long](root.getFieldVectors.size())
+                val colCount = root.getFieldVectors.size()
                 
-                for (colIdx <- 0 until root.getFieldVectors.size()) {
+                // FIX: Strict Schema Width Check!
+                // If the Arrow payload is missing columns, force it into the Slow Path for padding.
+                if (colCount != table.columns.size) {
+                    canBulkLoad = false
+                }
+                
+                val colNames = new Array[String](colCount)
+                val colTypes = new Array[Int](colCount)
+                val dataPtrs = new Array[Long](colCount)
+                val offsetPtrs = new Array[Long](colCount)
+                val sizes = new Array[Int](colCount)
+                val dims = new Array[Int](colCount)
+                
+                for (colIdx <- 0 until colCount) {
                     val vector = root.getVector(colIdx)
                     val vectorName = vector.getName.toLowerCase
                     val resolvedName = if (table.columns.contains(vectorName)) vectorName else table.columnOrder(colIdx)
                     
                     colNames(colIdx) = resolvedName
+                    val col = table.columns(resolvedName)
                     
-                    if (vector.isInstanceOf[IntVector] && !table.columns(resolvedName).isString && !table.columns(resolvedName).isVector) {
-                        pointers(colIdx) = vector.asInstanceOf[IntVector].getDataBuffer.memoryAddress()
-                    } else {
+                    if (vector.isInstanceOf[IntVector] && !col.isString && !col.isVector) {
+                        colTypes(colIdx) = 0
+                        dataPtrs(colIdx) = vector.asInstanceOf[IntVector].getDataBuffer.memoryAddress()
+                        sizes(colIdx) = rowCount * 4
+                    } 
+                    else if (vector.isInstanceOf[VarCharVector] && col.isString) {
+                        colTypes(colIdx) = 2
+                        val strVec = vector.asInstanceOf[VarCharVector]
+                        offsetPtrs(colIdx) = strVec.getOffsetBuffer.memoryAddress()
+                        dataPtrs(colIdx) = strVec.getDataBuffer.memoryAddress()
+                        
+                        // Exact String Pool Calculation! 
+                        // Arrow's offset buffer safely tracks the exact byte-length of all variable strings combined.
+                        val totalStringBytes = strVec.getOffsetBuffer.getInt(rowCount * 4L)
+                        sizes(colIdx) = (rowCount * 16) + totalStringBytes
+                    }
+                    else if (vector.isInstanceOf[org.apache.arrow.vector.complex.ListVector] && col.isVector) {
+                        colTypes(colIdx) = 3
+                        val listVec = vector.asInstanceOf[org.apache.arrow.vector.complex.ListVector]
+                        val innerVec = listVec.getDataVector.asInstanceOf[org.apache.arrow.vector.Float4Vector]
+                        
+                        val totalFloats = innerVec.getValueCount
+                        val dim = if (rowCount > 0) totalFloats / rowCount else 0
+                        
+                        dims(colIdx) = dim
+                        dataPtrs(colIdx) = innerVec.getDataBuffer.memoryAddress()
+                        sizes(colIdx) = totalFloats * 4 // 4 bytes per float
+                    }
+                    else {
                         canBulkLoad = false
                     }
                 }
 
                 if (canBulkLoad) {
-                    // 🚀🚀🚀 TRUE ZERO-COPY BULK INGESTION 🚀🚀🚀
-                    // Bypasses WAL, Delta Buffers, and the 1,000,000 row flush limits completely!
-                    table.bulkLoadFromArrowPointers(colNames, pointers, rowCount)
+                    // TRUE ZERO-COPY FOR ALL TYPES
+                    table.bulkLoadFromArrowPointers(colNames, colTypes, dataPtrs, offsetPtrs, sizes, dims, rowCount)
                     totalRowsIngested += rowCount
                 } else {
                     // 🐢🐢🐢 SLOW PATH: Legacy Mixed-Type Ingestion 🐢🐢🐢
@@ -400,6 +438,24 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                           val rawPointer = intVector.getDataBuffer.memoryAddress()
                           table.insertBatchFromPointer(colName, rawPointer, rowCount)
                         
+                        // 🚀 NEW: Handle 64-bit Integers (Downcast to 32-bit for JVM Legacy Loop)
+                        case bigIntVector: org.apache.arrow.vector.BigIntVector =>
+                          if (table.columns(colName).isString || table.columns(colName).isVector) {
+                            root.clear()
+                            throw CallStatus.INVALID_ARGUMENT
+                              .withDescription(s"Unsupported Arrow stream type. Found: BigIntVector on column '$colName'")
+                              .toRuntimeException
+                          }
+                          
+                          val arr = new Array[Int](rowCount)
+                          var i = 0
+                          while (i < rowCount) {
+                            // Read 64-bit Long and downcast to 32-bit Int
+                            arr(i) = bigIntVector.get(i).toInt 
+                            i += 1
+                          }
+                          table.insertBatch(colName, arr)
+
                         case stringVector: org.apache.arrow.vector.VarCharVector =>
                           if (!table.columns(colName).isString) {
                             root.clear()

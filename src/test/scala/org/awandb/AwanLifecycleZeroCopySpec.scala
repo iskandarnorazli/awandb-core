@@ -4,8 +4,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * * http://www.apache.org/licenses/LICENSE-2.0
 
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,8 +61,13 @@ class AwanLifecycleZeroCopySpec extends AnyFlatSpec with Matchers {
 
     // 2. TRUE ZERO-COPY INGRESS
     val columnNames = Array("id", "val1")
-    val rawPointers = Array(idVector.getDataBuffer.memoryAddress(), val1Vector.getDataBuffer.memoryAddress())
-    table.bulkLoadFromArrowPointers(columnNames, rawPointers, rowCount)
+    val colTypes = Array(0, 0)
+    val dataPtrs = Array(idVector.getDataBuffer.memoryAddress(), val1Vector.getDataBuffer.memoryAddress())
+    val offsetPtrs = Array(0L, 0L)
+    val sizes = Array(rowCount * 4, rowCount * 4)
+    val dims = Array(0, 0)
+    
+    table.bulkLoadFromArrowPointers(columnNames, colTypes, dataPtrs, offsetPtrs, sizes, dims, rowCount)
 
     // --- LIFECYCLE VALIDATIONS ---
 
@@ -107,11 +111,20 @@ class AwanLifecycleZeroCopySpec extends AnyFlatSpec with Matchers {
     
     val allocator = new RootAllocator()
     val idVector = new IntVector("id", allocator)
-    idVector.allocateNew(100)
-    for (i <- 0 until 100) idVector.setSafe(i, i)
-    idVector.setValueCount(100)
+    val rowCount = 100
+    
+    idVector.allocateNew(rowCount)
+    for (i <- 0 until rowCount) idVector.setSafe(i, i)
+    idVector.setValueCount(rowCount)
 
-    table.bulkLoadFromArrowPointers(Array("id"), Array(idVector.getDataBuffer.memoryAddress()), 100)
+    val colNames = Array("id")
+    val colTypes = Array(0)
+    val dataPtrs = Array(idVector.getDataBuffer.memoryAddress())
+    val offsetPtrs = Array(0L)
+    val sizes = Array(rowCount * 4)
+    val dims = Array(0)
+
+    table.bulkLoadFromArrowPointers(colNames, colTypes, dataPtrs, offsetPtrs, sizes, dims, rowCount)
     table.close() // Shut down the database
 
     // --- BOOT 2: Recover from Disk ---

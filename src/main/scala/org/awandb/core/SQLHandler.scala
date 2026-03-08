@@ -221,8 +221,14 @@ object SQLHandler {
 
   def execute(sql: String): SQLResult ={
     val hasReturning = sql.toUpperCase().contains(" RETURNING")
+    
+    // [FIX 1] Strip RETURNING before passing to JSqlParser
+    val cleanSql = if (hasReturning) {
+       sql.replaceAll("(?i)\\s+RETURNING\\s*\\*?\\s*$", "")
+    } else sql
+
     try {
-      val statement = CCJSqlParserUtil.parse(sql)
+      val statement = CCJSqlParserUtil.parse(cleanSql)
 
       // Global Helper to strip table prefixes for internal array lookups
       def cleanColName(rawName: String): String = {
@@ -254,12 +260,31 @@ object SQLHandler {
          expr match {
             case p: Parenthesis => parseWhere(p.getExpression, table)
             
-            // [NEW] Build AST instead of executing Scala set intersections
+            // Build AST instead of executing Scala set intersections
             case and: AndExpression =>
                AndAST(parseWhere(and.getLeftExpression, table), parseWhere(and.getRightExpression, table))
             case or: OrExpression =>
                OrAST(parseWhere(or.getLeftExpression, table), parseWhere(or.getRightExpression, table))
+
+            // [FIX 2] Standalone Vector Search Interceptor
+            case func: Function if func.getName.equalsIgnoreCase("VECTOR_SEARCH") =>
+               val params = func.getParameters.getExpressions
+               val rawCol = params.get(0) match {
+                  case c: Column => c.getFullyQualifiedName
+                  case _ => params.get(0).toString
+               }
+               val colName = cleanColName(rawCol)
+               if (!table.columnOrder.contains(colName)) throw new RuntimeException(s"Column '$colName' not found.")
                
+               val vecStr = params.get(1).asInstanceOf[StringValue].getValue
+               val threshold = params.get(2) match {
+                  case d: net.sf.jsqlparser.expression.DoubleValue => d.getValue.toFloat
+                  case l: net.sf.jsqlparser.expression.LongValue => l.getValue.toFloat
+                  case _ => 0.0f
+               }
+               val vecArray = vecStr.stripPrefix("[").stripSuffix("]").split(",").map(_.trim.toFloat)
+               MaterializedAST(table.queryVector(colName, vecArray, threshold))
+
             case eq: EqualsTo =>
                val left = eq.getLeftExpression
                // VECTOR SEARCH INTERCEPTOR (Wrap in MaterializedAST)
@@ -699,12 +724,18 @@ object SQLHandler {
                         val ramMatches = NativeBridge.joinProbe(mapPtr, probeKeysPtr, chunkLen, outPayloadsPtr, outIndicesPtr)
                         totalMatches += ramMatches
                         
+                        // [FIX 3] Extract outIndicesPtr to find the LeftKey
                         if (ramMatches > 0 && totalMatches <= 10) {
                             val toRead = math.min(ramMatches, 2)
                             val matchedPayloads = new Array[Long](toRead)
+                            val matchedIndices = new Array[Int](toRead)
+                            
                             NativeBridge.copyToScalaLong(outPayloadsPtr, matchedPayloads, toRead)
+                            NativeBridge.copyToScala(outIndicesPtr, matchedIndices, toRead)
+                            
                             for (i <- 0 until toRead) {
-                               sb.append(s"   [RAM] Match -> RightPayload: ${matchedPayloads(i)}\n")
+                               val leftKey = chunk(matchedIndices(i))
+                               sb.append(s"   [RAM] Match -> LeftKey: $leftKey | RightPayload: ${matchedPayloads(i)}\n")
                             }
                         }
                         offset += chunkLen
@@ -844,11 +875,11 @@ object SQLHandler {
           // -------------------------------------------------------
           // 4. HEAVY PIPELINE: MATERIALIZE -> SORT -> LIMIT -> PROJECT
           // -------------------------------------------------------
+          // [FIX 4] Use safe scanAll() for full table scans
           var finalRows = if (where == null) {
-              leftTable.scanFiltered(leftTable.columnOrder.head, 2, 0).toSeq
+              leftTable.scanAll().toSeq 
           } else {
               try { 
-                  // [FIX] Route to O(1) Interceptor
                   val matchedIds = executeWhereFast(where, leftTable)
                   matchedIds.flatMap(id => leftTable.getRow(id)).toSeq
               } 
@@ -991,6 +1022,7 @@ object SQLHandler {
           val numRows = finalRows.length
           val columnarData = new Array[Any](numCols)
           
+          // [FIX 5] Null-Safe Columnar Transposition
           for (c <- 0 until numCols) {
              val colName = requestedColumns(c)
              val isString = leftTable.columns(colName).isString
@@ -998,11 +1030,17 @@ object SQLHandler {
              
              if (isVector) {
                 val arr = new Array[Array[Float]](numRows)
-                for (r <- 0 until numRows) arr(r) = finalRows(r)(projectionIndices(c)).asInstanceOf[Array[Float]]
+                for (r <- 0 until numRows) {
+                    val v = finalRows(r)(projectionIndices(c))
+                    arr(r) = if (v != null) v.asInstanceOf[Array[Float]] else Array.empty[Float]
+                }
                 columnarData(c) = arr
              } else if (isString) {
                 val arr = new Array[String](numRows)
-                for (r <- 0 until numRows) arr(r) = finalRows(r)(projectionIndices(c)).toString
+                for (r <- 0 until numRows) {
+                    val v = finalRows(r)(projectionIndices(c))
+                    arr(r) = if (v != null) v.toString else "N/A"
+                }
                 columnarData(c) = arr
              } else {
                 val arr = new Array[Int](numRows)
@@ -1217,28 +1255,59 @@ object SQLHandler {
            if (table == null) return SQLResult(true, s"Error: Table '$tableName' not found.")
            
            val where = update.getWhere
-           
-           // [FIX] Route to O(1) Interceptor
            val idsToUpdate = executeWhereFast(where, table)
 
-           val cols = update.getColumns.asScala
-           val exprs = update.getExpressions.asScala
-           
            var affected = 0L
            val sb = new StringBuilder()
            if (hasReturning) sb.append(s"\n   Found Rows:\n")
 
-           // ---------------------------------------------------------
-           // AVX MATH INTERCEPTOR (Fast Path)
-           // ---------------------------------------------------------
-           val standardCols = scala.collection.mutable.ArrayBuffer[Column]()
+           val standardCols = scala.collection.mutable.ArrayBuffer[String]()
            val standardExprs = scala.collection.mutable.ArrayBuffer[Expression]()
            var mathPushedDown = false
 
-           for (i <- cols.indices) {
-              val rawName = cols(i).getFullyQualifiedName
-              val colName = cleanColName(rawName)
-              val expr = exprs(i)
+           // ---------------------------------------------------------
+           // [FIX] JSqlParser 4.x Cross-Version Assignment Extractor
+           // ---------------------------------------------------------
+           val colNamesList = scala.collection.mutable.ArrayBuffer[String]()
+           val exprList = scala.collection.mutable.ArrayBuffer[Expression]()
+
+           try {
+               // Try modern getUpdateSets() first (JSqlParser 4.6+)
+               val updateSetsMethod = update.getClass.getMethod("getUpdateSets")
+               val updateSets = updateSetsMethod.invoke(update).asInstanceOf[java.util.List[Any]].asScala
+               for (uSet <- updateSets) {
+                   val cs = uSet.getClass.getMethod("getColumns").invoke(uSet).asInstanceOf[java.util.List[Column]].asScala
+                   
+                   // [CRITICAL FIX] Locally catch getExpressions vs getValues!
+                   val es = try {
+                       uSet.getClass.getMethod("getExpressions").invoke(uSet).asInstanceOf[java.util.List[Expression]].asScala
+                   } catch {
+                       case _: Exception => 
+                           uSet.getClass.getMethod("getValues").invoke(uSet).asInstanceOf[java.util.List[Expression]].asScala
+                   }
+                   
+                   for (i <- cs.indices) {
+                       colNamesList.append(cleanColName(cs(i).getFullyQualifiedName))
+                       exprList.append(es(i))
+                   }
+               }
+           } catch {
+               case _: Exception => 
+                   // Fallback for older JSqlParser versions
+                   val cs = update.getClass.getMethod("getColumns").invoke(update).asInstanceOf[java.util.List[Column]].asScala
+                   val es = update.getClass.getMethod("getExpressions").invoke(update).asInstanceOf[java.util.List[Expression]].asScala
+                   for (i <- cs.indices) {
+                       colNamesList.append(cleanColName(cs(i).getFullyQualifiedName))
+                       exprList.append(es(i))
+                   }
+           }
+
+           // ---------------------------------------------------------
+           // AVX MATH INTERCEPTOR (Fast Path)
+           // ---------------------------------------------------------
+           for (i <- colNamesList.indices) {
+              val colName = colNamesList(i)
+              val expr = exprList(i)
 
               expr match {
                   case add: Addition if add.getRightExpression.isInstanceOf[LongValue] =>
@@ -1255,7 +1324,7 @@ object SQLHandler {
                       mathPushedDown = true
                   case _ =>
                       // Not a math operation, keep it for the standard row-by-row update loop
-                      standardCols.append(cols(i))
+                      standardCols.append(colName)
                       standardExprs.append(expr)
               }
            }
@@ -1282,14 +1351,20 @@ object SQLHandler {
               if (oldRowOpt.isDefined) {
                  val row = oldRowOpt.get
                  for (i <- standardCols.indices) {
-                    val rawName = standardCols(i).getFullyQualifiedName
-                    val colName = cleanColName(rawName)
+                    val colName = standardCols(i)
                     val colIdx = table.columnOrder.indexOf(colName)
                     if (colIdx != -1) {
                         standardExprs(i) match {
                             case l: LongValue => row(colIdx) = l.getValue.toInt
                             case s: StringValue => row(colIdx) = s.getValue
-                            case _ => // Ignore unsupported types
+                            case other => 
+                                // Bulletproof string fallback
+                                val str = other.toString
+                                if (str.startsWith("'") && str.endsWith("'")) {
+                                    row(colIdx) = str.substring(1, str.length - 1)
+                                } else {
+                                    try { row(colIdx) = str.toInt } catch { case _: Exception => row(colIdx) = str }
+                                }
                         }
                     }
                  }

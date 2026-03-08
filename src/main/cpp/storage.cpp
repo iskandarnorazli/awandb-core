@@ -273,4 +273,59 @@ extern "C" {
         out[1] = colHeaders[colIdx].max_int;
         env->ReleasePrimitiveArrayCritical(outMinMax, out, 0);
     }
+
+    // --- ZERO-COPY STRING INGRESS ---
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_bulkLoadArrowStringsNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jlong offsetPtr, jlong dataPtr, jint rowCount
+    ) {
+        if (blockPtr == 0 || offsetPtr == 0 || dataPtr == 0) return;
+
+        ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
+        GermanString* dest = (GermanString*)((uint8_t*)blockPtr + colHeaders[colIdx].data_offset);
+        
+        int32_t* offsets = (int32_t*)offsetPtr;
+        const char* data = (const char*)dataPtr;
+
+        // The dynamic String Pool begins exactly after the GermanString array!
+        char* pool = (char*)dest + (rowCount * sizeof(GermanString));
+        uint32_t poolOffset = 0;
+
+        for (int i = 0; i < rowCount; i++) {
+            int32_t start = offsets[i];
+            int32_t len = offsets[i+1] - start;
+            
+            dest[i].len = len;
+            
+            if (len > 0) {
+                int prefixLen = len < 4 ? len : 4;
+                std::memset(dest[i].prefix, 0, 4);
+                std::memcpy(dest[i].prefix, data + start, prefixLen);
+                
+                if (len <= 12) {
+                    // Inline short strings directly into the struct
+                    std::memset(dest[i].suffix, 0, 8);
+                    if (len > 4) {
+                        std::memcpy(dest[i].suffix, data + start + 4, len - 4);
+                    }
+                } else {
+                    // Route long strings to the dynamic String Pool
+                    std::memcpy(pool + poolOffset, data + start, len);
+                    dest[i].ptr = pool + poolOffset;
+                    poolOffset += len;
+                }
+            } else {
+                std::memset(dest[i].prefix, 0, 4);
+                std::memset(dest[i].suffix, 0, 8);
+            }
+        }
+    }
+
+    // --- ZERO-COPY VECTOR METADATA ---
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_setVectorDimNative(
+        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint dim
+    ) {
+        if (blockPtr == 0) return;
+        ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
+        colHeaders[colIdx].vector_dim = dim;
+    }
 }

@@ -62,7 +62,7 @@ extern "C" {
             return 0; // Everything was deleted! Nothing to compact.
         }
 
-        // 3. Allocate the new block based on surviving rows
+        // 3. Allocate the new block based on surviving rows & exact string pool sizes
         size_t headerSize = sizeof(BlockHeader);
         size_t colHeadersSize = colCount * sizeof(ColumnHeader);
         size_t metaDataSize = headerSize + colHeadersSize;
@@ -71,7 +71,26 @@ extern "C" {
 
         size_t totalDataSize = 0;
         for (uint32_t c = 0; c < colCount; c++) {
-            totalDataSize += totalSurvivingRows * firstColHeaders[c].stride;
+            if (firstColHeaders[c].type == TYPE_STRING) {
+                size_t poolSize = 0;
+                for (int b = 0; b < numBlocks; b++) {
+                    BlockHeader* bh = (BlockHeader*)blocks[b];
+                    ColumnHeader* oldCh = (ColumnHeader*)((uint8_t*)blocks[b] + sizeof(BlockHeader));
+                    GermanString* oldColData = (GermanString*)((uint8_t*)blocks[b] + oldCh[c].data_offset);
+                    uint8_t* bitmask = (uint8_t*)bitmasks[b];
+                    
+                    int rows = bh->row_count;
+                    for (int r = 0; r < rows; r++) {
+                        bool isDeleted = (bitmask != nullptr && bitmasks[b] != 0) && ((bitmask[r >> 3] & (1 << (r & 7))) != 0);
+                        if (!isDeleted && oldColData[r].len > 12) {
+                            poolSize += oldColData[r].len;
+                        }
+                    }
+                }
+                totalDataSize += (totalSurvivingRows * sizeof(GermanString)) + poolSize;
+            } else {
+                totalDataSize += totalSurvivingRows * firstColHeaders[c].stride;
+            }
         }
 
         size_t totalBlockSize = dataStartOffset + totalDataSize + 512; // +512 for AVX padding
@@ -91,7 +110,25 @@ extern "C" {
         for (uint32_t c = 0; c < colCount; c++) {
             newCh[c] = firstColHeaders[c]; // Copy metadata (stride, type, etc)
             newCh[c].data_offset = currentOffset;
-            newCh[c].data_length = totalSurvivingRows * newCh[c].stride;
+            
+            if (newCh[c].type == TYPE_STRING) {
+                // Determine this specific string column's exact length to offset the next column properly
+                size_t colDataLen = totalSurvivingRows * sizeof(GermanString);
+                for (int b = 0; b < numBlocks; b++) {
+                    BlockHeader* bh = (BlockHeader*)blocks[b];
+                    ColumnHeader* oldCh = (ColumnHeader*)((uint8_t*)blocks[b] + sizeof(BlockHeader));
+                    GermanString* oldColData = (GermanString*)((uint8_t*)blocks[b] + oldCh[c].data_offset);
+                    uint8_t* bitmask = (uint8_t*)bitmasks[b];
+                    for (int r = 0; r < bh->row_count; r++) {
+                        bool isDeleted = (bitmask != nullptr && bitmasks[b] != 0) && ((bitmask[r >> 3] & (1 << (r & 7))) != 0);
+                        if (!isDeleted && oldColData[r].len > 12) colDataLen += oldColData[r].len;
+                    }
+                }
+                newCh[c].data_length = colDataLen;
+            } else {
+                newCh[c].data_length = totalSurvivingRows * newCh[c].stride;
+            }
+            
             newCh[c].min_int = std::numeric_limits<int32_t>::max();
             newCh[c].max_int = std::numeric_limits<int32_t>::min();
             currentOffset += newCh[c].data_length;
@@ -128,7 +165,7 @@ extern "C" {
                 newCh[c].min_int = currentMin;
                 newCh[c].max_int = currentMax;
 
-            } else if (newCh[c].type == TYPE_VECTOR) { // [NEW] Vector Compaction Logic
+            } else if (newCh[c].type == TYPE_VECTOR) {
                 float* newColData = (float*)(newRawPtr + newCh[c].data_offset);
                 uint32_t dim = newCh[c].vector_dim;
                 uint32_t newIdx = 0;
@@ -143,14 +180,41 @@ extern "C" {
                     for (int r = 0; r < rows; r++) {
                         bool isDeleted = (bitmask != nullptr && bitmasks[b] != 0) && ((bitmask[r >> 3] & (1 << (r & 7))) != 0);
                         if (!isDeleted) {
-                            // Copy exactly 'dim' floats per surviving row
                             std::memcpy(&newColData[newIdx * dim], &oldColData[r * dim], dim * sizeof(float));
                             newIdx++;
                         }
                     }
                 }
+                
+            } else if (newCh[c].type == TYPE_STRING) { // [NEW] German String Compaction Logic
+                GermanString* newColData = (GermanString*)(newRawPtr + newCh[c].data_offset);
+                char* newPool = (char*)newColData + (totalSurvivingRows * sizeof(GermanString));
+                uint32_t newIdx = 0;
+                uint32_t poolOffset = 0;
+
+                for (int b = 0; b < numBlocks; b++) {
+                    BlockHeader* bh = (BlockHeader*)blocks[b];
+                    ColumnHeader* oldCh = (ColumnHeader*)((uint8_t*)blocks[b] + sizeof(BlockHeader));
+                    GermanString* oldColData = (GermanString*)((uint8_t*)blocks[b] + oldCh[c].data_offset);
+                    uint8_t* bitmask = (uint8_t*)bitmasks[b];
+
+                    int rows = bh->row_count;
+                    for (int r = 0; r < rows; r++) {
+                        bool isDeleted = (bitmask != nullptr && bitmasks[b] != 0) && ((bitmask[r >> 3] & (1 << (r & 7))) != 0);
+                        if (!isDeleted) {
+                            newColData[newIdx] = oldColData[r]; // Copy 16-byte header & inline prefix/suffix
+                            
+                            if (newColData[newIdx].len > 12) {
+                                // Deep copy the dynamic string payload from the old pool into the new continuous pool
+                                std::memcpy(newPool + poolOffset, oldColData[r].ptr, newColData[newIdx].len);
+                                newColData[newIdx].ptr = newPool + poolOffset; // Re-wire the C++ memory pointer
+                                poolOffset += newColData[newIdx].len;
+                            }
+                            newIdx++;
+                        }
+                    }
+                }
             }
-            // TODO: Add TYPE_STRING loop when needed.
         }
 
         // Release JVM Arrays

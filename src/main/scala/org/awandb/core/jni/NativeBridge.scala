@@ -158,6 +158,9 @@ class NativeBridge {
 
   // --- NATIVE MATH MUTATION ---
   @native def avxUpdateMathNative(blockPtr: Long, colIdx: Int, opChar: Char, operand: Int, indicesPtr: Long, count: Int): Unit
+
+  @native def bulkLoadArrowStringsNative(blockPtr: Long, colIdx: Int, offsetPtr: Long, dataPtr: Long, rowCount: Int): Unit
+  @native def setVectorDimNative(blockPtr: Long, colIdx: Int, dim: Int): Unit
 }
 
 // -----------------------------------------------------------
@@ -474,5 +477,13 @@ object NativeBridge {
     if (blockPtr != 0 && count > 0) {
       instance.avxUpdateMathNative(blockPtr, colIdx, opChar, operand, indicesPtr, count)
     }
+  }
+
+  def bulkLoadArrowStrings(blockPtr: Long, colIdx: Int, offsetPtr: Long, dataPtr: Long, rowCount: Int): Unit = {
+    instance.bulkLoadArrowStringsNative(blockPtr, colIdx, offsetPtr, dataPtr, rowCount)
+  }
+  
+  def setVectorDim(blockPtr: Long, colIdx: Int, dim: Int): Unit = {
+    instance.setVectorDimNative(blockPtr, colIdx, dim)
   }
 }

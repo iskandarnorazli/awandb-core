@@ -41,6 +41,9 @@ class AwanTable(
   val columns = new LinkedHashMap[String, NativeColumn]()
   val columnOrder = new ListBuffer[String]()
   
+  // Track Vector Dimensions dynamically to bypass C++ Stride defaults
+  private val vectorDims = new ConcurrentHashMap[String, Int]()
+  
   // [PERFORMANCE] Pre-allocated Buffer
   val resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
   
@@ -232,7 +235,11 @@ class AwanTable(
         } else {
            // DISK READ (Using NativeBridge)
            val colPtr = NativeBridge.getColumnPtr(blockPtr, colIdx)
-           val stride = NativeBridge.getColumnStride(blockPtr, colIdx)
+           
+           // 🚀 FIX: Override the C++ Stride dynamically for AI Vectors
+           val baseStride = NativeBridge.getColumnStride(blockPtr, colIdx)
+           val stride = if (col.isVector) vectorDims.getOrDefault(colName, math.max(1, baseStride / 4)) * 4 else baseStride
+           
            val cellPtr = NativeBridge.getOffsetPointer(colPtr, rowId * stride.toLong)
            
            if (col.isVector) {
@@ -271,7 +278,8 @@ class AwanTable(
             var c = 0
             for(colName <- columnOrder) {
                val col = columns(colName)
-               if(col.isString) row(c) = col.deltaStringBuffer(i)
+               if(col.isVector) row(c) = col.deltaVectorBuffer(i)
+               else if(col.isString) row(c) = col.deltaStringBuffer(i)
                else row(c) = col.deltaIntBuffer(i)
                c += 1
             }
@@ -280,18 +288,33 @@ class AwanTable(
 
       // 2. Disk Iterator (Forced eager evaluation with .toList)
       val diskList = blockManager.getLoadedBlocks.toList.flatMap { blockPtr =>
-          val rowCount = NativeBridge.getRowCount(blockPtr)
+          val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
           (0 until rowCount).collect {
              case i if !blockManager.isDeleted(blockPtr, i) =>
                  val row = new Array[Any](columns.size)
                  var c = 0
                  for(colName <- columnOrder) {
-                     val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
-                     val stride = NativeBridge.getColumnStride(blockPtr, c)
-                     val cellPtr = NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
-                     val temp = new Array[Int](1)
-                     NativeBridge.copyToScala(cellPtr, temp, 1)
-                     row(c) = temp(0)
+                     val col = columns(colName)
+                     val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, c)
+                     
+                     // 🚀 FIX: Safe Stride calculation for Full Scans
+                     val baseStride = org.awandb.core.jni.NativeBridge.getColumnStride(blockPtr, c)
+                     val stride = if (col.isVector) vectorDims.getOrDefault(colName, math.max(1, baseStride / 4)) * 4 else baseStride
+                     
+                     val cellPtr = org.awandb.core.jni.NativeBridge.getOffsetPointer(colPtr, i * stride.toLong)
+                     
+                     if (col.isVector) {
+                         val dim = stride / 4
+                         val tempBuf = new Array[Float](dim)
+                         org.awandb.core.jni.NativeBridge.copyToScalaFloat(cellPtr, tempBuf, dim)
+                         row(c) = tempBuf
+                     } else if (col.isString) {
+                         row(c) = "N/A (Disk)"
+                     } else {
+                         val temp = new Array[Int](1)
+                         org.awandb.core.jni.NativeBridge.copyToScala(cellPtr, temp, 1)
+                         row(c) = temp(0)
+                     }
                      c += 1
                  }
                  row
@@ -455,33 +478,51 @@ class AwanTable(
   // ---------------------------------------------------------
   // 🚀 TRUE ZERO-COPY BULK INGESTION (Bypasses WAL & Delta Store)
   // ---------------------------------------------------------
-  def bulkLoadFromArrowPointers(colNames: Array[String], rawPointers: Array[Long], rowCount: Int): Unit = {
+  def bulkLoadFromArrowPointers(
+      colNames: Array[String], 
+      colTypesIn: Array[Int], 
+      dataPtrsIn: Array[Long], 
+      offsetPtrsIn: Array[Long], 
+      sizesIn: Array[Int], 
+      dimsIn: Array[Int], 
+      rowCount: Int
+  ): Unit = {
     rwLock.writeLock().lock()
     try {
       if (isClosed) throw new IllegalStateException("Table is closed")
 
-      // 1. Align the incoming Arrow pointers with the physical table.columnOrder
-      val alignedPointers = new Array[Long](columnOrder.size)
-      val colTypes = new Array[Int](columnOrder.size)
+      val colCount = columnOrder.size
+      val alignedTypes = new Array[Int](colCount)
+      val alignedData = new Array[Long](colCount)
+      val alignedOffsets = new Array[Long](colCount)
+      val alignedSizes = new Array[Int](colCount)
+      val alignedDims = new Array[Int](colCount)
 
+      // Align incoming Arrow columns to the physical C++ Block column order
       for (i <- columnOrder.indices) {
         val name = columnOrder(i)
         val inIdx = colNames.indexOf(name)
         if (inIdx == -1) throw new IllegalArgumentException(s"Missing column in bulk load: $name")
         
-        alignedPointers(i) = rawPointers(inIdx)
-
-        val col = columns(name)
-        if (col.isVector) colTypes(i) = 3
-        else if (col.isString) colTypes(i) = 2
-        else colTypes(i) = 0
+        alignedTypes(i) = colTypesIn(inIdx)
+        alignedData(i) = dataPtrsIn(inIdx)
+        alignedOffsets(i) = offsetPtrsIn(inIdx)
+        alignedSizes(i) = sizesIn(inIdx)
+        alignedDims(i) = dimsIn(inIdx)
+        
+        // FIX: Cache the exact dimension size for Future Reads!
+        if (alignedTypes(i) == 3 && alignedDims(i) > 0) {
+            vectorDims.put(name, alignedDims(i))
+        }
       }
 
-      // 2. Delegate to BlockManager for 100% Native C++ block creation & memcpy
-      val blockPtr = blockManager.createAndPersistBlockFromPointers(rowCount, colTypes, alignedPointers)
+      // Delegate to BlockManager for 100% Native C++ block creation & memcpy
+      val blockPtr = blockManager.createAndPersistBlockFromPointers(
+          rowCount, alignedTypes, alignedData, alignedOffsets, alignedSizes, alignedDims
+      )
 
-      // 3. Update Primary Index (Fetch ONLY the ID column into the JVM)
-      if (blockPtr != 0L) {
+      // Update Primary Index (Fetch ONLY the ID column into the JVM)
+      if (blockPtr != 0L && !columns.values.head.isString && !columns.values.head.isVector) {
         val idColIdx = 0 // Assuming Col 0 is PK
         val idDestPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, idColIdx)
 
@@ -1132,20 +1173,20 @@ class AwanTable(
     // 3. Disk Filter (Predicate Pushdown) safely protected by withEpoch
     // [PHASE 1 FIX] Change .iterator to .toList to force eager materialization!
     val diskList = snapshotBlocks.flatMap { blockPtr =>
-       val rowCount = NativeBridge.getRowCount(blockPtr)
-       val outIndicesPtr = NativeBridge.allocMainStore(rowCount * 4) // [FIX] Multiply by 4 for bytes
+       val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
+       val outIndicesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4) // [FIX] Multiply by 4 for bytes
        
        val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
        
        try {
-           val matchCount = NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
+           val matchCount = org.awandb.core.jni.NativeBridge.avxFilterBlock(blockPtr, colIdx, opType, targetVal, outIndicesPtr, bitmaskPtr)
            
            if (matchCount == 0) {
                List.empty[Array[Any]]
            } else {
                // 1. First, pull the exact matched row indices into Scala
                val matchingIndices = new Array[Int](matchCount)
-               NativeBridge.copyToScala(outIndicesPtr, matchingIndices, matchCount)
+               org.awandb.core.jni.NativeBridge.copyToScala(outIndicesPtr, matchingIndices, matchCount)
                
                // 2. Allocate Scala arrays to hold the fully extracted columns
                val colsData = new Array[Array[Int]](columnOrder.size)
@@ -1154,27 +1195,31 @@ class AwanTable(
                    val col = columns(columnOrder(c))
                    if (!col.isString && !col.isVector) { // Safe-guard against native string/vector corruption
                        colsData(c) = new Array[Int](matchCount)
-                       val colPtr = NativeBridge.getColumnPtr(blockPtr, c)
-                       val tempValuesPtr = NativeBridge.allocMainStore(matchCount * 4) // [FIX] Multiply by 4 for bytes
+                       val colPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, c)
+                       val tempValuesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(matchCount * 4) // [FIX] Multiply by 4 for bytes
                        
-                       NativeBridge.batchRead(colPtr, outIndicesPtr, matchCount, tempValuesPtr)
-                       NativeBridge.copyToScala(tempValuesPtr, colsData(c), matchCount)
-                       NativeBridge.freeMainStore(tempValuesPtr)
+                       org.awandb.core.jni.NativeBridge.batchRead(colPtr, outIndicesPtr, matchCount, tempValuesPtr)
+                       org.awandb.core.jni.NativeBridge.copyToScala(tempValuesPtr, colsData(c), matchCount)
+                       org.awandb.core.jni.NativeBridge.freeMainStore(tempValuesPtr)
                    }
                }
                
                // 4. Transpose the columnar arrays into rows purely in Scala (Zero JNI overhead)
-               // Eagerly materialize into a List
+               // [FIX] The scanFiltered Safety Patch! Do not map missing string/vector values to raw nulls.
+               // [FIX 7] Do not map missing string/vector values to raw nulls.
                (0 until matchCount).map { i =>
                    val row = new Array[Any](columnOrder.size)
                    for (c <- columnOrder.indices) {
-                       row(c) = if (colsData(c) != null) colsData(c)(i) else null
+                       val col = columns(columnOrder(c))
+                       if (col.isVector) row(c) = Array.empty[Float]
+                       else if (col.isString) row(c) = "N/A (Disk)"
+                       else row(c) = if (colsData(c) != null) colsData(c)(i) else null
                    }
                    row
                }.toList
            }
        } finally {
-           NativeBridge.freeMainStore(outIndicesPtr)
+           org.awandb.core.jni.NativeBridge.freeMainStore(outIndicesPtr)
            // Do NOT free bitmaskPtr here! BlockManager owns it.
        }
     }.toList // Force execution inside the EBMM boundary
