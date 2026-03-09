@@ -894,6 +894,10 @@ class AwanTable(
                NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
                NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
                
+               // 🚨 [CRITICAL FIX] FREE THE NATIVE MEMORY TO PREVENT OOM SEGFAULTS!
+               org.awandb.core.jni.NativeBridge.freeMainStore(resultBatch.keysPtr)
+               org.awandb.core.jni.NativeBridge.freeMainStore(resultBatch.valuesPtr)
+               
                var i = 0
                while (i < resultBatch.count) {
                  val k = keys(i)

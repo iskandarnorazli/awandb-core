@@ -490,7 +490,8 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     val activeBlocks = loadedBlocks.asScala.toSeq
     
     activeBlocks.foreach { ptr =>
-      NativeBridge.freeMainStore(ptr)
+      // [CRITICAL FIX] Invoke the C++ destructor to free the massive internal payloads!
+      NativeBridge.destroyBlock(ptr)
 
       val bitmaskPtr = nativeBitmaps.getOrDefault(ptr, 0L)
       if (bitmaskPtr != 0L) NativeBridge.freeMainStore(bitmaskPtr)
