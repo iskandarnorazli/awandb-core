@@ -75,12 +75,16 @@ class ComplexSQLSpec extends AnyFunSuite with BeforeAndAfterAll {
     ordersTable.flush()
   }
 
+  // In ComplexSQLSpec.scala
   override def afterAll(): Unit = {
     if (ordersTable != null) ordersTable.close()
     if (customersTable != null) customersTable.close()
     if (emptyTable != null) emptyTable.close()
     val dir = new File(dataDir)
     if (dir.exists()) deleteRecursively(dir)
+    
+    // The test suite will fail if any C++ pointers were left orphaned
+    org.awandb.core.engine.memory.NativeMemoryTracker.assertNoLeaks()
   }
 
   // -------------------------------------------------------------------------

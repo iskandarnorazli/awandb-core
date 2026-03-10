@@ -140,8 +140,8 @@ class TableScanOperator(
 
   override def close(): Unit = {
     if (batch != null) {
-        NativeBridge.freeMainStore(batch.keysPtr)
-        NativeBridge.freeMainStore(batch.valuesPtr)
+        // [FIX] Properly route to VectorBatch.close() to free keys, values, AND the selection vector!
+        batch.close()
     }
   }
 }

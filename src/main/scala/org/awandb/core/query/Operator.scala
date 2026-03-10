@@ -242,5 +242,7 @@ class HashAggOperator(child: Operator) extends Operator {
     if (mapPtr != 0) NativeBridge.freeAggregationResult(mapPtr)
     if (tempKeys != 0) NativeBridge.freeMainStore(tempKeys)
     if (tempVals != 0) NativeBridge.freeMainStore(tempVals)
+    // [FIX] Prevent the Aggregation result batch from leaking 3 pointers!
+    if (resultBatch != null) resultBatch.close() 
   }
 }

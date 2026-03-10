@@ -212,13 +212,22 @@ object NativeBridge {
   // --- Memory ---
   def getOffsetPointer(basePtr: Long, offsetBytes: Long): Long = 
       instance.getOffsetPointerNative(basePtr, offsetBytes)
+  // Inside object NativeBridge (Scala API layer)
+
   def allocMainStore(size: Long): Long = {
     val ptr = instance.allocMainStoreNative(size)
-    if (ptr == 0) throw new OutOfMemoryError(s"Native Alloc Failed: $size ints")
+    // Log the allocation
+    org.awandb.core.engine.memory.NativeMemoryTracker.recordAllocation(ptr, size)
     ptr
   }
-  
-  def freeMainStore(ptr: Long): Unit = instance.freeMainStoreNative(ptr)
+
+  def freeMainStore(ptr: Long): Unit = {
+    if (ptr != 0L) {
+      // Log the deallocation
+      org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(ptr)
+      instance.freeMainStoreNative(ptr)
+    }
+  }
   def loadData(ptr: Long, data: Array[Int]): Unit = instance.loadDataNative(ptr, data)
   def copyToScala(srcPtr: Long, dst: Array[Int], len: Int): Unit = instance.copyToScalaNative(srcPtr, dst, len)
   def copyToScalaLong(src: Long, dst: Array[Long], len: Int): Unit = instance.copyToScalaLongNative(src, dst, len)

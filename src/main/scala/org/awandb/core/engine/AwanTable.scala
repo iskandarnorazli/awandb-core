@@ -882,33 +882,41 @@ class AwanTable(
           override def call(): scala.collection.mutable.Map[Int, Long] = {
             val scanOp = new TableScanOperator(blockManager, subset.toArray, keyIdx, valIdx)
             val aggOp = new HashAggOperator(scanOp)
-            aggOp.open()
             
-            var resultBatch = aggOp.next() 
-            val localMap = scala.collection.mutable.Map[Int, Long]()
-            
-            // Loop until the operator is exhausted
-            while (resultBatch != null && resultBatch.count > 0) {
-               val keys = new Array[Int](resultBatch.count)
-               val vals = new Array[Long](resultBatch.count)
-               NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
-               NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
-               
-               // 🚨 [CRITICAL FIX] FREE THE NATIVE MEMORY TO PREVENT OOM SEGFAULTS!
-               org.awandb.core.jni.NativeBridge.freeMainStore(resultBatch.keysPtr)
-               org.awandb.core.jni.NativeBridge.freeMainStore(resultBatch.valuesPtr)
-               
-               var i = 0
-               while (i < resultBatch.count) {
-                 val k = keys(i)
-                 val v = if (aggFunc == "COUNT") 1L else vals(i)
-                 localMap(k) = localMap.getOrElse(k, 0L) + v
-                 i += 1
-               }
-               resultBatch = aggOp.next() 
+            try {
+              aggOp.open()
+              
+              var resultBatch = aggOp.next() 
+              val localMap = scala.collection.mutable.Map[Int, Long]()
+              
+              // Loop until the operator is exhausted
+              while (resultBatch != null) {
+                 if (resultBatch.count > 0) {
+                     val keys = new Array[Int](resultBatch.count)
+                     val vals = new Array[Long](resultBatch.count)
+                     NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
+                     NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
+                     
+                     var i = 0
+                     while (i < resultBatch.count) {
+                       val k = keys(i)
+                       val v = if (aggFunc == "COUNT") 1L else vals(i)
+                       localMap(k) = localMap.getOrElse(k, 0L) + v
+                       i += 1
+                     }
+                 }
+                 
+                 // REMOVED the hazardous freeMainStore calls here!
+                 
+                 resultBatch = aggOp.next() 
+              }
+              localMap
+            } finally {
+              // [CRITICAL FIX] Only close the ROOT operator!
+              // aggOp's C++ destructor will automatically delete scanOp.
+              // Calling scanOp.close() here causes a Double Free Segfault!
+              aggOp.close()
             }
-            aggOp.close()
-            localMap
           }
         }
       }
@@ -1115,7 +1123,9 @@ class AwanTable(
           val blockPtr = blockManager.getBlockPtr(bIdx)
           if (blockPtr != 0L) {
              val matchCount = diskRowIds.length
-             val tempIndicesPtr = NativeBridge.allocMainStore(matchCount)
+             
+             // [CRITICAL FIX] Multiply by 4 bytes per Int to prevent a C++ Buffer Overflow!
+             val tempIndicesPtr = NativeBridge.allocMainStore(matchCount * 4) 
              
              try {
                 // Copy the specific Row IDs to a C++ buffer
