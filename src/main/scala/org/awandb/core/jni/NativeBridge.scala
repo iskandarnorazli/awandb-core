@@ -216,7 +216,12 @@ object NativeBridge {
 
   def allocMainStore(size: Long): Long = {
     val ptr = instance.allocMainStoreNative(size)
-    // Log the allocation
+    
+    // [CRITICAL FIX] Catch failed allocations immediately to prevent Segfaults!
+    if (ptr == 0L) {
+      throw new OutOfMemoryError(s"Native memory allocation failed! Could not allocate $size bytes.")
+    }
+    
     org.awandb.core.engine.memory.NativeMemoryTracker.recordAllocation(ptr, size)
     ptr
   }
