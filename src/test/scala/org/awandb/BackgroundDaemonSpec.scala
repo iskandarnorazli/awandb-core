@@ -108,8 +108,9 @@ class BackgroundDaemonSpec extends AnyFunSuite with Matchers with BeforeAndAfter
       }
     }
 
-    // Wait for the stress test to finish (which gives the daemon plenty of time to run)
-    Await.result(stressTest, 5.seconds)
+    // [FIX] Increased from 5.seconds to 20.seconds. 
+    // macOS thread scheduling and sleep(2) resolution is much slower than Linux.
+    Await.result(stressTest, 20.seconds)
 
     // Force a flush of the newly inserted rows from the stress test
     table.flush()
