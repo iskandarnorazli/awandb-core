@@ -108,4 +108,11 @@ extern "C" {
             free_aligned((void*)ptr); 
         }
     }
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyLongsToScalaNative(
+        JNIEnv* env, jobject obj, jlong srcPtr, jlongArray dstArray, jint len
+    ) {
+        if (srcPtr == 0 || dstArray == nullptr || len <= 0) return;
+        env->SetLongArrayRegion(dstArray, 0, len, (const jlong*)srcPtr);
+    }
 }

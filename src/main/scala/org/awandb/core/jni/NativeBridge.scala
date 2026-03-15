@@ -161,6 +161,14 @@ class NativeBridge {
 
   @native def bulkLoadArrowStringsNative(blockPtr: Long, colIdx: Int, offsetPtr: Long, dataPtr: Long, rowCount: Int): Unit
   @native def setVectorDimNative(blockPtr: Long, colIdx: Int, dim: Int): Unit
+
+  // --- PHASE 4: O(1) DICTIONARY AGGREGATION ---
+  @native def aggregateArraySumNative(keysPtr: Long, valsPtr: Long, count: Int, maxDictId: Int): Long
+  @native def aggregateArrayExportNative(mapPtr: Long, outKeysPtr: Long, outValsPtr: Long): Int
+
+  @native def copyLongsToScalaNative(srcPtr: Long, dstArray: Array[Long], len: Int): Unit
+  @native def freeArrayAggregationResultNative(ptr: Long): Unit
+  @native def dictionaryGetSizeNative(ptr: Long): Int
 }
 
 // -----------------------------------------------------------
@@ -508,5 +516,26 @@ object NativeBridge {
   // [CRITICAL FIX] Rename this from 'setVectorDim' to 'setVectorDimNative'
   def setVectorDimNative(blockPtr: Long, colIdx: Int, dim: Int): Unit = {
     instance.setVectorDimNative(blockPtr, colIdx, dim)
+  }
+
+  def aggregateArraySum(keysPtr: Long, valsPtr: Long, count: Int, maxDictId: Int): Long = {
+    instance.aggregateArraySumNative(keysPtr, valsPtr, count, maxDictId)
+  }
+
+  def aggregateArrayExport(mapPtr: Long, outKeysPtr: Long, outValsPtr: Long): Int = {
+    instance.aggregateArrayExportNative(mapPtr, outKeysPtr, outValsPtr)
+  }
+
+  def copyLongsToScala(srcPtr: Long, dstArray: Array[Long], len: Int): Unit = {
+    if (srcPtr != 0 && len > 0) {
+      instance.copyLongsToScalaNative(srcPtr, dstArray, len)
+    }
+  }
+
+  def freeArrayAggregationResult(ptr: Long): Unit = instance.freeArrayAggregationResultNative(ptr)
+  
+  def dictionaryGetSize(ptr: Long): Int = {
+    if (ptr == 0) return 0
+    instance.dictionaryGetSizeNative(ptr)
   }
 }

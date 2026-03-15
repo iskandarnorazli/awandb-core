@@ -863,6 +863,9 @@ class AwanTable(
      totalCounts
   }
 
+  // ---------------------------------------------------------
+  // STANDARD HASH GROUP BY
+  // ---------------------------------------------------------
   def executeGroupBy(keyCol: String, valCol: String, aggFunc: String = "SUM"): Map[Int, Long] = withEpoch {
     val keyIdx = columnOrder.indexOf(keyCol)
     val valIdx = columnOrder.indexOf(valCol)
@@ -881,7 +884,8 @@ class AwanTable(
         new Callable[scala.collection.mutable.Map[Int, Long]] {
           override def call(): scala.collection.mutable.Map[Int, Long] = {
             val scanOp = new TableScanOperator(blockManager, subset.toArray, keyIdx, valIdx)
-            val aggOp = new HashAggOperator(scanOp)
+            // [FIX] Pass the aggFunc down to the operator
+            val aggOp = new HashAggOperator(scanOp, aggFunc)
             
             try {
               aggOp.open()
@@ -900,21 +904,17 @@ class AwanTable(
                      var i = 0
                      while (i < resultBatch.count) {
                        val k = keys(i)
-                       val v = if (aggFunc == "COUNT") 1L else vals(i)
+                       val v = vals(i) // [FIX] Values are completely accurate from C++ natively now
                        localMap(k) = localMap.getOrElse(k, 0L) + v
                        i += 1
                      }
                  }
-                 
-                 // REMOVED the hazardous freeMainStore calls here!
                  
                  resultBatch = aggOp.next() 
               }
               localMap
             } finally {
               // [CRITICAL FIX] Only close the ROOT operator!
-              // aggOp's C++ destructor will automatically delete scanOp.
-              // Calling scanOp.close() here causes a Double Free Segfault!
               aggOp.close()
             }
           }
@@ -931,16 +931,118 @@ class AwanTable(
     // 2. RAM: Aggregate Unflushed JVM Delta Buffers
     rwLock.readLock().lock()
     try {
-      val keyColData = columns(keyCol).deltaIntBuffer
-      val valColData = columns(valCol).deltaIntBuffer
+      val keyColObj = columns(keyCol)
+      val valColObj = columns(valCol)
+      
+      // [FIX] Route to the correct Delta Buffer depending on column type
+      val numRows = if (keyColObj.isString) keyColObj.deltaStringBuffer.length else keyColObj.deltaIntBuffer.length
       
       var i = 0
-      while (i < keyColData.length) {
+      while (i < numRows) {
         if (!ramDeleted.get(i)) {
-          val k = keyColData(i)
-          val v = if (aggFunc == "COUNT") 1L else valColData(i).toLong
-          // Merge RAM values directly into the final C++ Map
+          // [FIX] Extract the dictionary ID directly from the String buffer
+          val k = if (keyColObj.isString) keyColObj.getDictId(keyColObj.deltaStringBuffer(i)) else keyColObj.deltaIntBuffer(i)
+          
+          if (k != -1) {
+              val v = if (aggFunc == "COUNT") 1L else valColObj.deltaIntBuffer(i).toLong
+              finalMap(k) = finalMap.getOrElse(k, 0L) + v
+          }
+        }
+        i += 1
+      }
+    } finally {
+      rwLock.readLock().unlock()
+    }
+
+    finalMap.toMap
+  }
+
+  // ---------------------------------------------------------
+  // PHASE 4: FAST-PATH DICTIONARY GROUP BY
+  // ---------------------------------------------------------
+  def executeDictionaryGroupBy(keyCol: String, valCol: String, aggFunc: String = "SUM"): Map[Int, Long] = withEpoch {
+    val keyIdx = columnOrder.indexOf(keyCol)
+    val valIdx = columnOrder.indexOf(valCol)
+    if (keyIdx == -1 || valIdx == -1) throw new IllegalArgumentException("Column not found")
+
+    // Retrieve exactly how much memory the Array Aggregator needs to allocate
+    val dictSize = columns(keyCol).getDictionarySize()
+    if (dictSize == 0) return Map.empty[Int, Long]
+    val maxDictId = dictSize - 1
+
+    val finalMap = scala.collection.mutable.Map[Int, Long]()
+
+    // 1. DISK: Aggregate Native C++ Blocks
+    val allBlocks = blockManager.getLoadedBlocks.toSeq
+    if (allBlocks.nonEmpty) {
+      val cores = MorselExec.activeCores
+      val blockSize = math.ceil(allBlocks.size.toDouble / cores).toInt
+      val blockChunks = allBlocks.grouped(blockSize).toSeq
+
+      val tasks = blockChunks.map { subset =>
+        new Callable[scala.collection.mutable.Map[Int, Long]] {
+          override def call(): scala.collection.mutable.Map[Int, Long] = {
+            val scanOp = new TableScanOperator(blockManager, subset.toArray, keyIdx, valIdx)
+            
+            // [NEW] Use the O(1) Array Operator instead of the Hash Operator and pass aggFunc
+            val aggOp = new ArrayAggOperator(scanOp, maxDictId, aggFunc) 
+            
+            try {
+              aggOp.open()
+              var resultBatch = aggOp.next() 
+              val localMap = scala.collection.mutable.Map[Int, Long]()
+              
+              while (resultBatch != null) {
+                 if (resultBatch.count > 0) {
+                     val keys = new Array[Int](resultBatch.count)
+                     val vals = new Array[Long](resultBatch.count)
+                     NativeBridge.copyToScala(resultBatch.keysPtr, keys, resultBatch.count)
+                     NativeBridge.copyToScalaLong(resultBatch.valuesPtr, vals, resultBatch.count)
+                     
+                     var i = 0
+                     while (i < resultBatch.count) {
+                       val k = keys(i)
+                       val v = vals(i) // [FIX] Values are completely accurate from C++ natively now
+                       localMap(k) = localMap.getOrElse(k, 0L) + v
+                       i += 1
+                     }
+                 }
+                 resultBatch = aggOp.next() 
+              }
+              localMap
+            } finally {
+              aggOp.close()
+            }
+          }
+        }
+      }
+      val partialResults = MorselExec.runParallel(tasks)
+      for (partial <- partialResults) {
+        for ((k, v) <- partial) {
           finalMap(k) = finalMap.getOrElse(k, 0L) + v
+        }
+      }
+    }
+
+    // 2. RAM: Aggregate Unflushed JVM Delta Buffers
+    rwLock.readLock().lock()
+    try {
+      val keyColObj = columns(keyCol)
+      val valColObj = columns(valCol)
+      
+      // [FIX] Route to the correct Delta Buffer depending on column type
+      val numRows = if (keyColObj.isString) keyColObj.deltaStringBuffer.length else keyColObj.deltaIntBuffer.length
+      
+      var i = 0
+      while (i < numRows) {
+        if (!ramDeleted.get(i)) {
+          // [FIX] Extract the dictionary ID directly from the String buffer
+          val k = if (keyColObj.isString) keyColObj.getDictId(keyColObj.deltaStringBuffer(i)) else keyColObj.deltaIntBuffer(i)
+          
+          if (k != -1) {
+              val v = if (aggFunc == "COUNT") 1L else valColObj.deltaIntBuffer(i).toLong
+              finalMap(k) = finalMap.getOrElse(k, 0L) + v
+          }
         }
         i += 1
       }

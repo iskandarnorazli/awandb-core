@@ -188,7 +188,7 @@ class SortOperator(child: Operator, rowCountHint: Int) extends Operator {
 // -------------------------------------------------------------------------
 // 5. AGGREGATION OPERATOR (Blocking)
 // -------------------------------------------------------------------------
-class HashAggOperator(child: Operator) extends Operator {
+class HashAggOperator(child: Operator, aggFunc: String = "SUM") extends Operator {
   private var mapPtr: Long = 0
   private var outputEmitted = false
   private var resultBatch: VectorBatch = _
@@ -211,22 +211,24 @@ class HashAggOperator(child: Operator) extends Operator {
     while (batch != null && totalInput < MAX_INPUT) {
       val offsetBytes = totalInput * 4L
       NativeBridge.memcpy(batch.keysPtr, NativeBridge.getOffsetPointer(tempKeys, offsetBytes), batch.count * 4L)
-      NativeBridge.memcpy(batch.valuesPtr, NativeBridge.getOffsetPointer(tempVals, offsetBytes), batch.count * 4L)
+      
+      // [FIX] Push COUNT logic into the Volcano pipeline before C++ executes
+      if (aggFunc == "COUNT") {
+         val ones = new Array[Int](batch.count)
+         java.util.Arrays.fill(ones, 1)
+         NativeBridge.loadData(NativeBridge.getOffsetPointer(tempVals, offsetBytes), ones)
+      } else {
+         NativeBridge.memcpy(batch.valuesPtr, NativeBridge.getOffsetPointer(tempVals, offsetBytes), batch.count * 4L)
+      }
+      
       totalInput += batch.count
       batch = child.next()
     }
 
     if (totalInput > 0) {
         mapPtr = NativeBridge.aggregateSum(tempKeys, tempVals, totalInput)
-        
-        // [DEBUG] Prove allocation size
-        println(s"[HashAgg] Allocating ResultBatch for $totalInput items with WIDTH = 8 bytes (Long)")
-        
-        // [CRITICAL FIX] valueWidthBytes = 8 is MANDATORY
         resultBatch = new VectorBatch(totalInput, valueWidthBytes = 8) 
-        
         val resultCount = NativeBridge.aggregateExport(mapPtr, resultBatch.keysPtr, resultBatch.valuesPtr)
-        println(s"[HashAgg] Exported $resultCount groups.")
         resultBatch.count = resultCount
     } else {
         resultBatch = new VectorBatch(1024)
@@ -242,7 +244,69 @@ class HashAggOperator(child: Operator) extends Operator {
     if (mapPtr != 0) NativeBridge.freeAggregationResult(mapPtr)
     if (tempKeys != 0) NativeBridge.freeMainStore(tempKeys)
     if (tempVals != 0) NativeBridge.freeMainStore(tempVals)
-    // [FIX] Prevent the Aggregation result batch from leaking 3 pointers!
+    if (resultBatch != null) resultBatch.close() 
+  }
+}
+
+// -------------------------------------------------------------------------
+// PHASE 4: O(1) ARRAY AGGREGATION OPERATOR (Branchless)
+// -------------------------------------------------------------------------
+class ArrayAggOperator(child: Operator, maxDictId: Int, aggFunc: String = "SUM") extends Operator {
+  private var aggPtr: Long = 0
+  private var outputEmitted = false
+  private var resultBatch: VectorBatch = _
+  
+  private var tempKeys: Long = 0
+  private var tempVals: Long = 0
+  private var totalInput = 0
+  private val MAX_INPUT = 10_000_000 
+
+  override def open(): Unit = {
+    child.open()
+    tempKeys = NativeBridge.allocMainStore(MAX_INPUT)
+    tempVals = NativeBridge.allocMainStore(MAX_INPUT)
+  }
+
+  override def next(): VectorBatch = {
+    if (outputEmitted) return null
+
+    var batch = child.next()
+    while (batch != null && totalInput < MAX_INPUT) {
+      val offsetBytes = totalInput * 4L
+      NativeBridge.memcpy(batch.keysPtr, NativeBridge.getOffsetPointer(tempKeys, offsetBytes), batch.count * 4L)
+      
+      // [FIX] Push COUNT logic into the Volcano pipeline before C++ executes
+      if (aggFunc == "COUNT") {
+         val ones = new Array[Int](batch.count)
+         java.util.Arrays.fill(ones, 1)
+         NativeBridge.loadData(NativeBridge.getOffsetPointer(tempVals, offsetBytes), ones)
+      } else {
+         NativeBridge.memcpy(batch.valuesPtr, NativeBridge.getOffsetPointer(tempVals, offsetBytes), batch.count * 4L)
+      }
+      
+      totalInput += batch.count
+      batch = child.next()
+    }
+
+    if (totalInput > 0) {
+        aggPtr = NativeBridge.aggregateArraySum(tempKeys, tempVals, totalInput, maxDictId)
+        resultBatch = new VectorBatch(maxDictId + 1, valueWidthBytes = 8) 
+        val resultCount = NativeBridge.aggregateArrayExport(aggPtr, resultBatch.keysPtr, resultBatch.valuesPtr)
+        resultBatch.count = resultCount
+    } else {
+        resultBatch = new VectorBatch(1024)
+        resultBatch.count = 0
+    }
+    
+    outputEmitted = true
+    resultBatch
+  }
+
+  override def close(): Unit = {
+    child.close()
+    if (aggPtr != 0) NativeBridge.freeArrayAggregationResult(aggPtr)
+    if (tempKeys != 0) NativeBridge.freeMainStore(tempKeys)
+    if (tempVals != 0) NativeBridge.freeMainStore(tempVals)
     if (resultBatch != null) resultBatch.close() 
   }
 }

@@ -177,4 +177,13 @@ extern "C" {
         env->ReleaseStringUTFChars(jPath, path);
         return (jlong)dict;
     }
+
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_dictionaryGetSizeNative(
+        JNIEnv* env, jobject obj, jlong ptr
+    ) {
+        if (ptr == 0) return 0;
+        Dictionary* dict = (Dictionary*)ptr;
+        // The domain size is exactly the size of the reverse map
+        return (jint)dict->reverse_map.size();
+    }
 }

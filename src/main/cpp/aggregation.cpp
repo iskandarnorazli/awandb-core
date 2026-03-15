@@ -154,6 +154,59 @@ struct NativeHashMap {
     }
 };
 
+// ---------------------------------------------------------
+// O(1) DICTIONARY ARRAY AGGREGATOR (PHASE 4)
+// ---------------------------------------------------------
+struct NativeArrayAggregator {
+    int64_t* values;
+    uint8_t* occupied;
+    size_t capacity;
+
+    NativeArrayAggregator(size_t maxDictId) {
+        capacity = maxDictId + 1;
+
+        // Allocate flat, contiguous arrays for branchless execution
+        values = (int64_t*)alloc_aligned(capacity * sizeof(int64_t));
+        occupied = (uint8_t*)alloc_aligned(capacity * sizeof(uint8_t));
+
+        if (!values || !occupied) {
+            free_aligned(values);
+            free_aligned(occupied);
+            throw std::bad_alloc();
+        }
+
+        std::memset(values, 0, capacity * sizeof(int64_t));
+        std::memset(occupied, 0, capacity * sizeof(uint8_t));
+    }
+
+    ~NativeArrayAggregator() {
+        free_aligned(values);
+        free_aligned(occupied);
+    }
+
+    // Completely branchless execution. 
+    // Assumes Scala layer provides valid dictionary bounds.
+    void aggregate_batch(int* input_keys, int* input_vals, size_t count) {
+        for (size_t i = 0; i < count; i++) {
+            int key = input_keys[i];
+            values[key] += input_vals[i];
+            occupied[key] = 1;
+        }
+    }
+
+    int32_t export_to_arrays(int* outKeys, int64_t* outValues) {
+        int32_t count = 0;
+        for (size_t i = 0; i < capacity; i++) {
+            if (occupied[i]) {
+                outKeys[count] = (int)i;
+                outValues[count] = values[i];
+                count++;
+            }
+        }
+        return count;
+    }
+};
+
 extern "C" {
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateSumNative(
         JNIEnv* env, jobject obj, jlong keysPtr, jlong valsPtr, jint count
@@ -182,5 +235,34 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong mapPtr
     ) {
         if (mapPtr != 0) delete (NativeHashMap*)mapPtr;
+    }
+
+    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateArraySumNative(
+        JNIEnv* env, jobject obj, jlong keysPtr, jlong valsPtr, jint count, jint maxDictId
+    ) {
+        if (keysPtr == 0 || valsPtr == 0 || count <= 0 || maxDictId < 0) return 0;
+
+        try {
+            NativeArrayAggregator* arr = new NativeArrayAggregator((size_t)maxDictId);
+            arr->aggregate_batch((int*)keysPtr, (int*)valsPtr, (size_t)count);
+            return (jlong)arr;
+        } catch (const std::bad_alloc& e) {
+            throwJavaOOM(env, "Native memory allocation failed in NativeArrayAggregator");
+            return 0;
+        }
+    }
+
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_aggregateArrayExportNative(
+        JNIEnv* env, jobject obj, jlong mapPtr, jlong outKeysPtr, jlong outValsPtr
+    ) {
+        if (mapPtr == 0 || outKeysPtr == 0 || outValsPtr == 0) return 0;
+        return ((NativeArrayAggregator*)mapPtr)->export_to_arrays((int*)outKeysPtr, (int64_t*)outValsPtr);
+    }
+
+    // REQUIRED TO PREVENT UNDEFINED BEHAVIOR 
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_freeArrayAggregationResultNative(
+        JNIEnv* env, jobject obj, jlong mapPtr
+    ) {
+        if (mapPtr != 0) delete (NativeArrayAggregator*)mapPtr;
     }
 }

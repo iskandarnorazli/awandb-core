@@ -102,13 +102,19 @@ class NativeColumn(val name: String, val isString: Boolean = false, val useDicti
   }
 
   // -----------------------------------------------------------
-  // QUERY HELPER (Required for DAGSpec)
+  // QUERY HELPER (Required for DAGSpec & Phase 4 Array Aggregation)
   // -----------------------------------------------------------
   
   def getDictId(value: String): Int = {
     if (dictionaryPtr == 0) return -1
     // dictionaryEncode returns the ID (creating it if missing, but existing keys are stable)
     NativeBridge.dictionaryEncode(dictionaryPtr, value)
+  }
+
+  // [NEW] PHASE 4: O(1) Dictionary Footprint Inspection
+  def getDictionarySize(): Int = {
+    if (dictionaryPtr == 0) return 0
+    NativeBridge.dictionaryGetSize(dictionaryPtr)
   }
 
   // -----------------------------------------------------------

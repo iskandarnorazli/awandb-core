@@ -510,7 +510,20 @@ object SQLHandler {
             if (valCol.isEmpty)
               return SQLResult(true, "Error: GROUP BY currently requires a SUM(column) or COUNT(*) aggregate.")
             
-            val resultMap = leftTable.executeGroupBy(keyCol, valCol, aggFunc)
+            // =========================================================
+            // PHASE 4: O(1) DICTIONARY ARRAY ROUTER
+            // =========================================================
+            val isDictionaryCol = leftTable.columns.contains(keyCol) && leftTable.columns(keyCol).useDictionary
+            
+            val resultMap = if (isDictionaryCol) {
+                // Fast-Path: Bypass Volcano DAG entirely for dictionary columns
+                leftTable.executeDictionaryGroupBy(keyCol, valCol, aggFunc)
+            } else {
+                // Slow-Path: Standard Hash Aggregation DAG
+                leftTable.executeGroupBy(keyCol, valCol, aggFunc)
+            }
+            // =========================================================
+            
             if (resultMap.isEmpty) return SQLResult(false, "   GROUP BY Results: (Empty)", 0L)
 
             var finalResultSeq = resultMap.toSeq
