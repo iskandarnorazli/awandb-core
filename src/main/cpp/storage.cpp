@@ -4,70 +4,82 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
-*/
+ */
 
 #include "common.h"
 #include <cstdio>
 #include <limits>
 #include <cstring> // for memcpy, memset
+#include "buffer_pool.h"
 
-extern "C" {
-
+extern "C"
+{
     // --- Block Management ---
     JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_createBlockNative(
-        JNIEnv* env, jobject obj, jint rowCount, jint colCount, jintArray jColSizes
-    ) {
-        if (jColSizes == nullptr) return 0;
-        
+        JNIEnv *env, jobject obj, jint rowCount, jint colCount, jintArray jColSizes)
+    {
+        if (jColSizes == nullptr)
+            return 0;
+
         // [RESTORED] Zero-Copy Critical Access
-        jint* colSizes = (jint*)env->GetPrimitiveArrayCritical(jColSizes, nullptr);
-        if (!colSizes) return 0; // Safety check maintained
-        
+        jint *colSizes = (jint *)env->GetPrimitiveArrayCritical(jColSizes, nullptr);
+        if (!colSizes)
+            return 0; // Safety check maintained
+
         size_t headerSize = sizeof(BlockHeader);
         size_t colHeadersSize = colCount * sizeof(ColumnHeader);
         size_t metaDataSize = headerSize + colHeadersSize;
-        
+
         size_t padding = (metaDataSize % 256 != 0) ? (256 - (metaDataSize % 256)) : 0;
         size_t dataStartOffset = metaDataSize + padding;
-        
+
         size_t totalDataSize = 0;
-        for (int i = 0; i < colCount; i++) {
+        for (int i = 0; i < colCount; i++)
+        {
             totalDataSize += (size_t)colSizes[i];
         }
-        
+
         size_t totalBlockSize = dataStartOffset + totalDataSize + 512; // Keep AVX padding
-        uint8_t* rawPtr = (uint8_t*)alloc_aligned(totalBlockSize);
-        
-        if (!rawPtr) {
+        uint8_t *rawPtr = (uint8_t *)alloc_aligned(totalBlockSize);
+
+        if (!rawPtr)
+        {
             env->ReleasePrimitiveArrayCritical(jColSizes, colSizes, 0);
-            return 0; 
+            return 0;
         }
         std::memset(rawPtr, 0, totalBlockSize);
 
-        BlockHeader* blkHeader = (BlockHeader*)rawPtr;
+        BlockHeader *blkHeader = (BlockHeader *)rawPtr;
         blkHeader->magic_number = BLOCK_MAGIC;
         blkHeader->version = BLOCK_VERSION;
         blkHeader->row_count = rowCount;
         blkHeader->column_count = colCount;
 
-        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
+        // --- PHASE 6: INIT BUFFER POOL METADATA ---
+        // Initialize the atomic flags (if they aren't auto-initialized by memset/constructors)
+        blkHeader->pin_count = 0;
+        blkHeader->is_resident = true;
+        blkHeader->memory_footprint_bytes = totalBlockSize;
+
+        ColumnHeader *colHeaders = (ColumnHeader *)(rawPtr + sizeof(BlockHeader));
         size_t currentOffset = dataStartOffset;
 
-        for (int i = 0; i < colCount; i++) {
+        for (int i = 0; i < colCount; i++)
+        {
             colHeaders[i].col_id = i;
-            colHeaders[i].type = TYPE_INT; 
+            colHeaders[i].type = TYPE_INT;
             colHeaders[i].compression = COMP_NONE;
             colHeaders[i].data_offset = currentOffset;
             colHeaders[i].data_length = (size_t)colSizes[i];
-            colHeaders[i].stride = 4; 
+            colHeaders[i].stride = 4;
             colHeaders[i].string_pool_offset = 0;
             colHeaders[i].string_pool_length = 0;
             colHeaders[i].min_int = std::numeric_limits<int32_t>::max();
@@ -78,20 +90,30 @@ extern "C" {
 
         // Release with mode 0 for Critical arrays
         env->ReleasePrimitiveArrayCritical(jColSizes, colSizes, 0);
+
+        // ---------------------------------------------------------
+        // PHASE 6: REGISTER WITH BUFFER POOL
+        // Tell the pacemaker daemon that this block is now using RAM.
+        // ---------------------------------------------------------
+        BufferPool::get_instance()->register_block(blkHeader, totalBlockSize);
+
         return (jlong)rawPtr;
     }
 
     // --- Data Loading ---
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadDataNative(JNIEnv* env, jobject obj, jlong ptr, jintArray jData) {
-        if (ptr == 0 || jData == nullptr) return;
-        
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadDataNative(JNIEnv *env, jobject obj, jlong ptr, jintArray jData)
+    {
+        if (ptr == 0 || jData == nullptr)
+            return;
+
         // [RESTORED] Zero-Copy Critical Access
-        jint* scalaData = (jint*)env->GetPrimitiveArrayCritical(jData, nullptr);
-        if (!scalaData) return; 
-        
+        jint *scalaData = (jint *)env->GetPrimitiveArrayCritical(jData, nullptr);
+        if (!scalaData)
+            return;
+
         jsize length = env->GetArrayLength(jData);
-        std::memcpy((void*)ptr, scalaData, (size_t)length * sizeof(int));
-        
+        std::memcpy((void *)ptr, scalaData, (size_t)length * sizeof(int));
+
         env->ReleasePrimitiveArrayCritical(jData, scalaData, 0);
     }
 
@@ -99,176 +121,241 @@ extern "C" {
     // MEMORY OPS - Float Array Copy
     // ==========================================================
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaFloatNative(
-        JNIEnv* env, jobject obj, jlong srcPtr, jfloatArray dest, jint count) {
-        
-        if (srcPtr == 0 || count <= 0) return;
-        
+        JNIEnv *env, jobject obj, jlong srcPtr, jfloatArray dest, jint count)
+    {
+
+        if (srcPtr == 0 || count <= 0)
+            return;
+
         // Efficiently copy the native float buffer into the JVM array
-        env->SetFloatArrayRegion(dest, 0, count, (const jfloat*)srcPtr);
+        env->SetFloatArrayRegion(dest, 0, count, (const jfloat *)srcPtr);
     }
 
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaNative(JNIEnv* env, jobject obj, jlong srcPtr, jintArray dstArray, jint len) {
-        if (srcPtr == 0) return;
-        int* cppData = (int*)srcPtr;
-        jint* scalaData = env->GetIntArrayElements(dstArray, nullptr);
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaNative(JNIEnv *env, jobject obj, jlong srcPtr, jintArray dstArray, jint len)
+    {
+        if (srcPtr == 0)
+            return;
+        int *cppData = (int *)srcPtr;
+        jint *scalaData = env->GetIntArrayElements(dstArray, nullptr);
         std::memcpy(scalaData, cppData, (size_t)len * sizeof(int));
         env->ReleaseIntArrayElements(dstArray, scalaData, 0);
     }
 
     // [RESTORED] This function was missing in the previous partial snippet
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaLongNative(JNIEnv* env, jobject obj, jlong srcPtr, jlongArray dstArray, jint len) {
-        if (srcPtr == 0) return;
-        jlong* scalaData = env->GetLongArrayElements(dstArray, nullptr);
-        std::memcpy(scalaData, (void*)srcPtr, (size_t)len * sizeof(int64_t));
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_copyToScalaLongNative(JNIEnv *env, jobject obj, jlong srcPtr, jlongArray dstArray, jint len)
+    {
+        if (srcPtr == 0)
+            return;
+        jlong *scalaData = env->GetLongArrayElements(dstArray, nullptr);
+        std::memcpy(scalaData, (void *)srcPtr, (size_t)len * sizeof(int64_t));
         env->ReleaseLongArrayElements(dstArray, scalaData, 0);
     }
 
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadStringDataNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jobjectArray jStrings) {
-        if (blockPtr == 0) return;
-        uint8_t* rawPtr = (uint8_t*)blockPtr;
-        ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadStringDataNative(JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jobjectArray jStrings)
+    {
+        if (blockPtr == 0)
+            return;
+        uint8_t *rawPtr = (uint8_t *)blockPtr;
+        ColumnHeader *ch = &((ColumnHeader *)(rawPtr + sizeof(BlockHeader)))[colIdx];
         jsize len = env->GetArrayLength(jStrings);
         ch->type = TYPE_STRING;
-        ch->stride = 16; 
-        GermanString* fixedData = (GermanString*)(rawPtr + ch->data_offset);
+        ch->stride = 16;
+        GermanString *fixedData = (GermanString *)(rawPtr + ch->data_offset);
         size_t structBytes = (size_t)len * 16;
-        char* poolBase = (char*)fixedData + structBytes;
+        char *poolBase = (char *)fixedData + structBytes;
         uint64_t poolLimit = (ch->data_length > structBytes) ? (ch->data_length - structBytes) : 0;
         uint64_t currentOffset = 0;
 
-        for (int i = 0; i < len; i++) {
+        for (int i = 0; i < len; i++)
+        {
             jstring js = (jstring)env->GetObjectArrayElement(jStrings, i);
-            if (!js) { fixedData[i] = GermanString(nullptr, 0, nullptr); continue; }
-            const char* cstr = env->GetStringUTFChars(js, nullptr);
+            if (!js)
+            {
+                fixedData[i] = GermanString(nullptr, 0, nullptr);
+                continue;
+            }
+            const char *cstr = env->GetStringUTFChars(js, nullptr);
             uint32_t sLen = (uint32_t)strlen(cstr);
-            if (sLen <= 12) {
+            if (sLen <= 12)
+            {
                 fixedData[i] = GermanString(cstr, sLen, nullptr);
-            } else {
-                if (currentOffset + sLen < poolLimit) {
-                    char* poolPtr = poolBase + currentOffset;
+            }
+            else
+            {
+                if (currentOffset + sLen < poolLimit)
+                {
+                    char *poolPtr = poolBase + currentOffset;
                     std::memcpy(poolPtr, cstr, sLen);
                     fixedData[i] = GermanString(cstr, sLen, poolPtr);
                     currentOffset += sLen;
-                } else { fixedData[i] = GermanString(nullptr, 0, nullptr); }
+                }
+                else
+                {
+                    fixedData[i] = GermanString(nullptr, 0, nullptr);
+                }
             }
             env->ReleaseStringUTFChars(js, cstr);
             env->DeleteLocalRef(js);
         }
-        ch->string_pool_offset = (uint64_t)((uint8_t*)poolBase - rawPtr);
+        ch->string_pool_offset = (uint64_t)((uint8_t *)poolBase - rawPtr);
         ch->string_pool_length = currentOffset;
         ch->data_length = structBytes;
     }
 
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadVectorDataNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jfloatArray jData, jint dim) {
-        if (blockPtr == 0 || jData == nullptr) return;
-        
-        uint8_t* rawPtr = (uint8_t*)blockPtr;
-        ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_loadVectorDataNative(JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jfloatArray jData, jint dim)
+    {
+        if (blockPtr == 0 || jData == nullptr)
+            return;
+
+        uint8_t *rawPtr = (uint8_t *)blockPtr;
+        ColumnHeader *ch = &((ColumnHeader *)(rawPtr + sizeof(BlockHeader)))[colIdx];
         ch->type = TYPE_VECTOR;
         ch->vector_dim = (uint32_t)dim;
         ch->stride = dim * sizeof(float);
-        if (ch->data_offset == 0) return;
-        
-        // [RESTORED] Zero-Copy Critical Access
-        jfloat* srcData = (jfloat*)env->GetPrimitiveArrayCritical(jData, nullptr);
-        if (!srcData) return; 
+        if (ch->data_offset == 0)
+            return;
 
-        jsize count = env->GetArrayLength(jData); 
-        float* dstData = (float*)(rawPtr + ch->data_offset);
+        // [RESTORED] Zero-Copy Critical Access
+        jfloat *srcData = (jfloat *)env->GetPrimitiveArrayCritical(jData, nullptr);
+        if (!srcData)
+            return;
+
+        jsize count = env->GetArrayLength(jData);
+        float *dstData = (float *)(rawPtr + ch->data_offset);
         std::memcpy(dstData, srcData, (size_t)count * sizeof(float));
         ch->data_length = (size_t)count * sizeof(float);
-        
+
         env->ReleasePrimitiveArrayCritical(jData, srcData, 0);
     }
 
     // --- IO & Metadata ---
-    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getColumnPtr(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx) {
-        if (blockPtr == 0) return 0;
-        uint8_t* rawPtr = (uint8_t*)blockPtr;
-        BlockHeader* blkHeader = (BlockHeader*)rawPtr;
-        if (colIdx < 0 || colIdx >= (int)blkHeader->column_count) return 0;
-        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
+    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getColumnPtr(JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx)
+    {
+        if (blockPtr == 0)
+            return 0;
+        uint8_t *rawPtr = (uint8_t *)blockPtr;
+        BlockHeader *blkHeader = (BlockHeader *)rawPtr;
+        if (colIdx < 0 || colIdx >= (int)blkHeader->column_count)
+            return 0;
+        ColumnHeader *colHeaders = (ColumnHeader *)(rawPtr + sizeof(BlockHeader));
         uint64_t offset = colHeaders[colIdx].data_offset;
         return (jlong)(rawPtr + offset);
     }
 
-    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getBlockSize(JNIEnv* env, jobject obj, jlong blockPtr) {
-        if (blockPtr == 0) return 0;
-        BlockHeader* header = (BlockHeader*)blockPtr;
+    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_getBlockSize(JNIEnv *env, jobject obj, jlong blockPtr)
+    {
+        if (blockPtr == 0)
+            return 0;
+        BlockHeader *header = (BlockHeader *)blockPtr;
         size_t metaSize = sizeof(BlockHeader) + (header->column_count * sizeof(ColumnHeader));
         size_t padding = (metaSize % 256 != 0) ? (256 - (metaSize % 256)) : 0;
-        ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
-        ColumnHeader* lastCol = &colHeaders[header->column_count - 1];
+        ColumnHeader *colHeaders = (ColumnHeader *)((uint8_t *)blockPtr + sizeof(BlockHeader));
+        ColumnHeader *lastCol = &colHeaders[header->column_count - 1];
         return (jlong)(lastCol->data_offset + lastCol->data_length);
     }
 
-    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_getRowCount(JNIEnv* env, jobject obj, jlong blockPtr) {
-        return (blockPtr == 0) ? 0 : (jint)((BlockHeader*)blockPtr)->row_count;
+    JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_getRowCount(JNIEnv *env, jobject obj, jlong blockPtr)
+    {
+        return (blockPtr == 0) ? 0 : (jint)((BlockHeader *)blockPtr)->row_count;
     }
 
-    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_loadBlockFromFile(JNIEnv* env, jobject obj, jstring path) {
-        const char* filename = env->GetStringUTFChars(path, nullptr);
-        FILE* file = fopen(filename, "rb");
-        if (!file) { env->ReleaseStringUTFChars(path, filename); return 0; }
+    JNIEXPORT jlong JNICALL Java_org_awandb_core_jni_NativeBridge_loadBlockFromFile(JNIEnv *env, jobject obj, jstring path)
+    {
+        const char *filename = env->GetStringUTFChars(path, nullptr);
+        FILE *file = fopen(filename, "rb");
+        if (!file)
+        {
+            env->ReleaseStringUTFChars(path, filename);
+            return 0;
+        }
         fseek(file, 0, SEEK_END);
         long fileSize = ftell(file);
         fseek(file, 0, SEEK_SET);
-        if (fileSize <= 0) { fclose(file); env->ReleaseStringUTFChars(path, filename); return 0; }
-        void* ptr = alloc_aligned((size_t)fileSize);
-        if (!ptr) { fclose(file); env->ReleaseStringUTFChars(path, filename); return 0; }
+        if (fileSize <= 0)
+        {
+            fclose(file);
+            env->ReleaseStringUTFChars(path, filename);
+            return 0;
+        }
+        void *ptr = alloc_aligned((size_t)fileSize);
+        if (!ptr)
+        {
+            fclose(file);
+            env->ReleaseStringUTFChars(path, filename);
+            return 0;
+        }
         size_t readBytes = fread(ptr, 1, (size_t)fileSize, file);
         fclose(file);
         env->ReleaseStringUTFChars(path, filename);
         return (readBytes == (size_t)fileSize) ? (jlong)ptr : 0;
     }
 
-    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_saveColumn(JNIEnv* env, jobject obj, jlong ptr, jlong size, jstring path) {
-        if (ptr == 0) return false;
+    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_saveColumn(JNIEnv *env, jobject obj, jlong ptr, jlong size, jstring path)
+    {
+        if (ptr == 0)
+            return false;
         // Calc Min/Max
-        uint8_t* rawPtr = (uint8_t*)ptr;
-        BlockHeader* blkHeader = (BlockHeader*)rawPtr;
-        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
-        for (uint32_t i = 0; i < blkHeader->column_count; i++) {
-            if (colHeaders[i].type == TYPE_INT) {
-                int* data = (int*)(rawPtr + colHeaders[i].data_offset);
-                size_t count = blkHeader->row_count; 
+        uint8_t *rawPtr = (uint8_t *)ptr;
+        BlockHeader *blkHeader = (BlockHeader *)rawPtr;
+        ColumnHeader *colHeaders = (ColumnHeader *)(rawPtr + sizeof(BlockHeader));
+        for (uint32_t i = 0; i < blkHeader->column_count; i++)
+        {
+            if (colHeaders[i].type == TYPE_INT)
+            {
+                int *data = (int *)(rawPtr + colHeaders[i].data_offset);
+                size_t count = blkHeader->row_count;
                 int32_t currentMin = std::numeric_limits<int32_t>::max();
                 int32_t currentMax = std::numeric_limits<int32_t>::min();
-                for (size_t r = 0; r < count; r++) {
+                for (size_t r = 0; r < count; r++)
+                {
                     int val = data[r];
-                    if (val < currentMin) currentMin = val;
-                    if (val > currentMax) currentMax = val;
+                    if (val < currentMin)
+                        currentMin = val;
+                    if (val > currentMax)
+                        currentMax = val;
                 }
                 colHeaders[i].min_int = currentMin;
                 colHeaders[i].max_int = currentMax;
             }
         }
-        const char* filename = env->GetStringUTFChars(path, nullptr);
-        FILE* file = fopen(filename, "wb");
-        if (!file) { env->ReleaseStringUTFChars(path, filename); return false; }
-        fwrite((void*)ptr, 1, (size_t)size, file);
+        const char *filename = env->GetStringUTFChars(path, nullptr);
+        FILE *file = fopen(filename, "wb");
+        if (!file)
+        {
+            env->ReleaseStringUTFChars(path, filename);
+            return false;
+        }
+        fwrite((void *)ptr, 1, (size_t)size, file);
         fclose(file);
         env->ReleaseStringUTFChars(path, filename);
         return true;
     }
 
-    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_loadColumn(JNIEnv* env, jobject obj, jlong ptr, jlong size, jstring path) {
-        const char* filename = env->GetStringUTFChars(path, nullptr);
-        FILE* file = fopen(filename, "rb");
-        if (!file) { env->ReleaseStringUTFChars(path, filename); return false; }
-        fread((void*)ptr, 1, (size_t)size, file);
+    JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_loadColumn(JNIEnv *env, jobject obj, jlong ptr, jlong size, jstring path)
+    {
+        const char *filename = env->GetStringUTFChars(path, nullptr);
+        FILE *file = fopen(filename, "rb");
+        if (!file)
+        {
+            env->ReleaseStringUTFChars(path, filename);
+            return false;
+        }
+        fread((void *)ptr, 1, (size_t)size, file);
         fclose(file);
         env->ReleaseStringUTFChars(path, filename);
         return true;
     }
 
-    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_getZoneMapNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jintArray outMinMax) {
-        if (blockPtr == 0) return;
-        uint8_t* rawPtr = (uint8_t*)blockPtr;
-        BlockHeader* blkHeader = (BlockHeader*)rawPtr;
-        if (colIdx < 0 || colIdx >= (int)blkHeader->column_count) return;
-        ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
-        jint* out = (jint*)env->GetPrimitiveArrayCritical(outMinMax, nullptr);
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_getZoneMapNative(JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jintArray outMinMax)
+    {
+        if (blockPtr == 0)
+            return;
+        uint8_t *rawPtr = (uint8_t *)blockPtr;
+        BlockHeader *blkHeader = (BlockHeader *)rawPtr;
+        if (colIdx < 0 || colIdx >= (int)blkHeader->column_count)
+            return;
+        ColumnHeader *colHeaders = (ColumnHeader *)(rawPtr + sizeof(BlockHeader));
+        jint *out = (jint *)env->GetPrimitiveArrayCritical(outMinMax, nullptr);
         out[0] = colHeaders[colIdx].min_int;
         out[1] = colHeaders[colIdx].max_int;
         env->ReleasePrimitiveArrayCritical(outMinMax, out, 0);
@@ -276,44 +363,53 @@ extern "C" {
 
     // --- ZERO-COPY STRING INGRESS ---
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_bulkLoadArrowStringsNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jlong offsetPtr, jlong dataPtr, jint rowCount
-    ) {
-        if (blockPtr == 0 || offsetPtr == 0 || dataPtr == 0) return;
+        JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jlong offsetPtr, jlong dataPtr, jint rowCount)
+    {
+        if (blockPtr == 0 || offsetPtr == 0 || dataPtr == 0)
+            return;
 
-        ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
-        GermanString* dest = (GermanString*)((uint8_t*)blockPtr + colHeaders[colIdx].data_offset);
-        
-        int32_t* offsets = (int32_t*)offsetPtr;
-        const char* data = (const char*)dataPtr;
+        ColumnHeader *colHeaders = (ColumnHeader *)((uint8_t *)blockPtr + sizeof(BlockHeader));
+        GermanString *dest = (GermanString *)((uint8_t *)blockPtr + colHeaders[colIdx].data_offset);
+
+        int32_t *offsets = (int32_t *)offsetPtr;
+        const char *data = (const char *)dataPtr;
 
         // The dynamic String Pool begins exactly after the GermanString array!
-        char* pool = (char*)dest + (rowCount * sizeof(GermanString));
+        char *pool = (char *)dest + (rowCount * sizeof(GermanString));
         uint32_t poolOffset = 0;
 
-        for (int i = 0; i < rowCount; i++) {
+        for (int i = 0; i < rowCount; i++)
+        {
             int32_t start = offsets[i];
-            int32_t len = offsets[i+1] - start;
-            
+            int32_t len = offsets[i + 1] - start;
+
             dest[i].len = len;
-            
-            if (len > 0) {
+
+            if (len > 0)
+            {
                 int prefixLen = len < 4 ? len : 4;
                 std::memset(dest[i].prefix, 0, 4);
                 std::memcpy(dest[i].prefix, data + start, prefixLen);
-                
-                if (len <= 12) {
+
+                if (len <= 12)
+                {
                     // Inline short strings directly into the struct
                     std::memset(dest[i].suffix, 0, 8);
-                    if (len > 4) {
+                    if (len > 4)
+                    {
                         std::memcpy(dest[i].suffix, data + start + 4, len - 4);
                     }
-                } else {
+                }
+                else
+                {
                     // Route long strings to the dynamic String Pool
                     std::memcpy(pool + poolOffset, data + start, len);
                     dest[i].ptr = pool + poolOffset;
                     poolOffset += len;
                 }
-            } else {
+            }
+            else
+            {
                 std::memset(dest[i].prefix, 0, 4);
                 std::memset(dest[i].suffix, 0, 8);
             }
@@ -322,12 +418,27 @@ extern "C" {
 
     // --- ZERO-COPY VECTOR METADATA ---
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_setVectorDimNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint dim
-    ) {
-        if (blockPtr == 0) return;
-        ColumnHeader* colHeaders = (ColumnHeader*)((uint8_t*)blockPtr + sizeof(BlockHeader));
+        JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jint dim)
+    {
+        if (blockPtr == 0)
+            return;
+        ColumnHeader *colHeaders = (ColumnHeader *)((uint8_t *)blockPtr + sizeof(BlockHeader));
         colHeaders[colIdx].vector_dim = dim;
         colHeaders[colIdx].type = TYPE_VECTOR;
         colHeaders[colIdx].stride = dim * sizeof(float);
+    }
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_freeBlockNative(
+        JNIEnv *env, jobject obj, jlong blockPtr)
+    {
+        if (blockPtr == 0) return;
+        
+        BlockHeader* block = (BlockHeader*)blockPtr;
+
+        // 1. Tell the Buffer Pool to forget this block completely
+        BufferPool::get_instance()->deregister_block(block);
+
+        // 2. Now it is safe to return the memory to the OS
+        free(block); 
     }
 }

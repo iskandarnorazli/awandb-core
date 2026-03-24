@@ -4,92 +4,114 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
-*/
+ */
 
 #include "common.h"
 #include "block.h"
+#include "buffer_pool.h"
 #include <vector>
 #include <algorithm>
 #include <cstring>
 
 #ifdef ARCH_X86
-    #include <immintrin.h>
+#include <immintrin.h>
 #elif defined(ARCH_ARM)
-    #include <arm_neon.h>
+#include <arm_neon.h>
 #endif
 
 #include <cstdio>
 
 // Helper to extract a 4-bit mask from a 128-bit NEON vector of 32-bit integers
 #ifdef ARCH_ARM
-inline int neon_movemask_epi32(uint32x4_t cmp) {
+inline int neon_movemask_epi32(uint32x4_t cmp)
+{
     return (vgetq_lane_u32(cmp, 0) & 1) |
-          ((vgetq_lane_u32(cmp, 1) & 1) << 1) |
-          ((vgetq_lane_u32(cmp, 2) & 1) << 2) |
-          ((vgetq_lane_u32(cmp, 3) & 1) << 3);
+           ((vgetq_lane_u32(cmp, 1) & 1) << 1) |
+           ((vgetq_lane_u32(cmp, 2) & 1) << 2) |
+           ((vgetq_lane_u32(cmp, 3) & 1) << 3);
 }
 #endif
 
-extern "C" {
+extern "C"
+{
 
     /*
      * [OPTIMIZED] HYBRID SCAN KERNEL (AVX2 + NEON)
      */
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanBlockNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint threshold, jlong outIndicesPtr
-    ) {
-        if (blockPtr == 0) return 0; 
+        JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jint threshold, jlong outIndicesPtr)
+    {
 
-        uint8_t* basePtr = (uint8_t*)blockPtr;
-        BlockHeader* header = (BlockHeader*)basePtr;
+        BlockHeader *block = reinterpret_cast<BlockHeader *>(blockPtr);
+        if (!block)
+            return 0;
 
-        if (colIdx < 0 || colIdx >= (int)header->column_count) return 0;
+        // ---------------------------------------------------------
+        // PHASE 6: RAII PIN GUARD (Zero-Leak Execution)
+        // Automatically pins the block upon creation and unpins it 
+        // when this function returns, guaranteeing no memory leaks!
+        // ---------------------------------------------------------
+        ScopedPin pin_guard(block);
 
-        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
-        ColumnHeader& col = colHeaders[colIdx];
+        uint8_t *basePtr = (uint8_t *)blockPtr;
+        BlockHeader *header = (BlockHeader *)basePtr;
 
-        if (col.data_offset == 0) return 0; 
-        
-        int32_t* data = (int32_t*)(basePtr + col.data_offset);
-        int32_t* outIndices = (int32_t*)outIndicesPtr;
+        if (colIdx < 0 || colIdx >= (int)header->column_count)
+            return 0; // <-- SAFE! ScopedPin unpins automatically here.
+
+        ColumnHeader *colHeaders = (ColumnHeader *)(basePtr + sizeof(BlockHeader));
+        ColumnHeader &col = colHeaders[colIdx];
+
+        if (col.data_offset == 0)
+            return 0; // <-- SAFE!
+
+        int32_t *data = (int32_t *)(basePtr + col.data_offset);
+        int32_t *outIndices = (int32_t *)outIndicesPtr;
         int rows = header->row_count;
         int matchCount = 0;
 
-        if (col.type == TYPE_INT) {
-            
+        if (col.type == TYPE_INT)
+        {
             // Fast Path: Zone Map Pruning
-            if (col.max_int <= threshold) return 0;
-            if (col.min_int > threshold) {
-                if (outIndices != nullptr) {
-                    for (int i = 0; i < rows; i++) outIndices[i] = i;
+            if (col.max_int <= threshold)
+                return 0; // <-- SAFE! This is likely where the leak happened previously.
+                
+            if (col.min_int > threshold)
+            {
+                if (outIndices != nullptr)
+                {
+                    for (int i = 0; i < rows; i++)
+                        outIndices[i] = i;
                 }
-                return rows;
+                return rows; // <-- SAFE!
             }
 
             int i = 0;
 
 #ifdef ARCH_X86
             __m256i vThresh = _mm256_set1_epi32(threshold);
-            
-            if (outIndices == nullptr) {
+
+            if (outIndices == nullptr)
+            {
                 int limit = rows - 64;
-                for (; i <= limit; i += 64) {
-                    __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
-                    __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
-                    __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
-                    __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
-                    __m256i v4 = _mm256_loadu_si256((__m256i*)&data[i+32]);
-                    __m256i v5 = _mm256_loadu_si256((__m256i*)&data[i+40]);
-                    __m256i v6 = _mm256_loadu_si256((__m256i*)&data[i+48]);
-                    __m256i v7 = _mm256_loadu_si256((__m256i*)&data[i+56]);
+                for (; i <= limit; i += 64)
+                {
+                    __m256i v0 = _mm256_loadu_si256((__m256i *)&data[i]);
+                    __m256i v1 = _mm256_loadu_si256((__m256i *)&data[i + 8]);
+                    __m256i v2 = _mm256_loadu_si256((__m256i *)&data[i + 16]);
+                    __m256i v3 = _mm256_loadu_si256((__m256i *)&data[i + 24]);
+                    __m256i v4 = _mm256_loadu_si256((__m256i *)&data[i + 32]);
+                    __m256i v5 = _mm256_loadu_si256((__m256i *)&data[i + 40]);
+                    __m256i v6 = _mm256_loadu_si256((__m256i *)&data[i + 48]);
+                    __m256i v7 = _mm256_loadu_si256((__m256i *)&data[i + 56]);
 
                     __m256i m0 = _mm256_cmpgt_epi32(v0, vThresh);
                     __m256i m1 = _mm256_cmpgt_epi32(v1, vThresh);
@@ -109,41 +131,66 @@ extern "C" {
                     matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m6)));
                     matchCount += _mm_popcnt_u32(_mm256_movemask_ps(_mm256_castsi256_ps(m7)));
                 }
-            } else {
+            }
+            else
+            {
                 int limit = rows - 32;
-                for (; i <= limit; i += 32) {
-                    _mm_prefetch((const char*)&data[i + 32], _MM_HINT_T0);
+                for (; i <= limit; i += 32)
+                {
+                    _mm_prefetch((const char *)&data[i + 32], _MM_HINT_T0);
 
-                    __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
-                    __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
-                    __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
-                    __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+                    __m256i v0 = _mm256_loadu_si256((__m256i *)&data[i]);
+                    __m256i v1 = _mm256_loadu_si256((__m256i *)&data[i + 8]);
+                    __m256i v2 = _mm256_loadu_si256((__m256i *)&data[i + 16]);
+                    __m256i v3 = _mm256_loadu_si256((__m256i *)&data[i + 24]);
 
                     int mask0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v0, vThresh)));
                     int mask1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v1, vThresh)));
                     int mask2 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v2, vThresh)));
                     int mask3 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v3, vThresh)));
 
-                    if (mask0) { for(int k=0; k<8; k++) if((mask0>>k)&1) outIndices[matchCount++] = i+k; }
-                    if (mask1) { for(int k=0; k<8; k++) if((mask1>>k)&1) outIndices[matchCount++] = i+8+k; }
-                    if (mask2) { for(int k=0; k<8; k++) if((mask2>>k)&1) outIndices[matchCount++] = i+16+k; }
-                    if (mask3) { for(int k=0; k<8; k++) if((mask3>>k)&1) outIndices[matchCount++] = i+24+k; }
+                    if (mask0)
+                    {
+                        for (int k = 0; k < 8; k++)
+                            if ((mask0 >> k) & 1)
+                                outIndices[matchCount++] = i + k;
+                    }
+                    if (mask1)
+                    {
+                        for (int k = 0; k < 8; k++)
+                            if ((mask1 >> k) & 1)
+                                outIndices[matchCount++] = i + 8 + k;
+                    }
+                    if (mask2)
+                    {
+                        for (int k = 0; k < 8; k++)
+                            if ((mask2 >> k) & 1)
+                                outIndices[matchCount++] = i + 16 + k;
+                    }
+                    if (mask3)
+                    {
+                        for (int k = 0; k < 8; k++)
+                            if ((mask3 >> k) & 1)
+                                outIndices[matchCount++] = i + 24 + k;
+                    }
                 }
             }
 #elif defined(ARCH_ARM)
             int32x4_t vThresh = vdupq_n_s32(threshold);
-            
-            if (outIndices == nullptr) {
+
+            if (outIndices == nullptr)
+            {
                 int limit = rows - 32;
-                for (; i <= limit; i += 32) {
+                for (; i <= limit; i += 32)
+                {
                     int32x4_t v0 = vld1q_s32(&data[i]);
-                    int32x4_t v1 = vld1q_s32(&data[i+4]);
-                    int32x4_t v2 = vld1q_s32(&data[i+8]);
-                    int32x4_t v3 = vld1q_s32(&data[i+12]);
-                    int32x4_t v4 = vld1q_s32(&data[i+16]);
-                    int32x4_t v5 = vld1q_s32(&data[i+20]);
-                    int32x4_t v6 = vld1q_s32(&data[i+24]);
-                    int32x4_t v7 = vld1q_s32(&data[i+28]);
+                    int32x4_t v1 = vld1q_s32(&data[i + 4]);
+                    int32x4_t v2 = vld1q_s32(&data[i + 8]);
+                    int32x4_t v3 = vld1q_s32(&data[i + 12]);
+                    int32x4_t v4 = vld1q_s32(&data[i + 16]);
+                    int32x4_t v5 = vld1q_s32(&data[i + 20]);
+                    int32x4_t v6 = vld1q_s32(&data[i + 24]);
+                    int32x4_t v7 = vld1q_s32(&data[i + 28]);
 
                     uint32x4_t m0 = vcgtq_s32(v0, vThresh);
                     uint32x4_t m1 = vcgtq_s32(v1, vThresh);
@@ -162,36 +209,62 @@ extern "C" {
                     sum2 = vaddq_s32(sum2, (int32x4_t)m6);
                     sum2 = vaddq_s32(sum2, (int32x4_t)m7);
 
-                    matchCount -= (vgetq_lane_s32(sum1, 0) + vgetq_lane_s32(sum1, 1) + 
+                    matchCount -= (vgetq_lane_s32(sum1, 0) + vgetq_lane_s32(sum1, 1) +
                                    vgetq_lane_s32(sum1, 2) + vgetq_lane_s32(sum1, 3));
-                    matchCount -= (vgetq_lane_s32(sum2, 0) + vgetq_lane_s32(sum2, 1) + 
+                    matchCount -= (vgetq_lane_s32(sum2, 0) + vgetq_lane_s32(sum2, 1) +
                                    vgetq_lane_s32(sum2, 2) + vgetq_lane_s32(sum2, 3));
                 }
-            } else {
+            }
+            else
+            {
                 int limit = rows - 16;
-                for (; i <= limit; i += 16) {
+                for (; i <= limit; i += 16)
+                {
                     int32x4_t v0 = vld1q_s32(&data[i]);
-                    int32x4_t v1 = vld1q_s32(&data[i+4]);
-                    int32x4_t v2 = vld1q_s32(&data[i+8]);
-                    int32x4_t v3 = vld1q_s32(&data[i+12]);
+                    int32x4_t v1 = vld1q_s32(&data[i + 4]);
+                    int32x4_t v2 = vld1q_s32(&data[i + 8]);
+                    int32x4_t v3 = vld1q_s32(&data[i + 12]);
 
                     int mask0 = neon_movemask_epi32(vcgtq_s32(v0, vThresh));
                     int mask1 = neon_movemask_epi32(vcgtq_s32(v1, vThresh));
                     int mask2 = neon_movemask_epi32(vcgtq_s32(v2, vThresh));
                     int mask3 = neon_movemask_epi32(vcgtq_s32(v3, vThresh));
 
-                    if (mask0) { for(int k=0; k<4; k++) if((mask0>>k)&1) outIndices[matchCount++] = i+k; }
-                    if (mask1) { for(int k=0; k<4; k++) if((mask1>>k)&1) outIndices[matchCount++] = i+4+k; }
-                    if (mask2) { for(int k=0; k<4; k++) if((mask2>>k)&1) outIndices[matchCount++] = i+8+k; }
-                    if (mask3) { for(int k=0; k<4; k++) if((mask3>>k)&1) outIndices[matchCount++] = i+12+k; }
+                    if (mask0)
+                    {
+                        for (int k = 0; k < 4; k++)
+                            if ((mask0 >> k) & 1)
+                                outIndices[matchCount++] = i + k;
+                    }
+                    if (mask1)
+                    {
+                        for (int k = 0; k < 4; k++)
+                            if ((mask1 >> k) & 1)
+                                outIndices[matchCount++] = i + 4 + k;
+                    }
+                    if (mask2)
+                    {
+                        for (int k = 0; k < 4; k++)
+                            if ((mask2 >> k) & 1)
+                                outIndices[matchCount++] = i + 8 + k;
+                    }
+                    if (mask3)
+                    {
+                        for (int k = 0; k < 4; k++)
+                            if ((mask3 >> k) & 1)
+                                outIndices[matchCount++] = i + 12 + k;
+                    }
                 }
             }
 #endif
 
             // Scalar Tail
-            for (; i < rows; i++) {
-                if (data[i] > threshold) {
-                    if (outIndices != nullptr) {
+            for (; i < rows; i++)
+            {
+                if (data[i] > threshold)
+                {
+                    if (outIndices != nullptr)
+                    {
                         outIndices[matchCount] = i;
                     }
                     matchCount++;
@@ -204,15 +277,17 @@ extern "C" {
 
     // --- GATHER (Widening: Int -> Long) ---
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_batchReadIntToLongNative(
-        JNIEnv* env, jobject obj, jlong basePtr, jlong indicesPtr, jint count, jlong outPtr
-    ) {
-        if (!basePtr || !indicesPtr || !outPtr) return;
-        
-        int32_t* base = (int32_t*)basePtr;
-        int32_t* indices = (int32_t*)indicesPtr;
-        int64_t* out = (int64_t*)outPtr;
-        
-        for (int i = 0; i < count; i++) {
+        JNIEnv *env, jobject obj, jlong basePtr, jlong indicesPtr, jint count, jlong outPtr)
+    {
+        if (!basePtr || !indicesPtr || !outPtr)
+            return;
+
+        int32_t *base = (int32_t *)basePtr;
+        int32_t *indices = (int32_t *)indicesPtr;
+        int64_t *out = (int64_t *)outPtr;
+
+        for (int i = 0; i < count; i++)
+        {
             out[i] = (int64_t)base[indices[i]];
         }
     }
@@ -221,34 +296,41 @@ extern "C" {
     // DIRTY SCAN: HYBRID AVX2/NEON WITH DELETION BITMASK PUSHDOWN
     // ==========================================================
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxScanBlockWithDeletionsNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint threshold, jlong deletedBitmaskPtr
-    ) {
-        if (blockPtr == 0) return 0;
+        JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jint threshold, jlong deletedBitmaskPtr)
+    {
+        if (blockPtr == 0)
+            return 0;
 
-        uint8_t* basePtr = (uint8_t*)blockPtr;
-        BlockHeader* header = (BlockHeader*)basePtr;
-        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
-        ColumnHeader& col = colHeaders[colIdx];
-        
-        if (col.data_offset == 0) return 0; 
-        
-        int32_t* data = (int32_t*)(basePtr + col.data_offset);
-        uint8_t* bitmask = (uint8_t*)deletedBitmaskPtr; 
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
+        uint8_t *basePtr = (uint8_t *)blockPtr;
+        BlockHeader *header = (BlockHeader *)basePtr;
+        ColumnHeader *colHeaders = (ColumnHeader *)(basePtr + sizeof(BlockHeader));
+        ColumnHeader &col = colHeaders[colIdx];
+
+        if (col.data_offset == 0)
+            return 0;
+
+        int32_t *data = (int32_t *)(basePtr + col.data_offset);
+        uint8_t *bitmask = (uint8_t *)deletedBitmaskPtr;
         int rows = header->row_count;
         int matchCount = 0;
 
-        if (col.type == TYPE_INT) {
-            if (col.max_int <= threshold) return 0;
+        if (col.type == TYPE_INT)
+        {
+            if (col.max_int <= threshold)
+                return 0;
             int i = 0;
 
 #ifdef ARCH_X86
             __m256i vThresh = _mm256_set1_epi32(threshold);
             int limit = rows - 32;
-            for (; i <= limit; i += 32) {
-                __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
-                __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
-                __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
-                __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+            for (; i <= limit; i += 32)
+            {
+                __m256i v0 = _mm256_loadu_si256((__m256i *)&data[i]);
+                __m256i v1 = _mm256_loadu_si256((__m256i *)&data[i + 8]);
+                __m256i v2 = _mm256_loadu_si256((__m256i *)&data[i + 16]);
+                __m256i v3 = _mm256_loadu_si256((__m256i *)&data[i + 24]);
 
                 int m0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v0, vThresh)));
                 int m1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v1, vThresh)));
@@ -256,18 +338,19 @@ extern "C" {
                 int m3 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v3, vThresh)));
 
                 uint32_t matchMask = (m0) | (m1 << 8) | (m2 << 16) | (m3 << 24);
-                uint32_t delMask = (bitmask != nullptr) ? *(uint32_t*)(bitmask + (i >> 3)) : 0;
+                uint32_t delMask = (bitmask != nullptr) ? *(uint32_t *)(bitmask + (i >> 3)) : 0;
                 uint32_t validMask = matchMask & (~delMask);
                 matchCount += _mm_popcnt_u32(validMask);
             }
 #elif defined(ARCH_ARM)
             int32x4_t vThresh = vdupq_n_s32(threshold);
             int limit = rows - 16;
-            for (; i <= limit; i += 16) {
+            for (; i <= limit; i += 16)
+            {
                 int32x4_t v0 = vld1q_s32(&data[i]);
-                int32x4_t v1 = vld1q_s32(&data[i+4]);
-                int32x4_t v2 = vld1q_s32(&data[i+8]);
-                int32x4_t v3 = vld1q_s32(&data[i+12]);
+                int32x4_t v1 = vld1q_s32(&data[i + 4]);
+                int32x4_t v2 = vld1q_s32(&data[i + 8]);
+                int32x4_t v3 = vld1q_s32(&data[i + 12]);
 
                 int m0 = neon_movemask_epi32(vcgtq_s32(v0, vThresh));
                 int m1 = neon_movemask_epi32(vcgtq_s32(v1, vThresh));
@@ -275,16 +358,19 @@ extern "C" {
                 int m3 = neon_movemask_epi32(vcgtq_s32(v3, vThresh));
 
                 uint32_t matchMask = (m0) | (m1 << 4) | (m2 << 8) | (m3 << 12);
-                uint32_t delMask = (bitmask != nullptr) ? *(uint16_t*)(bitmask + (i >> 3)) : 0;
+                uint32_t delMask = (bitmask != nullptr) ? *(uint16_t *)(bitmask + (i >> 3)) : 0;
                 uint32_t validMask = matchMask & (~delMask);
                 matchCount += __builtin_popcount(validMask);
             }
 #endif
             // Scalar Tail
-            for (; i < rows; i++) {
-                if (data[i] > threshold) {
+            for (; i < rows; i++)
+            {
+                if (data[i] > threshold)
+                {
                     bool isDeleted = (bitmask != nullptr) && ((bitmask[i >> 3] & (1 << (i & 7))) != 0);
-                    if (!isDeleted) matchCount++;
+                    if (!isDeleted)
+                        matchCount++;
                 }
             }
         }
@@ -295,25 +381,35 @@ extern "C" {
     // FAST RANDOM UPDATE (In-Place Memory Mutation)
     // ==========================================================
     JNIEXPORT jboolean JNICALL Java_org_awandb_core_jni_NativeBridge_updateCellNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint rowId, jint newValue
-    ) {
-        if (blockPtr == 0) return JNI_FALSE;
-        uint8_t* basePtr = (uint8_t*)blockPtr;
-        BlockHeader* header = (BlockHeader*)basePtr;
-        
-        if (colIdx < 0 || colIdx >= (int)header->column_count) return JNI_FALSE;
-        if (rowId < 0 || rowId >= (int)header->row_count) return JNI_FALSE;
+        JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jint rowId, jint newValue)
+    {
+        if (blockPtr == 0)
+            return JNI_FALSE;
 
-        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
-        ColumnHeader& col = colHeaders[colIdx];
-        if (col.data_offset == 0) return JNI_FALSE;
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
 
-        if (col.type == TYPE_INT) {
-            int32_t* data = (int32_t*)(basePtr + col.data_offset);
+        uint8_t *basePtr = (uint8_t *)blockPtr;
+        BlockHeader *header = (BlockHeader *)basePtr;
+
+        if (colIdx < 0 || colIdx >= (int)header->column_count)
+            return JNI_FALSE;
+        if (rowId < 0 || rowId >= (int)header->row_count)
+            return JNI_FALSE;
+
+        ColumnHeader *colHeaders = (ColumnHeader *)(basePtr + sizeof(BlockHeader));
+        ColumnHeader &col = colHeaders[colIdx];
+        if (col.data_offset == 0)
+            return JNI_FALSE;
+
+        if (col.type == TYPE_INT)
+        {
+            int32_t *data = (int32_t *)(basePtr + col.data_offset);
             data[rowId] = newValue;
-            
-            if (newValue < col.min_int) col.min_int = newValue;
-            if (newValue > col.max_int) col.max_int = newValue;
+
+            if (newValue < col.min_int)
+                col.min_int = newValue;
+            if (newValue > col.max_int)
+                col.max_int = newValue;
 
             return JNI_TRUE;
         }
@@ -324,64 +420,84 @@ extern "C" {
     // PREDICATE PUSHDOWN: HYBRID AVX2/NEON FILTER
     // ==========================================================
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxFilterBlockNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint opType, jint targetVal, jlong outIndicesPtr, jlong deletedBitmaskPtr
-    ) {
-        if (blockPtr == 0 || outIndicesPtr == 0) return 0;
+        JNIEnv *env, jobject obj, jlong blockPtr, jint colIdx, jint opType, jint targetVal, jlong outIndicesPtr, jlong deletedBitmaskPtr)
+    {
+        if (blockPtr == 0 || outIndicesPtr == 0)
+            return 0;
 
-        uint8_t* basePtr = (uint8_t*)blockPtr;
-        BlockHeader* header = (BlockHeader*)basePtr;
-        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
-        ColumnHeader& col = colHeaders[colIdx];
-        
-        if (col.data_offset == 0) return 0; 
-        
-        int32_t* data = (int32_t*)(basePtr + col.data_offset);
-        int32_t* outIndices = (int32_t*)outIndicesPtr;
-        uint8_t* bitmask = (uint8_t*)deletedBitmaskPtr;
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
+        uint8_t *basePtr = (uint8_t *)blockPtr;
+        BlockHeader *header = (BlockHeader *)basePtr;
+        ColumnHeader *colHeaders = (ColumnHeader *)(basePtr + sizeof(BlockHeader));
+        ColumnHeader &col = colHeaders[colIdx];
+
+        if (col.data_offset == 0)
+            return 0;
+
+        int32_t *data = (int32_t *)(basePtr + col.data_offset);
+        int32_t *outIndices = (int32_t *)outIndicesPtr;
+        uint8_t *bitmask = (uint8_t *)deletedBitmaskPtr;
         int rows = header->row_count;
         int matchCount = 0;
 
-        if (col.type == TYPE_INT) {
-            if (opType == 0 && (targetVal < col.min_int || targetVal > col.max_int)) return 0; 
-            if (opType == 1 && col.max_int <= targetVal) return 0; 
-            if (opType == 2 && col.max_int < targetVal) return 0; 
-            if (opType == 3 && col.min_int >= targetVal) return 0; 
-            if (opType == 4 && col.min_int > targetVal) return 0; 
+        if (col.type == TYPE_INT)
+        {
+            if (opType == 0 && (targetVal < col.min_int || targetVal > col.max_int))
+                return 0;
+            if (opType == 1 && col.max_int <= targetVal)
+                return 0;
+            if (opType == 2 && col.max_int < targetVal)
+                return 0;
+            if (opType == 3 && col.min_int >= targetVal)
+                return 0;
+            if (opType == 4 && col.min_int > targetVal)
+                return 0;
 
             int i = 0;
 
 #ifdef ARCH_X86
             __m256i vTarget = _mm256_set1_epi32(targetVal);
             int limit = rows - 32;
-            for (; i <= limit; i += 32) {
-                __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
-                __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
-                __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
-                __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+            for (; i <= limit; i += 32)
+            {
+                __m256i v0 = _mm256_loadu_si256((__m256i *)&data[i]);
+                __m256i v1 = _mm256_loadu_si256((__m256i *)&data[i + 8]);
+                __m256i v2 = _mm256_loadu_si256((__m256i *)&data[i + 16]);
+                __m256i v3 = _mm256_loadu_si256((__m256i *)&data[i + 24]);
 
                 __m256i cmp0, cmp1, cmp2, cmp3;
-                if (opType == 0) {
+                if (opType == 0)
+                {
                     cmp0 = _mm256_cmpeq_epi32(v0, vTarget);
                     cmp1 = _mm256_cmpeq_epi32(v1, vTarget);
                     cmp2 = _mm256_cmpeq_epi32(v2, vTarget);
                     cmp3 = _mm256_cmpeq_epi32(v3, vTarget);
-                } else if (opType == 1) { 
+                }
+                else if (opType == 1)
+                {
                     cmp0 = _mm256_cmpgt_epi32(v0, vTarget);
                     cmp1 = _mm256_cmpgt_epi32(v1, vTarget);
                     cmp2 = _mm256_cmpgt_epi32(v2, vTarget);
                     cmp3 = _mm256_cmpgt_epi32(v3, vTarget);
-                } else if (opType == 2) { 
+                }
+                else if (opType == 2)
+                {
                     __m256i vT = _mm256_set1_epi32(targetVal - 1);
                     cmp0 = _mm256_cmpgt_epi32(v0, vT);
                     cmp1 = _mm256_cmpgt_epi32(v1, vT);
                     cmp2 = _mm256_cmpgt_epi32(v2, vT);
                     cmp3 = _mm256_cmpgt_epi32(v3, vT);
-                } else if (opType == 3) { 
+                }
+                else if (opType == 3)
+                {
                     cmp0 = _mm256_cmpgt_epi32(vTarget, v0);
                     cmp1 = _mm256_cmpgt_epi32(vTarget, v1);
                     cmp2 = _mm256_cmpgt_epi32(vTarget, v2);
                     cmp3 = _mm256_cmpgt_epi32(vTarget, v3);
-                } else { 
+                }
+                else
+                {
                     cmp0 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v0, vTarget), _mm256_setzero_si256());
                     cmp1 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v1, vTarget), _mm256_setzero_si256());
                     cmp2 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v2, vTarget), _mm256_setzero_si256());
@@ -394,51 +510,62 @@ extern "C" {
                 int m3 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp3));
 
                 uint32_t matchMask = (m0) | (m1 << 8) | (m2 << 16) | (m3 << 24);
-                uint32_t delMask = (bitmask != nullptr) ? *(uint32_t*)(bitmask + (i >> 3)) : 0;
+                uint32_t delMask = (bitmask != nullptr) ? *(uint32_t *)(bitmask + (i >> 3)) : 0;
                 uint32_t validMask = matchMask & (~delMask);
-                
-                while (validMask) {
+
+                while (validMask)
+                {
                     unsigned long tz;
 #ifdef _MSC_VER
                     _BitScanForward(&tz, validMask);
 #else
-                    tz = __builtin_ctz(validMask); 
+                    tz = __builtin_ctz(validMask);
 #endif
                     outIndices[matchCount++] = i + tz;
-                    validMask &= (validMask - 1); 
+                    validMask &= (validMask - 1);
                 }
             }
 #elif defined(ARCH_ARM)
             int32x4_t vTarget = vdupq_n_s32(targetVal);
             int limit = rows - 16;
-            for (; i <= limit; i += 16) {
+            for (; i <= limit; i += 16)
+            {
                 int32x4_t v0 = vld1q_s32(&data[i]);
-                int32x4_t v1 = vld1q_s32(&data[i+4]);
-                int32x4_t v2 = vld1q_s32(&data[i+8]);
-                int32x4_t v3 = vld1q_s32(&data[i+12]);
+                int32x4_t v1 = vld1q_s32(&data[i + 4]);
+                int32x4_t v2 = vld1q_s32(&data[i + 8]);
+                int32x4_t v3 = vld1q_s32(&data[i + 12]);
 
                 uint32x4_t cmp0, cmp1, cmp2, cmp3;
-                if (opType == 0) {
+                if (opType == 0)
+                {
                     cmp0 = vceqq_s32(v0, vTarget);
                     cmp1 = vceqq_s32(v1, vTarget);
                     cmp2 = vceqq_s32(v2, vTarget);
                     cmp3 = vceqq_s32(v3, vTarget);
-                } else if (opType == 1) {
+                }
+                else if (opType == 1)
+                {
                     cmp0 = vcgtq_s32(v0, vTarget);
                     cmp1 = vcgtq_s32(v1, vTarget);
                     cmp2 = vcgtq_s32(v2, vTarget);
                     cmp3 = vcgtq_s32(v3, vTarget);
-                } else if (opType == 2) {
+                }
+                else if (opType == 2)
+                {
                     cmp0 = vcgeq_s32(v0, vTarget);
                     cmp1 = vcgeq_s32(v1, vTarget);
                     cmp2 = vcgeq_s32(v2, vTarget);
                     cmp3 = vcgeq_s32(v3, vTarget);
-                } else if (opType == 3) {
+                }
+                else if (opType == 3)
+                {
                     cmp0 = vcltq_s32(v0, vTarget);
                     cmp1 = vcltq_s32(v1, vTarget);
                     cmp2 = vcltq_s32(v2, vTarget);
                     cmp3 = vcltq_s32(v3, vTarget);
-                } else {
+                }
+                else
+                {
                     cmp0 = vcleq_s32(v0, vTarget);
                     cmp1 = vcleq_s32(v1, vTarget);
                     cmp2 = vcleq_s32(v2, vTarget);
@@ -451,29 +578,38 @@ extern "C" {
                 int m3 = neon_movemask_epi32(cmp3);
 
                 uint32_t matchMask = (m0) | (m1 << 4) | (m2 << 8) | (m3 << 12);
-                uint32_t delMask = (bitmask != nullptr) ? *(uint16_t*)(bitmask + (i >> 3)) : 0;
+                uint32_t delMask = (bitmask != nullptr) ? *(uint16_t *)(bitmask + (i >> 3)) : 0;
                 uint32_t validMask = matchMask & (~delMask);
-                
-                while (validMask) {
-                    int tz = __builtin_ctz(validMask); 
+
+                while (validMask)
+                {
+                    int tz = __builtin_ctz(validMask);
                     outIndices[matchCount++] = i + tz;
-                    validMask &= (validMask - 1); 
+                    validMask &= (validMask - 1);
                 }
             }
 #endif
 
             // Scalar Tail
-            for (; i < rows; i++) {
+            for (; i < rows; i++)
+            {
                 bool match = false;
-                if (opType == 0) match = (data[i] == targetVal);
-                else if (opType == 1) match = (data[i] > targetVal);
-                else if (opType == 2) match = (data[i] >= targetVal);
-                else if (opType == 3) match = (data[i] < targetVal);
-                else if (opType == 4) match = (data[i] <= targetVal);
+                if (opType == 0)
+                    match = (data[i] == targetVal);
+                else if (opType == 1)
+                    match = (data[i] > targetVal);
+                else if (opType == 2)
+                    match = (data[i] >= targetVal);
+                else if (opType == 3)
+                    match = (data[i] < targetVal);
+                else if (opType == 4)
+                    match = (data[i] <= targetVal);
 
-                if (match) {
+                if (match)
+                {
                     bool isDeleted = (bitmask != nullptr) && ((bitmask[i >> 3] & (1 << (i & 7))) != 0);
-                    if (!isDeleted) outIndices[matchCount++] = i;
+                    if (!isDeleted)
+                        outIndices[matchCount++] = i;
                 }
             }
         }
@@ -484,19 +620,23 @@ extern "C" {
     // COMPOSITE PREDICATE PUSHDOWN (RPN AST EVALUATOR)
     // ==========================================================
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_avxCompositeFilterNative(
-        JNIEnv* env, jobject obj, jlong blockPtr, jintArray jRpn, jlong outIndicesPtr, jlong deletedBitmaskPtr
-    ) {
-        if (blockPtr == 0 || jRpn == nullptr || outIndicesPtr == 0) return 0;
+        JNIEnv *env, jobject obj, jlong blockPtr, jintArray jRpn, jlong outIndicesPtr, jlong deletedBitmaskPtr)
+    {
+        if (blockPtr == 0 || jRpn == nullptr || outIndicesPtr == 0)
+            return 0;
 
-        uint8_t* basePtr = (uint8_t*)blockPtr;
-        BlockHeader* header = (BlockHeader*)basePtr;
-        ColumnHeader* colHeaders = (ColumnHeader*)(basePtr + sizeof(BlockHeader));
-        
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
+        uint8_t *basePtr = (uint8_t *)blockPtr;
+        BlockHeader *header = (BlockHeader *)basePtr;
+        ColumnHeader *colHeaders = (ColumnHeader *)(basePtr + sizeof(BlockHeader));
+
         int rows = header->row_count;
-        if (rows == 0) return 0;
+        if (rows == 0)
+            return 0;
 
         // Fetch RPN Instructions
-        jint* rpn = (jint*)env->GetPrimitiveArrayCritical(jRpn, nullptr);
+        jint *rpn = (jint *)env->GetPrimitiveArrayCritical(jRpn, nullptr);
         jsize rpnLen = env->GetArrayLength(jRpn);
 
         // Calculate Bitmask Size (1 bit per row, packed into 32-bit words)
@@ -504,86 +644,132 @@ extern "C" {
 
         // Pre-allocate a small pool of bitmasks for the RPN Stack (Max Depth 32)
         const int MAX_DEPTH = 32;
-        uint32_t* maskPool[MAX_DEPTH];
-        for (int i = 0; i < MAX_DEPTH; i++) {
-            maskPool[i] = (uint32_t*)alloc_aligned(numWords * sizeof(uint32_t));
+        uint32_t *maskPool[MAX_DEPTH];
+        for (int i = 0; i < MAX_DEPTH; i++)
+        {
+            maskPool[i] = (uint32_t *)alloc_aligned(numWords * sizeof(uint32_t));
         }
 
-        uint32_t* stack[MAX_DEPTH];
+        uint32_t *stack[MAX_DEPTH];
         int sp = 0;
         int poolIdx = 0;
 
         int pc = 0;
-        while (pc < rpnLen) {
+        while (pc < rpnLen)
+        {
             int op = rpn[pc];
 
-            if (op == 1) { // OP_PRED: [1, colIdx, opType, targetVal]
+            if (op == 1)
+            { // OP_PRED: [1, colIdx, opType, targetVal]
                 int colIdx = rpn[pc + 1];
                 int opType = rpn[pc + 2];
                 int targetVal = rpn[pc + 3];
                 pc += 4;
 
-                ColumnHeader& col = colHeaders[colIdx];
-                uint32_t* currentMask = maskPool[poolIdx++];
+                ColumnHeader &col = colHeaders[colIdx];
+                uint32_t *currentMask = maskPool[poolIdx++];
                 std::memset(currentMask, 0, numWords * sizeof(uint32_t));
 
                 // Zone Map Short-Circuiting (Extremely Fast)
                 bool allMatch = false;
                 bool noMatch = false;
 
-                if (opType == 0) { // ==
-                    if (targetVal < col.min_int || targetVal > col.max_int) noMatch = true;
-                    else if (col.min_int == col.max_int && targetVal == col.min_int) allMatch = true;
-                } else if (opType == 1) { // >
-                    if (col.max_int <= targetVal) noMatch = true;
-                    else if (col.min_int > targetVal) allMatch = true;
-                } else if (opType == 2) { // >=
-                    if (col.max_int < targetVal) noMatch = true;
-                    else if (col.min_int >= targetVal) allMatch = true;
-                } else if (opType == 3) { // <
-                    if (col.min_int >= targetVal) noMatch = true;
-                    else if (col.max_int < targetVal) allMatch = true;
-                } else if (opType == 4) { // <=
-                    if (col.min_int > targetVal) noMatch = true;
-                    else if (col.max_int <= targetVal) allMatch = true;
+                if (opType == 0)
+                { // ==
+                    if (targetVal < col.min_int || targetVal > col.max_int)
+                        noMatch = true;
+                    else if (col.min_int == col.max_int && targetVal == col.min_int)
+                        allMatch = true;
+                }
+                else if (opType == 1)
+                { // >
+                    if (col.max_int <= targetVal)
+                        noMatch = true;
+                    else if (col.min_int > targetVal)
+                        allMatch = true;
+                }
+                else if (opType == 2)
+                { // >=
+                    if (col.max_int < targetVal)
+                        noMatch = true;
+                    else if (col.min_int >= targetVal)
+                        allMatch = true;
+                }
+                else if (opType == 3)
+                { // <
+                    if (col.min_int >= targetVal)
+                        noMatch = true;
+                    else if (col.max_int < targetVal)
+                        allMatch = true;
+                }
+                else if (opType == 4)
+                { // <=
+                    if (col.min_int > targetVal)
+                        noMatch = true;
+                    else if (col.max_int <= targetVal)
+                        allMatch = true;
                 }
 
-                if (noMatch) {
+                if (noMatch)
+                {
                     // memset already did the work
-                } else if (allMatch) {
+                }
+                else if (allMatch)
+                {
                     std::memset(currentMask, 0xFF, numWords * sizeof(uint32_t));
-                } else {
+                }
+                else
+                {
                     // AVX/NEON Full Evaluation
-                    int32_t* data = (int32_t*)(basePtr + col.data_offset);
-                    
-                    for (int w = 0; w < numWords; w++) {
+                    int32_t *data = (int32_t *)(basePtr + col.data_offset);
+
+                    for (int w = 0; w < numWords; w++)
+                    {
                         int i = w * 32;
-                        if (i + 31 >= rows) break; // Leave tail for scalar
+                        if (i + 31 >= rows)
+                            break; // Leave tail for scalar
 
                         uint32_t word = 0;
 
 #ifdef ARCH_X86
                         __m256i vT = _mm256_set1_epi32(targetVal);
-                        __m256i v0 = _mm256_loadu_si256((__m256i*)&data[i]);
-                        __m256i v1 = _mm256_loadu_si256((__m256i*)&data[i+8]);
-                        __m256i v2 = _mm256_loadu_si256((__m256i*)&data[i+16]);
-                        __m256i v3 = _mm256_loadu_si256((__m256i*)&data[i+24]);
+                        __m256i v0 = _mm256_loadu_si256((__m256i *)&data[i]);
+                        __m256i v1 = _mm256_loadu_si256((__m256i *)&data[i + 8]);
+                        __m256i v2 = _mm256_loadu_si256((__m256i *)&data[i + 16]);
+                        __m256i v3 = _mm256_loadu_si256((__m256i *)&data[i + 24]);
 
                         __m256i c0, c1, c2, c3;
-                        if (opType == 0) {
-                            c0 = _mm256_cmpeq_epi32(v0, vT); c1 = _mm256_cmpeq_epi32(v1, vT);
-                            c2 = _mm256_cmpeq_epi32(v2, vT); c3 = _mm256_cmpeq_epi32(v3, vT);
-                        } else if (opType == 1) {
-                            c0 = _mm256_cmpgt_epi32(v0, vT); c1 = _mm256_cmpgt_epi32(v1, vT);
-                            c2 = _mm256_cmpgt_epi32(v2, vT); c3 = _mm256_cmpgt_epi32(v3, vT);
-                        } else if (opType == 2) {
+                        if (opType == 0)
+                        {
+                            c0 = _mm256_cmpeq_epi32(v0, vT);
+                            c1 = _mm256_cmpeq_epi32(v1, vT);
+                            c2 = _mm256_cmpeq_epi32(v2, vT);
+                            c3 = _mm256_cmpeq_epi32(v3, vT);
+                        }
+                        else if (opType == 1)
+                        {
+                            c0 = _mm256_cmpgt_epi32(v0, vT);
+                            c1 = _mm256_cmpgt_epi32(v1, vT);
+                            c2 = _mm256_cmpgt_epi32(v2, vT);
+                            c3 = _mm256_cmpgt_epi32(v3, vT);
+                        }
+                        else if (opType == 2)
+                        {
                             __m256i vT1 = _mm256_set1_epi32(targetVal - 1);
-                            c0 = _mm256_cmpgt_epi32(v0, vT1); c1 = _mm256_cmpgt_epi32(v1, vT1);
-                            c2 = _mm256_cmpgt_epi32(v2, vT1); c3 = _mm256_cmpgt_epi32(v3, vT1);
-                        } else if (opType == 3) {
-                            c0 = _mm256_cmpgt_epi32(vT, v0); c1 = _mm256_cmpgt_epi32(vT, v1);
-                            c2 = _mm256_cmpgt_epi32(vT, v2); c3 = _mm256_cmpgt_epi32(vT, v3);
-                        } else if (opType == 4) {
+                            c0 = _mm256_cmpgt_epi32(v0, vT1);
+                            c1 = _mm256_cmpgt_epi32(v1, vT1);
+                            c2 = _mm256_cmpgt_epi32(v2, vT1);
+                            c3 = _mm256_cmpgt_epi32(v3, vT1);
+                        }
+                        else if (opType == 3)
+                        {
+                            c0 = _mm256_cmpgt_epi32(vT, v0);
+                            c1 = _mm256_cmpgt_epi32(vT, v1);
+                            c2 = _mm256_cmpgt_epi32(vT, v2);
+                            c3 = _mm256_cmpgt_epi32(vT, v3);
+                        }
+                        else if (opType == 4)
+                        {
                             c0 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v0, vT), _mm256_setzero_si256());
                             c1 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v1, vT), _mm256_setzero_si256());
                             c2 = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(v2, vT), _mm256_setzero_si256());
@@ -598,33 +784,80 @@ extern "C" {
                         word = (m0) | (m1 << 8) | (m2 << 16) | (m3 << 24);
 #elif defined(ARCH_ARM)
                         int32x4_t vT = vdupq_n_s32(targetVal);
-                        int32x4_t v0 = vld1q_s32(&data[i]);    int32x4_t v1 = vld1q_s32(&data[i+4]);
-                        int32x4_t v2 = vld1q_s32(&data[i+8]);  int32x4_t v3 = vld1q_s32(&data[i+12]);
-                        int32x4_t v4 = vld1q_s32(&data[i+16]); int32x4_t v5 = vld1q_s32(&data[i+20]);
-                        int32x4_t v6 = vld1q_s32(&data[i+24]); int32x4_t v7 = vld1q_s32(&data[i+28]);
+                        int32x4_t v0 = vld1q_s32(&data[i]);
+                        int32x4_t v1 = vld1q_s32(&data[i + 4]);
+                        int32x4_t v2 = vld1q_s32(&data[i + 8]);
+                        int32x4_t v3 = vld1q_s32(&data[i + 12]);
+                        int32x4_t v4 = vld1q_s32(&data[i + 16]);
+                        int32x4_t v5 = vld1q_s32(&data[i + 20]);
+                        int32x4_t v6 = vld1q_s32(&data[i + 24]);
+                        int32x4_t v7 = vld1q_s32(&data[i + 28]);
 
                         uint32x4_t c0, c1, c2, c3, c4, c5, c6, c7;
-                        if (opType == 0) {
-                            c0 = vceqq_s32(v0, vT); c1 = vceqq_s32(v1, vT); c2 = vceqq_s32(v2, vT); c3 = vceqq_s32(v3, vT);
-                            c4 = vceqq_s32(v4, vT); c5 = vceqq_s32(v5, vT); c6 = vceqq_s32(v6, vT); c7 = vceqq_s32(v7, vT);
-                        } else if (opType == 1) {
-                            c0 = vcgtq_s32(v0, vT); c1 = vcgtq_s32(v1, vT); c2 = vcgtq_s32(v2, vT); c3 = vcgtq_s32(v3, vT);
-                            c4 = vcgtq_s32(v4, vT); c5 = vcgtq_s32(v5, vT); c6 = vcgtq_s32(v6, vT); c7 = vcgtq_s32(v7, vT);
-                        } else if (opType == 2) {
-                            c0 = vcgeq_s32(v0, vT); c1 = vcgeq_s32(v1, vT); c2 = vcgeq_s32(v2, vT); c3 = vcgeq_s32(v3, vT);
-                            c4 = vcgeq_s32(v4, vT); c5 = vcgeq_s32(v5, vT); c6 = vcgeq_s32(v6, vT); c7 = vcgeq_s32(v7, vT);
-                        } else if (opType == 3) {
-                            c0 = vcltq_s32(v0, vT); c1 = vcltq_s32(v1, vT); c2 = vcltq_s32(v2, vT); c3 = vcltq_s32(v3, vT);
-                            c4 = vcltq_s32(v4, vT); c5 = vcltq_s32(v5, vT); c6 = vcltq_s32(v6, vT); c7 = vcltq_s32(v7, vT);
-                        } else if (opType == 4) {
-                            c0 = vcleq_s32(v0, vT); c1 = vcleq_s32(v1, vT); c2 = vcleq_s32(v2, vT); c3 = vcleq_s32(v3, vT);
-                            c4 = vcleq_s32(v4, vT); c5 = vcleq_s32(v5, vT); c6 = vcleq_s32(v6, vT); c7 = vcleq_s32(v7, vT);
+                        if (opType == 0)
+                        {
+                            c0 = vceqq_s32(v0, vT);
+                            c1 = vceqq_s32(v1, vT);
+                            c2 = vceqq_s32(v2, vT);
+                            c3 = vceqq_s32(v3, vT);
+                            c4 = vceqq_s32(v4, vT);
+                            c5 = vceqq_s32(v5, vT);
+                            c6 = vceqq_s32(v6, vT);
+                            c7 = vceqq_s32(v7, vT);
+                        }
+                        else if (opType == 1)
+                        {
+                            c0 = vcgtq_s32(v0, vT);
+                            c1 = vcgtq_s32(v1, vT);
+                            c2 = vcgtq_s32(v2, vT);
+                            c3 = vcgtq_s32(v3, vT);
+                            c4 = vcgtq_s32(v4, vT);
+                            c5 = vcgtq_s32(v5, vT);
+                            c6 = vcgtq_s32(v6, vT);
+                            c7 = vcgtq_s32(v7, vT);
+                        }
+                        else if (opType == 2)
+                        {
+                            c0 = vcgeq_s32(v0, vT);
+                            c1 = vcgeq_s32(v1, vT);
+                            c2 = vcgeq_s32(v2, vT);
+                            c3 = vcgeq_s32(v3, vT);
+                            c4 = vcgeq_s32(v4, vT);
+                            c5 = vcgeq_s32(v5, vT);
+                            c6 = vcgeq_s32(v6, vT);
+                            c7 = vcgeq_s32(v7, vT);
+                        }
+                        else if (opType == 3)
+                        {
+                            c0 = vcltq_s32(v0, vT);
+                            c1 = vcltq_s32(v1, vT);
+                            c2 = vcltq_s32(v2, vT);
+                            c3 = vcltq_s32(v3, vT);
+                            c4 = vcltq_s32(v4, vT);
+                            c5 = vcltq_s32(v5, vT);
+                            c6 = vcltq_s32(v6, vT);
+                            c7 = vcltq_s32(v7, vT);
+                        }
+                        else if (opType == 4)
+                        {
+                            c0 = vcleq_s32(v0, vT);
+                            c1 = vcleq_s32(v1, vT);
+                            c2 = vcleq_s32(v2, vT);
+                            c3 = vcleq_s32(v3, vT);
+                            c4 = vcleq_s32(v4, vT);
+                            c5 = vcleq_s32(v5, vT);
+                            c6 = vcleq_s32(v6, vT);
+                            c7 = vcleq_s32(v7, vT);
                         }
 
-                        int m0 = neon_movemask_epi32(c0); int m1 = neon_movemask_epi32(c1);
-                        int m2 = neon_movemask_epi32(c2); int m3 = neon_movemask_epi32(c3);
-                        int m4 = neon_movemask_epi32(c4); int m5 = neon_movemask_epi32(c5);
-                        int m6 = neon_movemask_epi32(c6); int m7 = neon_movemask_epi32(c7);
+                        int m0 = neon_movemask_epi32(c0);
+                        int m1 = neon_movemask_epi32(c1);
+                        int m2 = neon_movemask_epi32(c2);
+                        int m3 = neon_movemask_epi32(c3);
+                        int m4 = neon_movemask_epi32(c4);
+                        int m5 = neon_movemask_epi32(c5);
+                        int m6 = neon_movemask_epi32(c6);
+                        int m7 = neon_movemask_epi32(c7);
 
                         word = (m0) | (m1 << 4) | (m2 << 8) | (m3 << 12) | (m4 << 16) | (m5 << 20) | (m6 << 24) | (m7 << 28);
 #endif
@@ -634,93 +867,117 @@ extern "C" {
                     // Scalar Tail
                     int tailStart = (rows / 32) * 32;
                     uint32_t tailWord = 0;
-                    for (int i = tailStart; i < rows; i++) {
+                    for (int i = tailStart; i < rows; i++)
+                    {
                         bool match = false;
-                        if (opType == 0) match = (data[i] == targetVal);
-                        else if (opType == 1) match = (data[i] > targetVal);
-                        else if (opType == 2) match = (data[i] >= targetVal);
-                        else if (opType == 3) match = (data[i] < targetVal);
-                        else if (opType == 4) match = (data[i] <= targetVal);
+                        if (opType == 0)
+                            match = (data[i] == targetVal);
+                        else if (opType == 1)
+                            match = (data[i] > targetVal);
+                        else if (opType == 2)
+                            match = (data[i] >= targetVal);
+                        else if (opType == 3)
+                            match = (data[i] < targetVal);
+                        else if (opType == 4)
+                            match = (data[i] <= targetVal);
 
-                        if (match) tailWord |= (1U << (i - tailStart));
+                        if (match)
+                            tailWord |= (1U << (i - tailStart));
                     }
-                    if (tailStart < rows) {
+                    if (tailStart < rows)
+                    {
                         currentMask[tailStart / 32] = tailWord;
                     }
                 }
-                
-                stack[sp++] = currentMask;
 
-            } else if (op == 2) { // OP_AND: [2]
+                stack[sp++] = currentMask;
+            }
+            else if (op == 2)
+            { // OP_AND: [2]
                 pc += 1;
-                uint32_t* mask2 = stack[--sp];
-                uint32_t* mask1 = stack[sp - 1]; // Peak top
-                for (int w = 0; w < numWords; w++) {
+                uint32_t *mask2 = stack[--sp];
+                uint32_t *mask1 = stack[sp - 1]; // Peak top
+                for (int w = 0; w < numWords; w++)
+                {
                     mask1[w] &= mask2[w];
                 }
                 poolIdx--; // Recycle mask2
-            } else if (op == 3) { // OP_OR: [3]
+            }
+            else if (op == 3)
+            { // OP_OR: [3]
                 pc += 1;
-                uint32_t* mask2 = stack[--sp];
-                uint32_t* mask1 = stack[sp - 1]; 
-                for (int w = 0; w < numWords; w++) {
+                uint32_t *mask2 = stack[--sp];
+                uint32_t *mask1 = stack[sp - 1];
+                for (int w = 0; w < numWords; w++)
+                {
                     mask1[w] |= mask2[w];
                 }
-                poolIdx--; 
-            } else if (op == 4) { // OP_MAT: [4, len, id1, id2...]
+                poolIdx--;
+            }
+            else if (op == 4)
+            { // OP_MAT: [4, len, id1, id2...]
                 int len = rpn[pc + 1];
                 std::vector<int> targetPKs(&rpn[pc + 2], &rpn[pc + 2 + len]);
                 std::sort(targetPKs.begin(), targetPKs.end());
                 pc += 2 + len;
 
-                uint32_t* currentMask = maskPool[poolIdx++];
+                uint32_t *currentMask = maskPool[poolIdx++];
                 std::memset(currentMask, 0, numWords * sizeof(uint32_t));
 
                 // Always match against Column 0 (Primary Key)
-                int32_t* pkData = (int32_t*)(basePtr + colHeaders[0].data_offset);
+                int32_t *pkData = (int32_t *)(basePtr + colHeaders[0].data_offset);
 
-                for (int w = 0; w < numWords; w++) {
+                for (int w = 0; w < numWords; w++)
+                {
                     int i = w * 32;
                     uint32_t word = 0;
                     int bound = std::min(i + 32, rows);
-                    for (int bit = 0; bit < (bound - i); bit++) {
-                        if (std::binary_search(targetPKs.begin(), targetPKs.end(), pkData[i + bit])) {
+                    for (int bit = 0; bit < (bound - i); bit++)
+                    {
+                        if (std::binary_search(targetPKs.begin(), targetPKs.end(), pkData[i + bit]))
+                        {
                             word |= (1U << bit);
                         }
                     }
                     currentMask[w] = word;
                 }
                 stack[sp++] = currentMask;
-            } else {
+            }
+            else
+            {
                 break; // Safety escape
             }
         }
 
         // Apply Deletion Bitmask & Extract Indices
         int matchCount = 0;
-        int32_t* outIndices = (int32_t*)outIndicesPtr;
-        uint32_t* finalMask = stack[0];
-        uint32_t* delMaskArray = (uint32_t*)deletedBitmaskPtr;
+        int32_t *outIndices = (int32_t *)outIndicesPtr;
+        uint32_t *finalMask = stack[0];
+        uint32_t *delMaskArray = (uint32_t *)deletedBitmaskPtr;
 
-        for (int w = 0; w < numWords; w++) {
+        for (int w = 0; w < numWords; w++)
+        {
             uint32_t validMask = finalMask[w];
-            
-            if (delMaskArray != nullptr) {
+
+            if (delMaskArray != nullptr)
+            {
                 validMask &= ~(delMaskArray[w]);
             }
 
             // Optional: Mask out bits beyond 'rows' in the final word
-            if (w == numWords - 1 && (rows % 32) != 0) {
+            if (w == numWords - 1 && (rows % 32) != 0)
+            {
                 validMask &= ((1U << (rows % 32)) - 1);
             }
 
             int baseIdx = w * 32;
-            while (validMask) {
+            while (validMask)
+            {
 #ifdef _MSC_VER
                 unsigned long tz;
                 _BitScanForward(&tz, validMask);
 #else
-                int tz = __builtin_ctz(validMask); 
+                int tz = __builtin_ctz(validMask);
 #endif
                 outIndices[matchCount++] = baseIdx + tz;
                 validMask &= (validMask - 1); // Clear lowest set bit
@@ -728,7 +985,8 @@ extern "C" {
         }
 
         // Cleanup Pool
-        for (int i = 0; i < MAX_DEPTH; i++) {
+        for (int i = 0; i < MAX_DEPTH; i++)
+        {
             free_aligned(maskPool[i]);
         }
 

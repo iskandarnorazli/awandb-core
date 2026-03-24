@@ -27,6 +27,7 @@ import scala.jdk.CollectionConverters._
 import org.apache.arrow.vector.IntVector
 import org.apache.arrow.flight.{CallStatus, FlightRuntimeException, FlightStream, PutResult}
 import org.awandb.server.middleware.FormatMiddleware
+import org.awandb.core.jni.NativeBridge // <-- Added for Zero-Copy
 
 class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) extends FlightSqlProducer {
 
@@ -115,8 +116,6 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
         val emptySchema = if (format == "arrow") {
            if (result.schema.isEmpty) {
               // 🚀 SCHEMA FALLBACK FIX: Match the getFlightInfo promise for DDL queries!
-              // If SQLHandler returned an empty schema (e.g., DROP TABLE), we must still 
-              // send the 1-column layout that the ADBC client is expecting.
               new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
            } else {
                // Standard typed schema for 0-row SELECTs (e.g., SELECT * WHERE 1=0)
@@ -167,18 +166,27 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                 case "INT" =>
                     val intVec = vector.asInstanceOf[IntVector]
                     intVec.allocateNew(rowCount)
-                    val arr = rawData.asInstanceOf[Array[Int]]
                     
-                    // 🚀 TRUE ZERO-COPY EGRESS: Blast data straight into Arrow Off-Heap Memory!
                     val arrowDataPtr = intVec.getDataBuffer.memoryAddress()
-                    org.awandb.core.jni.NativeBridge.loadData(arrowDataPtr, arr)
                     
-                    // Fast-path Validity Buffer (Mark all as non-null)
-                    var i = 0
-                    while (i < rowCount) {
-                        intVec.setIndexDefined(i)
-                        i += 1
+                    // 🚀 TRUE ZERO-COPY UPGRADE
+                    // If the SQLHandler exposes the C++ pointer (Long), memcpy it. 
+                    // Otherwise, safely fallback to loading the JVM Array.
+                    rawData match {
+                      case ptr: java.lang.Long => 
+                        NativeBridge.memcpy(ptr, arrowDataPtr, rowCount * 4L)
+                      case arr: Array[Int] =>
+                        NativeBridge.loadData(arrowDataPtr, arr)
+                      case _ => 
+                        throw new IllegalArgumentException(s"Unknown data type for INT column: ${rawData.getClass.getSimpleName}")
                     }
+                    
+                    // 🚀 O(1) FAST-PATH VALIDITY BUFFER 
+                    // Replaces the slow O(N) while-loop. Instantly marks all rows as non-null.
+                    val validityBytes = (rowCount + 7) / 8
+                    val ones = Array.fill[Byte](validityBytes)((-1).toByte)
+                    intVec.getValidityBuffer.setBytes(0, ones, 0, validityBytes)
+                    
                     intVec.setValueCount(rowCount)
                     
                 case "STRING" =>

@@ -85,7 +85,7 @@ class AwanTable(
   engineManager.start()
 
   // ---------------------------------------------------------
-  // ROBUST BACKGROUND DAEMON (EBMM & Compaction)
+  // ROBUST BACKGROUND DAEMON (EBMM & Compaction & Pacemaker)
   // ---------------------------------------------------------
   val epochManager = new org.awandb.core.engine.memory.EpochManager(new org.awandb.core.engine.memory.NativeMemoryReleaser())
   val compactor = new Compactor(this, epochManager)
@@ -97,23 +97,26 @@ class AwanTable(
           Thread.sleep(daemonIntervalMs)
           epochManager.advanceGlobalEpoch()
           
-          // Drain the queue and build pending Cuckoo Filters
-          // Extract schema flags and build Multi-Column Indexes
+          // 1. [PHASE 6] Pacemaker Daemon: Clock-Sweep LRU Eviction
+          // Triggers gentle eviction down to 20% Idle Watermark
+          NativeBridge.triggerPacemakerSweep()
+
+          // 2. Build pending Cuckoo Filters
           var built = 0
           val isVectorFlags = columnOrder.map(c => columns(c).isVector).toArray
-          
           while (blockManager.buildPendingIndexes(isVectorFlags) > 0) { built += 1 }
-          // if (built > 0) println(s"[Daemon] Built $built Cuckoo Filters in table '$name'.")
           
+          // 3. Compact dead blocks
           val compacted = compactor.compact(0.3)
           if (compacted > 0) println(s"[Daemon] Compacted $compacted blocks in table '$name'.")
           
+          // 4. Reclaim memory safely
           epochManager.tryReclaim()
         } catch {
           case _: InterruptedException => // Graceful shutdown
           case t: Throwable => 
              println(s"[Daemon] FATAL CRASH: ${t.getMessage}")
-             t.printStackTrace() // This will reveal if your C++ library needs recompiling!
+             t.printStackTrace() 
         }
       }
     }
@@ -1897,6 +1900,71 @@ class AwanTable(
       if (resultIndexBuffer != 0L) {
           org.awandb.core.jni.NativeBridge.freeMainStore(resultIndexBuffer)
       }
+    } finally {
+      rwLock.writeLock().unlock()
+    }
+  }
+
+  // ---------------------------------------------------------
+  // ZERO-LEAK DDL (DROP TABLE)
+  // ---------------------------------------------------------
+  def drop(): Unit = {
+    rwLock.writeLock().lock()
+    try {
+      if (isClosed) return
+      isClosed = true
+      
+      // 1. Interrupt and kill the Pacemaker/Compaction daemon
+      if (daemonThread != null && daemonThread.isAlive) {
+        daemonThread.interrupt()
+      }
+
+      // 2. Explicitly clear and nullify JVM Delta Store ArrayBuffers
+      columns.values.foreach { col =>
+        if (col.deltaIntBuffer != null) col.deltaIntBuffer.clear()
+        if (col.deltaStringBuffer != null) col.deltaStringBuffer.clear()
+        if (col.isVector && col.deltaVectorBuffer != null) col.deltaVectorBuffer.clear()
+      }
+      
+      // Drop the references completely
+      columns.clear()
+      columnOrder.clear()
+      ramDeleted.clear()
+
+      // 3. Close the BlockManager (Unmaps files) and WAL
+      if (blockManager != null) blockManager.close()
+      if (wal != null) wal.close()
+
+      // [FIX 1] Explicitly free the pre-allocated result index buffer
+      if (resultIndexBuffer != 0L) {
+        NativeBridge.freeMainStore(resultIndexBuffer)
+      }
+
+      // 4. Force Immediate GC to trigger Native Cleaners
+      System.gc()
+      
+      // Give the JVM Cleaners a brief moment to push the orphaned 
+      // native pointers into the EpochManager's retirement queue
+      Thread.sleep(100) 
+
+      // 5. Actively flush the Epoch Manager's retirement queues 
+      // -> THIS triggers your native free method.
+      // -> The C++ free method now safely calls BufferPool::deregister_block!
+      epochManager.advanceGlobalEpoch() // Push current epoch
+      epochManager.advanceGlobalEpoch() // Push buffer epoch
+      epochManager.tryReclaim()         // Force free C++ pointers safely
+
+      // [FIX 2] WIPE THE DISK FILES 
+      // Safely deletes the table's directory and all its block files
+      if (dataDir != null) {
+        val dir = new java.io.File(dataDir)
+        if (dir.exists()) {
+          val files = dir.listFiles()
+          if (files != null) files.foreach(_.delete())
+          dir.delete()
+        }
+      }
+
     } finally {
       rwLock.writeLock().unlock()
     }

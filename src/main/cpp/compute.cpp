@@ -17,6 +17,7 @@
 #include "common.h"
 #include <limits>
 #include <string>
+#include "buffer_pool.h"
 
 // --- ARCHITECTURE SPECIFIC HEADERS ---
 #ifdef ARCH_X86
@@ -40,6 +41,8 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jintArray jThresholds, jintArray jCounts
     ) {
         if (blockPtr == 0) return;
+
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
         
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         BlockHeader* blkHeader = (BlockHeader*)rawPtr;
@@ -149,6 +152,9 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jstring search, jlong outIndicesPtr
     ) {
         if (blockPtr == 0) return 0;
+
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
         GermanString* data = (GermanString*)(rawPtr + ch->data_offset);
@@ -361,6 +367,9 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jfloatArray jQuery, jfloat threshold, jlong outIndicesPtr, jlong outScoresPtr) { 
         
         if (blockPtr == 0) return 0;
+
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
         if (ch->type != TYPE_VECTOR) return 0;
@@ -465,6 +474,9 @@ extern "C" {
     // ==========================================================
     JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_avxHashVectorNative(JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jlong outHashPtr) {
         if (blockPtr == 0 || outHashPtr == 0) return;
+
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         ColumnHeader* ch = &((ColumnHeader*)(rawPtr + sizeof(BlockHeader)))[colIdx];
         
@@ -520,6 +532,9 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jint targetVal, jlong outIndicesPtr
     ) {
         if (blockPtr == 0) return 0;
+
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
+
         uint8_t* rawPtr = (uint8_t*)blockPtr;
         BlockHeader* header = (BlockHeader*)rawPtr;
         ColumnHeader* colHeaders = (ColumnHeader*)(rawPtr + sizeof(BlockHeader));
@@ -656,6 +671,8 @@ extern "C" {
         JNIEnv* env, jobject obj, jlong blockPtr, jint colIdx, jchar opChar, jint operand, jlong indicesPtr, jint count
     ) {
         if (blockPtr == 0 || indicesPtr == 0 || count <= 0) return;
+
+        ScopedPin pin_guard((BlockHeader*)blockPtr);
 
         uint8_t* basePtr = (uint8_t*)blockPtr;
         BlockHeader* header = (BlockHeader*)basePtr;

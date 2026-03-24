@@ -169,6 +169,16 @@ class NativeBridge {
   @native def copyLongsToScalaNative(srcPtr: Long, dstArray: Array[Long], len: Int): Unit
   @native def freeArrayAggregationResultNative(ptr: Long): Unit
   @native def dictionaryGetSizeNative(ptr: Long): Int
+
+  // --- Buffer Pool TDD Harness ---
+  @native def initTestBufferPool(capacityBytes: Long): Unit
+  @native def requestTestPage(pageId: Int): Unit
+  @native def pinTestPage(pageId: Int): Unit
+  @native def unpinTestPage(pageId: Int): Unit
+  @native def isPageResident(pageId: Int): Boolean
+  @native def getBufferPoolUsagePercent(): Int
+  @native def triggerPacemakerSweep(): Unit
+  @native def destroyTestBufferPool(): Unit
 }
 
 // -----------------------------------------------------------
@@ -533,9 +543,19 @@ object NativeBridge {
   }
 
   def freeArrayAggregationResult(ptr: Long): Unit = instance.freeArrayAggregationResultNative(ptr)
-  
+
   def dictionaryGetSize(ptr: Long): Int = {
     if (ptr == 0) return 0
     instance.dictionaryGetSizeNative(ptr)
   }
+
+  // --- Buffer Pool TDD Harness (Public Wrappers) ---
+  def initTestBufferPool(capacityBytes: Long): Unit = instance.initTestBufferPool(capacityBytes)
+  def requestTestPage(pageId: Int): Unit = instance.requestTestPage(pageId)
+  def pinTestPage(pageId: Int): Unit = instance.pinTestPage(pageId)
+  def unpinTestPage(pageId: Int): Unit = instance.unpinTestPage(pageId)
+  def isPageResident(pageId: Int): Boolean = instance.isPageResident(pageId)
+  def getBufferPoolUsagePercent(): Int = instance.getBufferPoolUsagePercent()
+  def triggerPacemakerSweep(): Unit = instance.triggerPacemakerSweep()
+  def destroyTestBufferPool(): Unit = instance.destroyTestBufferPool()
 }
