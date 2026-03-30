@@ -246,12 +246,13 @@ extern "C"
     {
         if (blockPtr == 0)
             return 0;
+            
         BlockHeader *header = (BlockHeader *)blockPtr;
-        size_t metaSize = sizeof(BlockHeader) + (header->column_count * sizeof(ColumnHeader));
-        size_t padding = (metaSize % 256 != 0) ? (256 - (metaSize % 256)) : 0;
-        ColumnHeader *colHeaders = (ColumnHeader *)((uint8_t *)blockPtr + sizeof(BlockHeader));
-        ColumnHeader *lastCol = &colHeaders[header->column_count - 1];
-        return (jlong)(lastCol->data_offset + lastCol->data_length);
+        
+        // [CRITICAL FIX] Read the exactly tracked memory footprint.
+        // This natively accounts for the 512-byte AVX padding and the dynamic String Pool,
+        // preventing the JVM NativeMemoryTracker from mathematically leaking memory.
+        return (jlong)(header->memory_footprint_bytes);
     }
 
     JNIEXPORT jint JNICALL Java_org_awandb_core_jni_NativeBridge_getRowCount(JNIEnv *env, jobject obj, jlong blockPtr)
@@ -432,13 +433,20 @@ extern "C"
         JNIEnv *env, jobject obj, jlong blockPtr)
     {
         if (blockPtr == 0) return;
-        
         BlockHeader* block = (BlockHeader*)blockPtr;
-
+        
         // 1. Tell the Buffer Pool to forget this block completely
         BufferPool::get_instance()->deregister_block(block);
-
+        
         // 2. Now it is safe to return the memory to the OS
-        free(block); 
+        free_aligned(block); // <--- CRITICAL FIX: Was free(block)
+    }
+
+    JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_trimMemoryNative(JNIEnv *env, jobject obj) {
+#ifdef __linux__
+        malloc_trim(0);
+#elif defined(_WIN32) || defined(_WIN64)
+        _heapmin();
+#endif
     }
 }

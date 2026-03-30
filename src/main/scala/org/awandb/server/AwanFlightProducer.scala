@@ -23,6 +23,7 @@ import org.apache.arrow.vector.types.pojo.{ArrowType, Field, Schema}
 import org.apache.arrow.vector.IntVector
 import org.awandb.core.sql.SQLHandler
 import scala.jdk.CollectionConverters._
+import org.awandb.core.jni.NativeBridge
 
 class AwanFlightProducer(allocator: BufferAllocator, location: Location) extends NoOpFlightProducer {
 
@@ -39,16 +40,35 @@ class AwanFlightProducer(allocator: BufferAllocator, location: Location) extends
   }
 
   override def getStream(context: FlightProducer.CallContext, ticket: Ticket, listener: FlightProducer.ServerStreamListener): Unit = {
-    try {
-      // 1. Read the SQL command from the Python Client's ticket
-      val sql = new String(ticket.getBytes, "UTF-8")
-      println(s"[Network] Executing Incoming SQL: $sql")
+    // 1. Generate a Unique ID to track this query's C++ memory arena
+    val queryId = java.util.UUID.randomUUID().toString
 
-      // 2. Execute via the Native Volcano Pipeline
+    try {
+      // 2. Initialize memory tracking in C++
+      NativeBridge.initQueryContext(queryId)
+
+      // 3. Read the SQL command from the Python Client's ticket
+      val sql = new String(ticket.getBytes, "UTF-8")
+      println(s"[Network] 🟢 Executing Incoming SQL [$queryId]: $sql")
+
+      // 4. ABORT CHECK: Did the client drop before we even started?
+      if (listener.isCancelled) {
+          println(s"[Network] 🟡 Client disconnected early. Aborting query $queryId.")
+          return // The 'finally' block will safely clean up the memory.
+      }
+
+      // 5. Execute via the Native Volcano Pipeline
       // [FIX] Capture the structured SQLResult object
+      // Note: Pass queryId to SQLHandler if your operators need to track memory inside the C++ arena
       val result = SQLHandler.execute(sql)
 
-      // 3. Package the native result into a zero-copy Apache Arrow Vector
+      // 6. ABORT CHECK: If the Python client crashed or dropped during execution, abort Arrow packing!
+      if (listener.isCancelled) {
+          println(s"[Network] 🟡 Client disconnected after execution. Aborting Arrow packaging for $queryId.")
+          return 
+      }
+
+      // 7. Package the native result into a zero-copy Apache Arrow Vector
       val schema = new Schema(List(Field.nullable("query_result", new ArrowType.Utf8())).asJava)
       val root = VectorSchemaRoot.create(schema, allocator)
       val resultVector = root.getVector("query_result").asInstanceOf[VarCharVector]
@@ -61,16 +81,25 @@ class AwanFlightProducer(allocator: BufferAllocator, location: Location) extends
       resultVector.setValueCount(1)
       root.setRowCount(1)
 
-      // 4. Stream it back to the client!
-      listener.start(root)
-      listener.putNext()
-      root.close()
-      listener.completed()
+      // 8. FINAL ABORT CHECK: Stream it back to the client!
+      if (!listener.isCancelled) {
+        listener.start(root)
+        listener.putNext()
+        root.close()
+        listener.completed()
+      } else {
+        println(s"[Network] 🟡 Client dropped right before stream transfer for $queryId.")
+        root.close()
+      }
 
     } catch {
       case e: Exception =>
-        println(s"[Network] Error executing query: ${e.getMessage}")
+        println(s"[Network] 🔴 Error executing query: ${e.getMessage}")
         listener.error(e)
+    } finally {
+      // 9. THE FAILSAFE: Guarantee C++ memory teardown regardless of crashes, drops, or success!
+      NativeBridge.destroyQueryContext(queryId)
+      println(s"[Memory] 🧹 Reclaimed C++ Query Arena for: $queryId")
     }
   }
 

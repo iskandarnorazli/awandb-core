@@ -118,6 +118,28 @@ class Wal(directory: String) {
         dataOutput.close()
     }
   }
+
+  /**
+   * [NEW] ZERO-LEAK DDL DROP
+   * Forcefully closes the streams (ignoring any flush errors) and permanently
+   * deletes the WAL file from disk. Does NOT re-initialize the streams.
+   */
+  def drop(): Unit = {
+    // 1. Close streams (swallow any IO exceptions since we are destroying it anyway)
+    try {
+      if (dataOutput != null) {
+        dataOutput.close()
+      }
+    } catch {
+      case _: Exception => // Ignore flush/sync errors during a hard drop
+    }
+
+    // 2. Permanently delete the file from the OS
+    val file = new File(WAL_FILE)
+    if (file.exists()) {
+      file.delete()
+    }
+  }
   
   /**
    * [FIXED] Clear logs and RE-OPEN streams.

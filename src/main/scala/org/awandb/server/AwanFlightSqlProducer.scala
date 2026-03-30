@@ -86,18 +86,25 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
   override def getStreamStatement(ticket: TicketStatementQuery, context: FlightProducer.CallContext, listener: FlightProducer.ServerStreamListener): Unit = {
     var root: VectorSchemaRoot = null
     
+    // 1. Generate a Unique ID to track this query's C++ memory arena
+    val queryId = java.util.UUID.randomUUID().toString 
+    
     try {
       val sql = ticket.getStatementHandle.toStringUtf8
       
+      // 2. Initialize the Memory Arena in C++
+      NativeBridge.initQueryContext(queryId) 
+      
       // START PROFILER
       AwanDBInternalProfiler.start()
-      println(s"[Network] 🟢 Executing SELECT: $sql")
+      println(s"[Network] 🟢 Executing SELECT [$queryId]: $sql")
 
       // PHASE 1 (Prep & Parse Boundary)
       AwanDBInternalProfiler.stampPhase1()
 
       // [FIX 3] Receive the structured SQLResult
-      val result = SQLHandler.execute(sql)
+      // Note: Make sure to update your SQLHandler to accept and pass the queryId down to the operators if needed!
+      val result = SQLHandler.execute(sql) 
       
       // PHASE 2 (Engine Execution Boundary)
       AwanDBInternalProfiler.stampPhase2()
@@ -105,6 +112,12 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
       // Hard failure on actual boolean error
       if (result.isError) {
         throw new IllegalArgumentException(result.message)
+      }
+
+      // 3. ABORT CHECK: If the Python client crashed or dropped during C++ execution, abort Arrow packing!
+      if (listener.isCancelled) {
+         println(s"[Network] 🟡 Client disconnected early. Aborting Arrow packaging for $queryId.")
+         return // The 'finally' block will safely clean up the memory.
       }
 
       // 1. Intercept the Requested Format from Middleware
@@ -135,8 +148,12 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
         
         root = VectorSchemaRoot.create(emptySchema, allocator)
         root.setRowCount(0)
-        listener.start(root) // Sends the Schema only
-        listener.completed()
+        
+        // 4. SECOND ABORT CHECK
+        if (!listener.isCancelled) {
+          listener.start(root) // Sends the Schema only
+          listener.completed()
+        }
       } 
       else if (format == "arrow") {
         // ---------------------------------------------------------
@@ -170,8 +187,6 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                     val arrowDataPtr = intVec.getDataBuffer.memoryAddress()
                     
                     // 🚀 TRUE ZERO-COPY UPGRADE
-                    // If the SQLHandler exposes the C++ pointer (Long), memcpy it. 
-                    // Otherwise, safely fallback to loading the JVM Array.
                     rawData match {
                       case ptr: java.lang.Long => 
                         NativeBridge.memcpy(ptr, arrowDataPtr, rowCount * 4L)
@@ -182,7 +197,6 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
                     }
                     
                     // 🚀 O(1) FAST-PATH VALIDITY BUFFER 
-                    // Replaces the slow O(N) while-loop. Instantly marks all rows as non-null.
                     val validityBytes = (rowCount + 7) / 8
                     val ones = Array.fill[Byte](validityBytes)((-1).toByte)
                     intVec.getValidityBuffer.setBytes(0, ones, 0, validityBytes)
@@ -204,9 +218,14 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
             }
         }
 
-        listener.start(root)
-        listener.putNext()
-        listener.completed()
+        // 4. SECOND ABORT CHECK
+        if (!listener.isCancelled) {
+          listener.start(root)
+          listener.putNext()
+          listener.completed()
+        } else {
+          println(s"[Network] 🟡 Client dropped right before stream transfer for $queryId.")
+        }
       } 
       else {
         // ---------------------------------------------------------
@@ -221,9 +240,14 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
         resultVector.setValueCount(1)
         root.setRowCount(1)
 
-        listener.start(root)
-        listener.putNext()
-        listener.completed()
+        // 4. SECOND ABORT CHECK
+        if (!listener.isCancelled) {
+          listener.start(root)
+          listener.putNext()
+          listener.completed()
+        } else {
+          println(s"[Network] 🟡 Client dropped right before stream transfer for $queryId.")
+        }
       }
 
       // 🚀 STOP PROFILER (Arrow Packing Complete)
@@ -238,6 +262,10 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
         listener.error(CallStatus.INTERNAL.withDescription(e.getMessage).toRuntimeException)
     } finally {
       if (root != null) root.close()
+      
+      // 5. THE FAILSAFE: Guarantee C++ memory teardown regardless of crashes, drops, or success!
+      NativeBridge.destroyQueryContext(queryId)
+      println(s"[Memory] 🧹 Reclaimed C++ Query Arena for: $queryId")
     }
   }
 
@@ -248,9 +276,15 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
   override def acceptPutStatement(command: CommandStatementUpdate, context: FlightProducer.CallContext, flightStream: FlightStream, listener: FlightProducer.StreamListener[PutResult]): Runnable = {
     new Runnable {
       override def run(): Unit = {
+        // [CRITICAL FIX] Generate an arena ID
+        val queryId = java.util.UUID.randomUUID().toString
+        
         try {
           val sql = command.getQuery
           println(s"[Network] 🟢 Executing MUTATION: $sql")
+          
+          // [CRITICAL FIX] Bind this DML command to a safe C++ memory arena
+          NativeBridge.initQueryContext(queryId)
           
           val result = SQLHandler.execute(sql)
           if (result.isError) {
@@ -275,6 +309,10 @@ class AwanFlightSqlProducer(allocator: BufferAllocator, location: Location) exte
           case e: Throwable =>
             println(s"[Network] 🔴 Engine Crash: ${e.getMessage}")
             listener.onError(CallStatus.INTERNAL.withDescription(e.getMessage).toRuntimeException)
+        } finally {
+          // [CRITICAL FIX] THE FAILSAFE: Guarantee C++ memory teardown for DML queries
+          NativeBridge.destroyQueryContext(queryId)
+          println(s"[Memory] 🧹 Reclaimed C++ Query Arena for DML: $queryId")
         }
       }
     }

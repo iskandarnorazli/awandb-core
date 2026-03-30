@@ -66,7 +66,7 @@ class QueryExecutorSpec extends AnyFlatSpec with Matchers {
 
     // 4. EXECUTE
     val t0 = System.nanoTime()
-    val resultCount = QueryExecutor.execute(sortOp)
+    val resultCount = QueryExecutor.execute("test-query-id", sortOp)
     val t1 = System.nanoTime()
     
     println(s"Query Time: ${(t1 - t0) / 1e6} ms")

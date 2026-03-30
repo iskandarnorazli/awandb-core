@@ -485,32 +485,71 @@ class BlockManager(router: StorageRouter, val enableIndex: Boolean) {
     }
   }
 
-  def close(): Unit = {
-    var idx = 0
-    val activeBlocks = loadedBlocks.asScala.toSeq
-    
-    activeBlocks.foreach { ptr =>
-      // [CRITICAL FIX] Invoke the C++ destructor to free the massive internal payloads!
+  /**
+   * [NEW] Instantly frees all native C++ memory without flushing or saving metadata.
+   * Required for ZERO-LEAK DDL (DROP TABLE) to prevent JVM memory GC deadlocks.
+   */
+  def dropAllBlocksInstantly(): Unit = {
+    // 1. Destroy the physical C++ block memory instantly
+    loadedBlocks.asScala.foreach { ptr =>
       NativeBridge.destroyBlock(ptr)
+    }
 
-      val bitmaskPtr = nativeBitmaps.getOrDefault(ptr, 0L)
+    // 2. Free native deletion bitmasks directly from the values
+    nativeBitmaps.values().asScala.foreach { bitmaskPtr =>
       if (bitmaskPtr != 0L) NativeBridge.freeMainStore(bitmaskPtr)
+    }
 
-      // [FIX] Loop through the Filter Array to destroy all active columns
-      val filterArray = loadedFilters.get(idx)
+    // 3. Destroy all associated Cuckoo Filters in native memory safely 
+    // regardless of map keys (Fixes the `idx` pointer leak)
+    loadedFilters.values().asScala.foreach { filterArray =>
       if (filterArray != null) {
         filterArray.foreach { filterPtr =>
           if (filterPtr != 0L) NativeBridge.cuckooDestroy(filterPtr)
         }
       }
-      idx += 1
     }
 
+    // 4. Clear all JVM references so GC can collect the Scala wrapper objects
     loadedBlocks.clear()
     loadedFilters.clear()
     loadedZoneMaps.clear()
     deletionBitmaps.clear()
     nativeBitmaps.clear()
     bitmapDirty.clear()
+    pendingIndexes.clear()
+  }
+
+  def close(): Unit = {
+    // 1. Destroy the physical C++ block memory
+    loadedBlocks.asScala.foreach { ptr =>
+      // [CRITICAL FIX] Invoke the C++ destructor to free the massive internal payloads!
+      NativeBridge.destroyBlock(ptr)
+    }
+
+    // 2. Free native deletion bitmasks directly from the map values
+    nativeBitmaps.values().asScala.foreach { bitmaskPtr =>
+      if (bitmaskPtr != 0L) NativeBridge.freeMainStore(bitmaskPtr)
+    }
+
+    // 3. Destroy all associated Cuckoo Filters in native memory safely 
+    // regardless of map keys (Fixes the `idx` pointer leak)
+    loadedFilters.values().asScala.foreach { filterArray =>
+      if (filterArray != null) {
+        filterArray.foreach { filterPtr =>
+          if (filterPtr != 0L) NativeBridge.cuckooDestroy(filterPtr)
+        }
+      }
+    }
+
+    // 4. Clear all JVM references so GC can collect the Scala wrapper objects
+    loadedBlocks.clear()
+    loadedFilters.clear()
+    loadedZoneMaps.clear()
+    deletionBitmaps.clear()
+    nativeBitmaps.clear()
+    bitmapDirty.clear()
+    // Included pendingIndexes just to be completely thorough
+    pendingIndexes.clear() 
   }
 }

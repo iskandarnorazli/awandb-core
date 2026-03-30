@@ -179,6 +179,12 @@ class NativeBridge {
   @native def getBufferPoolUsagePercent(): Int
   @native def triggerPacemakerSweep(): Unit
   @native def destroyTestBufferPool(): Unit
+
+  // --- QUERY CONTEXT MANAGEMENT ---
+  @native def initQueryContextNative(queryId: String): Unit
+  @native def destroyQueryContextNative(queryId: String): Unit
+
+  @native def trimMemoryNative(): Unit
 }
 
 // -----------------------------------------------------------
@@ -230,7 +236,15 @@ object NativeBridge {
   // --- Memory ---
   def getOffsetPointer(basePtr: Long, offsetBytes: Long): Long = 
       instance.getOffsetPointerNative(basePtr, offsetBytes)
-  // Inside object NativeBridge (Scala API layer)
+
+  // [NEW] Query-Scoped Memory Tracking
+  def initQueryContext(queryId: String): Unit = {
+    instance.initQueryContextNative(queryId)
+  }
+
+  def destroyQueryContext(queryId: String): Unit = {
+    instance.destroyQueryContextNative(queryId)
+  }
 
   def allocMainStore(size: Long): Long = {
     val ptr = instance.allocMainStoreNative(size)
@@ -321,7 +335,12 @@ object NativeBridge {
   def getBlockSize(blockPtr: Long): Long = instance.getBlockSize(blockPtr)
   def getRowCount(blockPtr: Long): Int = instance.getRowCount(blockPtr)
   def destroyBlock(blockPtr: Long): Unit = {
-    if (blockPtr != 0) instance.destroyBlockNative(blockPtr)
+    if (blockPtr != 0L) {
+      // [CRITICAL FIX] Ensure the Scala ledger is updated whenever a block is destroyed,
+      // regardless of whether it was dropped instantly or swept by the EpochManager.
+      org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(blockPtr)
+      instance.destroyBlockNative(blockPtr)
+    }
   }
   def loadBlockFromFile(path: String): Long = {
     val ptr = instance.loadBlockFromFile(path)
@@ -558,4 +577,6 @@ object NativeBridge {
   def getBufferPoolUsagePercent(): Int = instance.getBufferPoolUsagePercent()
   def triggerPacemakerSweep(): Unit = instance.triggerPacemakerSweep()
   def destroyTestBufferPool(): Unit = instance.destroyTestBufferPool()
+
+  def trimMemory(): Unit = instance.trimMemoryNative()
 }

@@ -102,6 +102,22 @@ class EpochManager(releaser: MemoryReleaser) {
       isReclaiming.set(false)
     }
   }
+
+  /**
+   * [CRITICAL FIX] Bypasses epoch safety checks to forcefully free all pending native memory.
+   * MUST ONLY be called during DROP TABLE or JVM shutdown to prevent memory leaks.
+   */
+  def forceReclaimAll(): Unit = {
+    // We do not check minActiveEpoch. We nuke everything currently in the list.
+    val it = retirementList.iterator()
+    while (it.hasNext) {
+      val (ptr, _, resourceType) = it.next() 
+      if (ptr != 0L) {
+        releaser.free(ptr, resourceType)
+      }
+      it.remove()
+    }
+  }
   
   // Expose for testing
   def getGlobalEpoch: Long = globalEpoch.get()

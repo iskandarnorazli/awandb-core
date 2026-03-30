@@ -28,14 +28,23 @@ object NativeMemoryTracker {
 
   def recordAllocation(ptr: Long, sizeBytes: Long): Unit = {
     if (ptr != 0L) {
-      activeAllocations.put(ptr, sizeBytes)
-      totalAllocatedBytes.addAndGet(sizeBytes)
+      // [CRITICAL FIX] Use putIfAbsent to prevent double-ledgering
+      // It returns null if the key was not already associated with a value
+      val previousValue = activeAllocations.putIfAbsent(ptr, sizeBytes)
+      
+      // Only increment the global byte tracker if this is a brand new pointer
+      if (previousValue == null) {
+        totalAllocatedBytes.addAndGet(sizeBytes)
+      } else {
+        // Warning: The engine attempted to track an already tracked pointer.
+        // By ignoring it here, we protect the totalAllocatedBytes ledger from drifting.
+      }
     }
   }
 
   def recordDeallocation(ptr: Long): Unit = {
     if (ptr != 0L) {
-      // Now it safely returns null if the pointer wasn't in the map
+      // Safely returns null if the pointer wasn't in the map
       val size = activeAllocations.remove(ptr)
       if (size != null) {
         totalAllocatedBytes.addAndGet(-size)

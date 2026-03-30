@@ -45,9 +45,12 @@ class AwanTable(
   private val vectorDims = new ConcurrentHashMap[String, Int]()
   
   // [PERFORMANCE] Pre-allocated Buffer
-  val resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
+  var resultIndexBuffer: Long = NativeBridge.allocMainStore(capacity)
   
-  private[engine] val rwLock = new ReentrantReadWriteLock()
+  // [CRITICAL FIX] Track this memory!
+  org.awandb.core.engine.memory.NativeMemoryTracker.recordAllocation(resultIndexBuffer, capacity * 4L)
+  
+  val rwLock = new ReentrantReadWriteLock()
   
   @volatile private var isClosed = false
 
@@ -590,11 +593,15 @@ class AwanTable(
           
           // 2. Persist Data Block
           blockManager.createAndPersistBlock(allColumnsData.asInstanceOf[List[Any]])
-    
+
           // 3. Update Index Locations (RAM -> Disk)
           if (blockManager.getLoadedBlocks.nonEmpty) {
-              val newBlockIdx = blockManager.getLoadedBlocks.size - 1 // [NEW] Get index
+              val newBlockIdx = blockManager.getLoadedBlocks.size - 1
               val newBlockPtr = blockManager.getLoadedBlocks.last
+              
+              // [CRITICAL FIX] Track the newly flushed native block memory!
+              val blockSize = org.awandb.core.jni.NativeBridge.getBlockSize(newBlockPtr)
+              org.awandb.core.engine.memory.NativeMemoryTracker.recordAllocation(newBlockPtr, blockSize)
               val rowCount = headCol.get.deltaIntBuffer.length
               val firstCol = columns.values.head
               
@@ -649,10 +656,22 @@ class AwanTable(
   }
 
   def query(colName: String, search: Any): Int = {
-      search match {
-          case i: Int => queryIntEquality(colName, i) 
-          case s: String => queryStringEquality(colName, s)
-          case _ => 0
+      // 1. Generate a unique Query ID for the C++ Memory Arena
+      val queryId = java.util.UUID.randomUUID().toString
+      
+      // 2. Initialize the C++ Query Context
+      NativeBridge.initQueryContext(queryId)
+      
+      try {
+          // 3. Dispatch to the appropriate typed execution path
+          search match {
+              case i: Int => queryIntEquality(colName, i) 
+              case s: String => queryStringEquality(colName, s)
+              case _ => 0
+          }
+      } finally {
+          // 4. CRITICAL: Guarantee arena destruction even if the scan fails
+          NativeBridge.destroyQueryContext(queryId)
       }
   }
 
@@ -793,77 +812,105 @@ class AwanTable(
 
   def query(threshold: Int): Int = withEpoch {
     if (columns.isEmpty) return 0
-    val firstColName = columns.keys.head
     
-    var ramCount = 0
-    var snapshotBlocks: Seq[Long] = Seq.empty 
-
-    rwLock.readLock().lock()
+    // 1. Generate a unique Query ID for this execution's C++ Memory Arena
+    val queryId = java.util.UUID.randomUUID().toString
+    
+    // 2. Initialize the C++ Query Context
+    NativeBridge.initQueryContext(queryId)
+    
     try {
-       if (isClosed) throw new IllegalStateException("Table is closed")
-       val col = columns(firstColName)
-       if (col.deltaIntBuffer.nonEmpty) {
-         val arr = col.deltaIntBuffer.toArray
-         var i = 0
-         while (i < arr.length) {
-           if (!ramDeleted.get(i) && arr(i) > threshold) ramCount += 1
-           i += 1
-         }
-       }
-       snapshotBlocks = blockManager.getLoadedBlocks.toList 
-    } finally {
-       rwLock.readLock().unlock()
-    }
+      val firstColName = columns.keys.head
+      
+      var ramCount = 0
+      var snapshotBlocks: Seq[Long] = Seq.empty 
 
-    val colIdx = 0
-    val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
-       val rowCount = NativeBridge.getRowCount(blockPtr)
-       
-       // Fetch the cached native pointer instantly
-       val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
-       
-       if (bitmaskPtr == 0L) {
-           // FAST CLEAN PATH
-           NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
-       } else {
-           // FAST DIRTY PATH: Use cached Native Pointer directly
-           NativeBridge.avxScanBlockWithDeletions(blockPtr, colIdx, threshold, bitmaskPtr)
-       }
-    })
-    ramCount + diskCount
+      rwLock.readLock().lock()
+      try {
+         if (isClosed) throw new IllegalStateException("Table is closed")
+         val col = columns(firstColName)
+         if (col.deltaIntBuffer.nonEmpty) {
+           val arr = col.deltaIntBuffer.toArray
+           var i = 0
+           while (i < arr.length) {
+             if (!ramDeleted.get(i) && arr(i) > threshold) ramCount += 1
+             i += 1
+           }
+         }
+         snapshotBlocks = blockManager.getLoadedBlocks.toList 
+      } finally {
+         rwLock.readLock().unlock()
+      }
+
+      val colIdx = 0
+      val diskCount = MorselExec.scanParallel(snapshotBlocks, { blockPtr =>
+         val rowCount = NativeBridge.getRowCount(blockPtr)
+         
+         // Fetch the cached native pointer instantly
+         val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
+         
+         // Note: If avxScanBlock ever needs to allocate temporary memory, 
+         // you can eventually pass `queryId` into it here.
+         if (bitmaskPtr == 0L) {
+             // FAST CLEAN PATH
+             NativeBridge.avxScanBlock(blockPtr, colIdx, threshold, 0)
+         } else {
+             // FAST DIRTY PATH: Use cached Native Pointer directly
+             NativeBridge.avxScanBlockWithDeletions(blockPtr, colIdx, threshold, bitmaskPtr)
+         }
+      })
+      
+      ramCount + diskCount
+      
+    } finally {
+      // 3. CRITICAL: Destroy the C++ arena, guaranteed to run even if MorselExec throws
+      NativeBridge.destroyQueryContext(queryId)
+    }
   }
 
   def queryShared(thresholds: Array[Int]): Array[Int] = withEpoch {
-     val totalCounts = new Array[Int](thresholds.length)
-     var snapshotBlocks: Seq[Long] = Seq.empty
-     rwLock.readLock().lock()
-     try {
-       if (isClosed) throw new IllegalStateException("Table is closed")
-       if (columns.nonEmpty) {
-         val firstCol = columns.values.head
-         if (firstCol.deltaIntBuffer.nonEmpty) {
-           val ramData = firstCol.deltaIntBuffer.toArray
-           NativeBridge.avxScanArrayMulti(ramData, thresholds, totalCounts)
-         }
-       }
-       snapshotBlocks = blockManager.getLoadedBlocks.toList 
-     } finally {
-       rwLock.readLock().unlock()
-     }
+    // 1. Generate a unique Query ID for this execution's C++ Memory Arena
+    val queryId = java.util.UUID.randomUUID().toString
+    
+    // 2. Initialize the C++ Query Context
+    NativeBridge.initQueryContext(queryId)
+    
+    try {
+      val totalCounts = new Array[Int](thresholds.length)
+      var snapshotBlocks: Seq[Long] = Seq.empty
+      
+      rwLock.readLock().lock()
+      try {
+        if (isClosed) throw new IllegalStateException("Table is closed")
+        if (columns.nonEmpty) {
+          val firstCol = columns.values.head
+          if (firstCol.deltaIntBuffer.nonEmpty) {
+            val ramData = firstCol.deltaIntBuffer.toArray
+            NativeBridge.avxScanArrayMulti(ramData, thresholds, totalCounts)
+          }
+        }
+        snapshotBlocks = blockManager.getLoadedBlocks.toList 
+      } finally {
+        rwLock.readLock().unlock()
+      }
 
-     val diskCounts = MorselExec.scanSharedParallel(
-        snapshotBlocks,
-        allocator = () => new Array[Int](thresholds.length),
-        scanner = (ptr, counts) => NativeBridge.avxScanMultiBlock(ptr, 0, thresholds, counts)
-     )
-     
-     var i = 0
-     while (i < totalCounts.length) {
-       totalCounts(i) += diskCounts(i)
-       i += 1
-     }
-     
-     totalCounts
+      val diskCounts = MorselExec.scanSharedParallel(
+         snapshotBlocks,
+         allocator = () => new Array[Int](thresholds.length),
+         scanner = (ptr, counts) => NativeBridge.avxScanMultiBlock(ptr, 0, thresholds, counts)
+      )
+      
+      var i = 0
+      while (i < totalCounts.length) {
+        totalCounts(i) += diskCounts(i)
+        i += 1
+      }
+      
+      totalCounts
+    } finally {
+      // 3. CRITICAL: Destroy the C++ arena, guaranteed to run even if MorselExec throws
+      NativeBridge.destroyQueryContext(queryId)
+    }
   }
 
   // ---------------------------------------------------------
@@ -1154,7 +1201,12 @@ class AwanTable(
     // 3. DISK Evaluator (JNI AVX Pushdown)
     val diskIds = snapshotBlocks.flatMap { blockPtr =>
       val rowCount = NativeBridge.getRowCount(blockPtr)
-      val outIndicesPtr = NativeBridge.allocMainStore(rowCount * 4) // 4 bytes per Int
+      val outIndicesSize = rowCount * 4L
+      val outIndicesPtr = NativeBridge.allocMainStore(outIndicesSize) // 4 bytes per Int
+      
+      // [CRITICAL FIX] Track the allocation
+      org.awandb.core.engine.memory.NativeMemoryTracker.recordAllocation(outIndicesPtr, outIndicesSize)
+      
       val bitmaskPtr = blockManager.getNativeDeletionBitmap(blockPtr, rowCount)
 
       try {
@@ -1165,20 +1217,31 @@ class AwanTable(
         } else {
           // Extract only the matching Primary Keys (Col 0)
           val idColPtr = NativeBridge.getColumnPtr(blockPtr, 0)
-          val tempValuesPtr = NativeBridge.allocMainStore(matchCount * 4)
           
-          NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
-          val ids = new Array[Int](matchCount)
-          NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
+          val tempValuesSize = matchCount * 4L
+          val tempValuesPtr = NativeBridge.allocMainStore(tempValuesSize)
           
-          NativeBridge.freeMainStore(tempValuesPtr)
-          ids
+          // [CRITICAL FIX] Track the transient buffer allocation
+          org.awandb.core.engine.memory.NativeMemoryTracker.recordAllocation(tempValuesPtr, tempValuesSize)
+          
+          try {
+            NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
+            val ids = new Array[Int](matchCount)
+            NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
+            ids
+          } finally {
+            // [CRITICAL FIX] Ensure free and untrack even if copyToScala throws
+            NativeBridge.freeMainStore(tempValuesPtr)
+            org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(tempValuesPtr)
+          }
         }
       } finally {
+        // Untrack the primary indices buffer
         NativeBridge.freeMainStore(outIndicesPtr)
+        org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(outIndicesPtr)
       }
     }
-
+    
     ramIds.toArray ++ diskIds
   }
 
@@ -1476,100 +1539,112 @@ class AwanTable(
     val colIdx = columnOrder.indexOf(colName)
     if (colIdx == -1) return Array.empty[Int]
 
-    var snapshotBlocks: List[Long] = Nil
-    val ramMatches = scala.collection.mutable.ArrayBuffer[(Int, Float)]()
+    // 1. Generate a unique Query ID for this execution's C++ Memory Arena
+    val queryId = java.util.UUID.randomUUID().toString
+    
+    // 2. Initialize the C++ Query Context
+    org.awandb.core.jni.NativeBridge.initQueryContext(queryId)
 
-    // 1. Lock the table for reading
-    rwLock.readLock().lock()
     try {
-      if (isClosed) throw new IllegalStateException("Table is closed")
+      var snapshotBlocks: List[Long] = Nil
+      val ramMatches = scala.collection.mutable.ArrayBuffer[(Int, Float)]()
 
-      // --- RAM VECTOR SEARCH ---
-      val col = columns(colName)
-      if (col.isVector && col.deltaVectorBuffer.nonEmpty) {
-        val ramVectors = col.deltaVectorBuffer
-        val ramIdCol = columns(columnOrder.head).deltaIntBuffer // Assumes Col 0 is PK
-        
-        var i = 0
-        while (i < ramVectors.length) {
-          if (!ramDeleted.get(i)) {
-             val vec = ramVectors(i)
-             if (vec != null && vec.length == query.length) {
-                 var dotProduct = 0.0f
-                 var normA = 0.0f
-                 var normB = 0.0f
-                 var d = 0
-                 
-                 // Compute Cosine Similarity strictly for vectors in RAM
-                 while (d < vec.length) {
-                    dotProduct += vec(d) * query(d)
-                    normA += vec(d) * vec(d)
-                    normB += query(d) * query(d)
-                    d += 1
-                 }
-                 if (normA > 0 && normB > 0) {
-                     val score = dotProduct / (math.sqrt(normA) * math.sqrt(normB)).toFloat
-                     if (score >= threshold) {
-                         ramMatches.append((ramIdCol(i), score))
-                     }
-                 }
-             }
+      // 1. Lock the table for reading
+      rwLock.readLock().lock()
+      try {
+        if (isClosed) throw new IllegalStateException("Table is closed")
+
+        // --- RAM VECTOR SEARCH ---
+        val col = columns(colName)
+        if (col.isVector && col.deltaVectorBuffer.nonEmpty) {
+          val ramVectors = col.deltaVectorBuffer
+          val ramIdCol = columns(columnOrder.head).deltaIntBuffer // Assumes Col 0 is PK
+          
+          var i = 0
+          while (i < ramVectors.length) {
+            if (!ramDeleted.get(i)) {
+               val vec = ramVectors(i)
+               if (vec != null && vec.length == query.length) {
+                   var dotProduct = 0.0f
+                   var normA = 0.0f
+                   var normB = 0.0f
+                   var d = 0
+                   
+                   // Compute Cosine Similarity strictly for vectors in RAM
+                   while (d < vec.length) {
+                      dotProduct += vec(d) * query(d)
+                      normA += vec(d) * vec(d)
+                      normB += query(d) * query(d)
+                      d += 1
+                   }
+                   if (normA > 0 && normB > 0) {
+                       val score = dotProduct / (math.sqrt(normA) * math.sqrt(normB)).toFloat
+                       if (score >= threshold) {
+                           ramMatches.append((ramIdCol(i), score))
+                       }
+                   }
+               }
+            }
+            i += 1
           }
-          i += 1
         }
-      }
 
-      snapshotBlocks = blockManager.getLoadedBlocks.toList
+        snapshotBlocks = blockManager.getLoadedBlocks.toList
+
+      } finally {
+        rwLock.readLock().unlock()
+      }
+      
+      // 2. DISK VECTOR SEARCH (JNI)
+      // Protected safely by the outer withEpoch wrapper!
+      val diskMatches = snapshotBlocks.flatMap { blockPtr =>
+         val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
+         
+         val outIndicesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4)
+         val outScoresPtr  = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4) 
+         
+         try {
+             val matchCount = org.awandb.core.jni.NativeBridge.avxScanVectorCosine(
+               blockPtr, colIdx, query, threshold, outIndicesPtr, outScoresPtr
+             )
+             
+             if (matchCount == 0) {
+                 Array.empty[(Int, Float)] 
+             } else {
+                 val idColPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, 0)
+                 val tempValuesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(matchCount * 4)
+                 org.awandb.core.jni.NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
+                 
+                 val ids = new Array[Int](matchCount)
+                 org.awandb.core.jni.NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
+                 org.awandb.core.jni.NativeBridge.freeMainStore(tempValuesPtr)
+                 
+                 val scores = new Array[Float](matchCount)
+                 org.awandb.core.jni.NativeBridge.copyToScalaFloat(outScoresPtr, scores, matchCount) 
+                 
+                 ids.zip(scores)
+             }
+         } finally {
+             org.awandb.core.jni.NativeBridge.freeMainStore(outIndicesPtr)
+             org.awandb.core.jni.NativeBridge.freeMainStore(outScoresPtr)
+         }
+      }
+      
+      // 3. Late-Stage Filtering & Top-K Ranking (Merging RAM and Disk)
+      val allMatches = ramMatches ++ diskMatches
+
+      allMatches
+        .filter { case (id, _) => getRow(id).isDefined } 
+        .distinctBy { case (id, _) => id }               
+        .sortBy { case (_, score) => -score }            
+        .take(limit)                                     
+        .map { case (id, _) => id }                      
+        .toArray
 
     } finally {
-      rwLock.readLock().unlock()
+      // 4. CRITICAL: Destroy the C++ arena, guaranteed to run even if an exception occurs
+      org.awandb.core.jni.NativeBridge.destroyQueryContext(queryId)
     }
-    
-    // 2. DISK VECTOR SEARCH (JNI)
-    // Protected safely by the outer withEpoch wrapper!
-    val diskMatches = snapshotBlocks.flatMap { blockPtr =>
-       val rowCount = org.awandb.core.jni.NativeBridge.getRowCount(blockPtr)
-       
-       val outIndicesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4)
-       val outScoresPtr  = org.awandb.core.jni.NativeBridge.allocMainStore(rowCount * 4) 
-       
-       try {
-           val matchCount = org.awandb.core.jni.NativeBridge.avxScanVectorCosine(
-             blockPtr, colIdx, query, threshold, outIndicesPtr, outScoresPtr
-           )
-           
-           if (matchCount == 0) {
-               Array.empty[(Int, Float)] 
-           } else {
-               val idColPtr = org.awandb.core.jni.NativeBridge.getColumnPtr(blockPtr, 0)
-               val tempValuesPtr = org.awandb.core.jni.NativeBridge.allocMainStore(matchCount * 4)
-               org.awandb.core.jni.NativeBridge.batchRead(idColPtr, outIndicesPtr, matchCount, tempValuesPtr)
-               
-               val ids = new Array[Int](matchCount)
-               org.awandb.core.jni.NativeBridge.copyToScala(tempValuesPtr, ids, matchCount)
-               org.awandb.core.jni.NativeBridge.freeMainStore(tempValuesPtr)
-               
-               val scores = new Array[Float](matchCount)
-               org.awandb.core.jni.NativeBridge.copyToScalaFloat(outScoresPtr, scores, matchCount) 
-               
-               ids.zip(scores)
-           }
-       } finally {
-           org.awandb.core.jni.NativeBridge.freeMainStore(outIndicesPtr)
-           org.awandb.core.jni.NativeBridge.freeMainStore(outScoresPtr)
-       }
-    }
-    
-    // 3. Late-Stage Filtering & Top-K Ranking (Merging RAM and Disk)
-    val allMatches = ramMatches ++ diskMatches
-
-    allMatches
-      .filter { case (id, _) => getRow(id).isDefined } 
-      .distinctBy { case (id, _) => id }               
-      .sortBy { case (_, score) => -score }            
-      .take(limit)                                     
-      .map { case (id, _) => id }                      
-      .toArray
   }
 
   // ---------------------------------------------------------
@@ -1870,9 +1945,11 @@ class AwanTable(
      if (min == Int.MaxValue && matchedIds.length == 0) 0 else min
   }
 
+  // ---------------------------------------------------------
+  // LIFECYCLE MANAGEMENT (CLOSE)
+  // ---------------------------------------------------------
   def close(): Unit = {
-    // 1. Mark as closed so threads know to stop immediately
-    // This breaks the while(!isClosed) loop in the daemon.
+    // 1. Mark as closed to prevent new operations
     rwLock.writeLock().lock()
     try {
       if (isClosed) return
@@ -1881,24 +1958,35 @@ class AwanTable(
       rwLock.writeLock().unlock()
     }
     
-    // 2. Signal interruptions to break any Thread.sleep() delays instantly
-    daemonThread.interrupt() 
-    engineManager.stopEngine()
+    // 2. Halt background processing immediately
+    if (daemonThread != null) daemonThread.interrupt() 
+    if (engineManager != null) engineManager.stopEngine()
     
-    // 3. WAIT for background threads to safely exit the C++ boundary!
-    // We MUST NOT use a timeout here. If the daemon is deep inside C++ 
-    // building filters, we must let it finish, otherwise we will Segfault!
-    try { daemonThread.join() } catch { case _: Exception => }
-    try { engineManager.joinThread() } catch { case _: Exception => }
+    // 3. Wait for active JNI/Background sweeps to safely exit
+    try { if (daemonThread != null) daemonThread.join() } catch { case _: Exception => }
+    try { if (engineManager != null) engineManager.joinThread() } catch { case _: Exception => }
     
-    // 4. Safely free native memory now that no thread is using it
+    // 4. Safely deallocate native memory and clear data structures
     rwLock.writeLock().lock()
     try {
-      blockManager.close()
-      wal.close()
-      columns.values.foreach(_.close())
+      // Untrack data blocks before closing the BlockManager
+      if (blockManager != null) {
+        blockManager.getLoadedBlocks.foreach { ptr =>
+            org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(ptr)
+        }
+        blockManager.close()
+      }
+      
+      if (wal != null) wal.close()
+      
+      // This properly delegates column cleanup (buffers, dictionaries) to NativeColumn
+      if (columns != null) columns.values.foreach(_.close()) 
+
+      // Clean up Result Index Buffer safely
       if (resultIndexBuffer != 0L) {
           org.awandb.core.jni.NativeBridge.freeMainStore(resultIndexBuffer)
+          org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(resultIndexBuffer)
+          resultIndexBuffer = 0L // Reset pointer (Requires resultIndexBuffer to be a var)
       }
     } finally {
       rwLock.writeLock().unlock()
@@ -1909,65 +1997,93 @@ class AwanTable(
   // ZERO-LEAK DDL (DROP TABLE)
   // ---------------------------------------------------------
   def drop(): Unit = {
-    rwLock.writeLock().lock()
-    try {
-      if (isClosed) return
-      isClosed = true
-      
-      // 1. Interrupt and kill the Pacemaker/Compaction daemon
-      if (daemonThread != null && daemonThread.isAlive) {
-        daemonThread.interrupt()
-      }
+    // 1. Signal threads to stop immediately
+    isClosed = true 
+    if (daemonThread != null && daemonThread.isAlive) {
+      daemonThread.interrupt()
+    }
+    if (engineManager != null) {
+      engineManager.stopEngine()
+    }
 
-      // 2. Explicitly clear and nullify JVM Delta Store ArrayBuffers
-      columns.values.foreach { col =>
-        if (col.deltaIntBuffer != null) col.deltaIntBuffer.clear()
-        if (col.deltaStringBuffer != null) col.deltaStringBuffer.clear()
-        if (col.isVector && col.deltaVectorBuffer != null) col.deltaVectorBuffer.clear()
-      }
-      
-      // Drop the references completely
-      columns.clear()
-      columnOrder.clear()
-      ramDeleted.clear()
+    // 2. Instant File System Rename (0ms Latency)
+    // Move the data directory out of the way so new tables with the same name can be created instantly.
+    val currentDir = new java.io.File(dataDir)
+    val trashDir = new java.io.File(s"${currentDir.getParent}/trash/${name}_${System.currentTimeMillis()}")
+    trashDir.getParentFile.mkdirs()
+    
+    // [CRITICAL FIX] Capture the rename result. On Windows, open mmap handles can block this.
+    val renameSuccess = currentDir.renameTo(trashDir)
 
-      // 3. Close the BlockManager (Unmaps files) and WAL
-      if (blockManager != null) blockManager.close()
-      if (wal != null) wal.close()
+    // 3. Spin off the Detached Drop Thread for heavy lifting
+    val dropThread = new Thread(new Runnable {
+      override def run(): Unit = {
+        // A. WAIT for background threads to safely exit the C++ boundary!
+        // If we free memory while they are in C++, the JVM will instantly Segfault.
+        try { if (daemonThread != null) daemonThread.join() } catch { case _: Exception => }
+        try { if (engineManager != null) engineManager.joinThread() } catch { case _: Exception => }
 
-      // [FIX 1] Explicitly free the pre-allocated result index buffer
-      if (resultIndexBuffer != 0L) {
-        NativeBridge.freeMainStore(resultIndexBuffer)
-      }
+        rwLock.writeLock().lock()
+        try {
+          // B. Let columns clean up their own buffers AND Native C++ Dictionaries
+          columns.values.foreach(_.close())
+          columns.clear()
+          columnOrder.clear()
+          ramDeleted.clear()
+          primaryIndex.clear()
+          vectorDims.clear()
 
-      // 4. Force Immediate GC to trigger Native Cleaners
-      System.gc()
-      
-      // Give the JVM Cleaners a brief moment to push the orphaned 
-      // native pointers into the EpochManager's retirement queue
-      Thread.sleep(100) 
+          // C. EXPLICIT NATIVE MEMORY WIPEOUT
+          if (blockManager != null) {
+            blockManager.getLoadedBlocks.foreach { ptr =>
+                org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(ptr)
+            }
+            blockManager.dropAllBlocksInstantly() 
+          }
+          
+          if (wal != null) {
+            wal.drop() 
+          }
 
-      // 5. Actively flush the Epoch Manager's retirement queues 
-      // -> THIS triggers your native free method.
-      // -> The C++ free method now safely calls BufferPool::deregister_block!
-      epochManager.advanceGlobalEpoch() // Push current epoch
-      epochManager.advanceGlobalEpoch() // Push buffer epoch
-      epochManager.tryReclaim()         // Force free C++ pointers safely
+          // D. Safely Free and Zero the Main Store Buffer to prevent Double-Free
+          if (resultIndexBuffer != 0L) {
+            org.awandb.core.jni.NativeBridge.freeMainStore(resultIndexBuffer)
+            org.awandb.core.engine.memory.NativeMemoryTracker.recordDeallocation(resultIndexBuffer)
+            resultIndexBuffer = 0L 
+          }
 
-      // [FIX 2] WIPE THE DISK FILES 
-      // Safely deletes the table's directory and all its block files
-      if (dataDir != null) {
-        val dir = new java.io.File(dataDir)
-        if (dir.exists()) {
-          val files = dir.listFiles()
-          if (files != null) files.foreach(_.delete())
-          dir.delete()
+          // E. Execute STRIKE 1 FIX: Nuke all orphaned native memory
+          epochManager.forceReclaimAll()
+
+          // F. Safely wipe the directory from the disk in the background
+          def deleteRecursively(f: java.io.File): Unit = {
+            if (f.isDirectory) {
+              val children = f.listFiles()
+              if (children != null) children.foreach(deleteRecursively)
+            }
+            // Windows File-Lock Defeater
+            if (f.exists() && !f.delete()) {
+                System.gc() // Force JVM to release any lingering streams
+                Thread.sleep(50) // Give the OS a millisecond to catch up
+                f.delete() // Try again!
+            }
+          }
+          
+          // [CRITICAL FIX] If rename failed due to native locks, delete the original dir!
+          if (renameSuccess) deleteRecursively(trashDir)
+          else deleteRecursively(currentDir)
+
+          // [CRITICAL FIX] Force the OS to instantly reclaim the dropped table's memory!
+          org.awandb.core.jni.NativeBridge.trimMemory()
+
+        } finally {
+          rwLock.writeLock().unlock()
         }
       }
+    }, s"AwanDB-DropThread-$name")
 
-    } finally {
-      rwLock.writeLock().unlock()
-    }
+    dropThread.setDaemon(true)
+    dropThread.start()
   }
 
   def persist(dir: String): Unit = flush() 

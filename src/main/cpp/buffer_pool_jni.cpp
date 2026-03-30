@@ -4,10 +4,8 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
+ * * http://www.apache.org/licenses/LICENSE-2.0
+ * * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -38,18 +36,17 @@ JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_requestTestPage(JNI
 }
 
 JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_pinTestPage(JNIEnv* env, jobject, jint page_id) {
-    // We didn't add a direct pin method to BufferPool, so we'll access the map directly for the test harness,
-    // or you can add a pin_page(id) method to BufferPool.h! For now, we simulate a query pinning it:
-    if (test_pool && test_pool->is_resident(page_id)) {
-        // Note: For a real test harness, add a get_block(id) to BufferPool to do this cleanly.
-        // Assuming you add `BlockHeader* get_block(int page_id)` to BufferPool.h:
-        test_pool->request_page(page_id)->pin_count++; 
+    // [CRITICAL FIX] Delegate to the fully thread-safe C++ method!
+    // Prevents JNI race conditions and double-accounting deadlocks.
+    if (test_pool) {
+        test_pool->pin_page(page_id); 
     }
 }
 
 JNIEXPORT void JNICALL Java_org_awandb_core_jni_NativeBridge_unpinTestPage(JNIEnv* env, jobject, jint page_id) {
-    if (test_pool && test_pool->is_resident(page_id)) {
-        test_pool->request_page(page_id)->pin_count--;
+    // [CRITICAL FIX] Delegate to the fully thread-safe C++ method!
+    if (test_pool) {
+        test_pool->unpin_page(page_id);
     }
 }
 

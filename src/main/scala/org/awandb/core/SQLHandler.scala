@@ -143,18 +143,35 @@ object SQLHandler {
           // 1. Check for GROUP BY
           val groupBy = plain.getGroupBy
           if (groupBy != null) {
-            val rawKey = groupBy.getGroupByExpressionList.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName
+            // [CRITICAL FIX] Cross-Version JSqlParser Compatibility via Reflection
+            val groupByExprs = try {
+              // Modern JSqlParser (4.7+)
+              groupBy.getClass.getMethod("getGroupByExpressions").invoke(groupBy).asInstanceOf[java.util.List[Expression]]
+            } catch {
+              case _: NoSuchMethodException =>
+                // Legacy JSqlParser (< 4.6)
+                val exprList = groupBy.getClass.getMethod("getGroupByExpressionList").invoke(groupBy)
+                exprList.getClass.getMethod("getExpressions").invoke(exprList).asInstanceOf[java.util.List[Expression]]
+            }
+
+            val rawKey = groupByExprs.get(0) match {
+              case c: Column => c.getFullyQualifiedName
+              case e => e.toString
+            }
             val keyCol = cleanColName(rawKey)
             
             var valCol = ""
             for (item <- plain.getSelectItems.asScala) {
               val expr = item.getExpression
+              // [CRITICAL FIX] Respect SQL Aliases (e.g., COUNT(*) AS sales)
+              val alias = if (item.getAlias != null) item.getAlias.getName else null
+
               if (expr != null && expr.isInstanceOf[Function]) {
                 val func = expr.asInstanceOf[Function]
                 if (func.getName.equalsIgnoreCase("sum")) {
-                   valCol = s"SUM(${cleanColName(func.getParameters.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName)})"
+                   valCol = if (alias != null) alias else s"SUM(${cleanColName(func.getParameters.getExpressions.get(0).asInstanceOf[Column].getFullyQualifiedName)})"
                 } else if (func.getName.equalsIgnoreCase("count")) {
-                   valCol = "COUNT(*)"
+                   valCol = if (alias != null) alias else "COUNT(*)"
                 }
               }
             }
@@ -1230,29 +1247,26 @@ object SQLHandler {
              
              // 1. Clean up JVM memory if the table is currently loaded
              if (table != null) {
-                 table.close() 
+                 table.drop() // <--- Detached thread handles ALL renaming and deletion!
                  tables.remove(tableName)
+             } else {
+                 // 2. ONLY wipe synchronously if the table was offline/unloaded
+                 val dirPath = s"data/$tableName"
+                 val dir = new java.io.File(dirPath)
+                 
+                 def deleteRecursively(f: java.io.File): Unit = {
+                   if (f.isDirectory) {
+                     val children = f.listFiles()
+                     if (children != null) children.foreach(deleteRecursively)
+                   }
+                   if (f.exists() && !f.delete()) {
+                       System.gc() 
+                       Thread.sleep(50) 
+                       f.delete() 
+                   }
+                 }
+                 deleteRecursively(dir)
              }
-             
-             // 2. ALWAYS wipe the directory from disk, even if the server just rebooted!
-             // Fallback to the standard data directory pattern if table was null
-             val dirPath = if (table != null) table.dataDir else s"data/$tableName"
-             val dir = new java.io.File(dirPath)
-             
-             def deleteRecursively(f: java.io.File): Unit = {
-               if (f.isDirectory) {
-                 val children = f.listFiles()
-                 if (children != null) children.foreach(deleteRecursively)
-               }
-               
-               // Windows File-Lock Defeater
-               if (f.exists() && !f.delete()) {
-                   System.gc() // Force JVM to release any lingering streams
-                   Thread.sleep(50) // Give the OS a millisecond to catch up
-                   f.delete() // Try again!
-               }
-             }
-             deleteRecursively(dir)
              
              SQLResult(false, s"Table '$tableName' dropped.", 0L)
           } else {

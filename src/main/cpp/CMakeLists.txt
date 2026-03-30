@@ -96,6 +96,8 @@ set(SOURCES
     compaction.cpp
     graph.cpp
     buffer_pool_jni.cpp
+    query_context.cpp
+    ${HEADERS}
 )
 
 add_library(awan_engine_core SHARED ${SOURCES})

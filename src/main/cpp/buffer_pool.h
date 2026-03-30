@@ -4,10 +4,8 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
+ * * http://www.apache.org/licenses/LICENSE-2.0
+ * * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -21,6 +19,7 @@
 #include <list>
 #include <mutex>
 #include <vector>
+#include <condition_variable> // [NEW] Added for thread blocking
 
 #include "block.h"
 
@@ -39,6 +38,8 @@ private:
     // LRU (Least Recently Used) stays at the begin()
     std::list<int> lru_list; 
     std::mutex pool_mutex;
+    std::condition_variable pool_cv; // [NEW] Condition Variable to block starving threads
+    std::unordered_map<int, std::list<int>::iterator> lru_iters;
 
     // --- SINGLETON SETUP ---
     BufferPool() = default;
@@ -52,29 +53,32 @@ private:
         if (max_bytes == 0) return;
         size_t target_bytes = (max_bytes * target_usage_percent) / 100;
         
-        // Sweep forward starting from the LRU (begin)
         auto it = lru_list.begin();
         while (current_bytes > target_bytes && it != lru_list.end()) {
             int candidate_id = *it;
             BlockHeader* block = page_table[candidate_id];
 
-            if (block->pin_count <= 0) { // Safety catch: Only evict unpinned!
+            if (block->pin_count <= 0) { 
                 block->is_resident = false;
-                block->pin_count = 0; // Reset
                 current_bytes -= block->memory_footprint_bytes;
                 
-                // erase safely returns the next valid iterator
+                lru_iters.erase(candidate_id);
                 it = lru_list.erase(it);
+
+                // [CRITICAL FIX] Memory Leak & Corruption Prevention
+                // Test harness blocks are NOT in pointer_to_page. 
+                // We MUST delete them and erase them from the map to prevent dangling pointers.
+                if (pointer_to_page.count(block) == 0) {
+                    page_table.erase(candidate_id);
+                    delete block; // Safely invoke C++ destructor instead of raw free()
+                }
             } else {
-                ++it; // Block is pinned (in use by AVX), skip it!
+                ++it; 
             }
         }
     }
 
 public:
-    // ---------------------------------------------------------
-    // THE SINGLETON ACCESSOR (Fixes C2039)
-    // ---------------------------------------------------------
     static BufferPool* get_instance() {
         static BufferPool instance; 
         return &instance;
@@ -84,29 +88,67 @@ public:
         std::lock_guard<std::mutex> lock(pool_mutex);
         max_bytes = max_capacity;
         current_bytes = 0;
-        page_table.clear();
+        
+        // Safely wipe any lingering Test Harness blocks from previous tests
+        for (auto it = page_table.begin(); it != page_table.end(); ) {
+            if (pointer_to_page.count(it->second) == 0) {
+                delete it->second;
+                it = page_table.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         pointer_to_page.clear();
         lru_list.clear();
+        lru_iters.clear();
+        pool_cv.notify_all(); // Wake up any lingering threads
     }
 
     void destroy() {
         std::lock_guard<std::mutex> lock(pool_mutex);
         max_bytes = 0;
         current_bytes = 0;
-        page_table.clear();
+        
+        // Safely wipe any lingering Test Harness blocks
+        for (auto it = page_table.begin(); it != page_table.end(); ) {
+            if (pointer_to_page.count(it->second) == 0) {
+                delete it->second;
+                it = page_table.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         pointer_to_page.clear();
         lru_list.clear();
+        lru_iters.clear();
+        pool_cv.notify_all(); 
     }
 
     // =========================================================
-    // REAL ENGINE HOOKS (For storage.cpp & scan.cpp)
+    // REAL ENGINE HOOKS 
     // =========================================================
     
     void register_block(BlockHeader* block, size_t footprint) {
-        std::lock_guard<std::mutex> lock(pool_mutex);
+        std::unique_lock<std::mutex> lock(pool_mutex);
         
-        if (max_bytes > 0 && (current_bytes + footprint) * 100 / max_bytes >= 95) {
+        while (true) {
+            // 1. Check if we already have space
+            if (max_bytes == 0 || (current_bytes + footprint) * 100 / max_bytes < 95) {
+                break; 
+            }
+            
+            // 2. We don't have space. Try to evict down to 75%.
             evict_if_needed(75);
+            
+            // 3. Check if eviction worked
+            if ((current_bytes + footprint) * 100 / max_bytes < 95) {
+                break; 
+            }
+            
+            // 4. Memory is full of pinned pages. Sleep until someone unpins.
+            pool_cv.wait(lock); 
         }
 
         int pid = next_page_id++;
@@ -119,31 +161,48 @@ public:
         pointer_to_page[block] = pid;
         
         lru_list.push_back(pid);
+        lru_iters[pid] = std::prev(lru_list.end());
         current_bytes += footprint;
     }
 
     void pin_block(BlockHeader* block) {
         if (!block) return;
-        std::lock_guard<std::mutex> lock(pool_mutex);
+        std::unique_lock<std::mutex> lock(pool_mutex);
         
         auto it = pointer_to_page.find(block);
         if (it != pointer_to_page.end()) {
             int pid = it->second;
             
-            // If it was evicted to disk, fault it back into RAM
-            if (!block->is_resident) {
-                if (max_bytes > 0 && (current_bytes + block->memory_footprint_bytes) * 100 / max_bytes >= 95) {
-                    evict_if_needed(75); // Block until space is freed
+            while (true) {
+                if (block->is_resident) {
+                    auto lru_it = lru_iters.find(pid);
+                    if (lru_it != lru_iters.end()) lru_list.erase(lru_it->second); 
+                    lru_list.push_back(pid);
+                    lru_iters[pid] = std::prev(lru_list.end());
+                    break;
                 }
-                block->is_resident = true;
-                current_bytes += block->memory_footprint_bytes;
-                lru_list.push_back(pid);
-            } else {
-                // Already in RAM, update LRU
-                lru_list.remove(pid);
-                lru_list.push_back(pid);
+
+                size_t footprint = block->memory_footprint_bytes;
+                
+                if (max_bytes == 0 || (current_bytes + footprint) * 100 / max_bytes < 95) {
+                    block->is_resident = true;
+                    current_bytes += footprint;
+                    lru_list.push_back(pid);
+                    lru_iters[pid] = std::prev(lru_list.end());
+                    break;
+                }
+
+                evict_if_needed(75); 
+                
+                if ((current_bytes + footprint) * 100 / max_bytes < 95) {
+                    block->is_resident = true;
+                    current_bytes += footprint;
+                    lru_list.push_back(pid);
+                    lru_iters[pid] = std::prev(lru_list.end());
+                    break;
+                }
+                pool_cv.wait(lock);
             }
-            
             block->pin_count++;
         }
     }
@@ -153,24 +212,39 @@ public:
         std::lock_guard<std::mutex> lock(pool_mutex);
         if (block->pin_count > 0) {
             block->pin_count--;
+            // [FIX] If the block is fully unpinned, it can now be evicted! Wake up sleeping threads.
+            if (block->pin_count == 0) {
+                pool_cv.notify_all(); 
+            }
         }
     }
 
     // =========================================================
-    // TDD HARNESS HOOKS (For Scala Tests)
+    // TDD HARNESS HOOKS 
     // =========================================================
 
     BlockHeader* request_page(int page_id) {
-        std::lock_guard<std::mutex> lock(pool_mutex);
+        std::unique_lock<std::mutex> lock(pool_mutex);
 
-        if (page_table.count(page_id) && page_table[page_id]->is_resident) {
-            lru_list.remove(page_id);
-            lru_list.push_back(page_id); 
-            return page_table[page_id];
-        }
+        while (true) {
+            if (page_table.count(page_id) && page_table[page_id]->is_resident) {
+                auto lru_it = lru_iters.find(page_id);
+                if (lru_it != lru_iters.end()) lru_list.erase(lru_it->second);
+                lru_list.push_back(page_id); 
+                lru_iters[page_id] = std::prev(lru_list.end()); 
+                return page_table[page_id];
+            }
 
-        if (max_bytes > 0 && (current_bytes + 4096) * 100 / max_bytes >= 95) {
+            if (max_bytes == 0 || (current_bytes + 4096) * 100 / max_bytes < 95) {
+                break;
+            }
+
             evict_if_needed(75); 
+            
+            if ((current_bytes + 4096) * 100 / max_bytes < 95) {
+                break;
+            }
+            pool_cv.wait(lock);
         }
 
         if (!page_table.count(page_id)) {
@@ -184,24 +258,43 @@ public:
         block->pin_count = 0; 
         
         lru_list.push_back(page_id); 
+        lru_iters[page_id] = std::prev(lru_list.end());
         current_bytes += block->memory_footprint_bytes;
 
         return block;
     }
 
     void pin_page(int page_id) {
-        std::lock_guard<std::mutex> lock(pool_mutex);
-        if (page_table.count(page_id)) {
-            if (!page_table[page_id]->is_resident) {
-                if (max_bytes > 0 && (current_bytes + page_table[page_id]->memory_footprint_bytes) * 100 / max_bytes >= 95) {
-                    evict_if_needed(75);
-                }
-                page_table[page_id]->is_resident = true;
-                current_bytes += page_table[page_id]->memory_footprint_bytes;
-                lru_list.push_back(page_id);
+        std::unique_lock<std::mutex> lock(pool_mutex);
+        if (!page_table.count(page_id)) return;
+
+        while (true) {
+            if (page_table[page_id]->is_resident) {
+                break;
             }
-            page_table[page_id]->pin_count++;
+            
+            size_t footprint = page_table[page_id]->memory_footprint_bytes;
+            
+            if (max_bytes == 0 || (current_bytes + footprint) * 100 / max_bytes < 95) {
+                page_table[page_id]->is_resident = true;
+                current_bytes += footprint;
+                lru_list.push_back(page_id);
+                lru_iters[page_id] = std::prev(lru_list.end());
+                break;
+            }
+
+            evict_if_needed(75);
+            
+            if ((current_bytes + footprint) * 100 / max_bytes < 95) {
+                page_table[page_id]->is_resident = true;
+                current_bytes += footprint;
+                lru_list.push_back(page_id);
+                lru_iters[page_id] = std::prev(lru_list.end());
+                break;
+            }
+            pool_cv.wait(lock);
         }
+        page_table[page_id]->pin_count++;
     }
 
     void unpin_page(int page_id) {
@@ -209,6 +302,10 @@ public:
         if (page_table.count(page_id) && page_table[page_id]->is_resident) {
             if (page_table[page_id]->pin_count > 0) {
                 page_table[page_id]->pin_count--;
+                // [FIX] Wake up sleeping threads
+                if (page_table[page_id]->pin_count == 0) {
+                    pool_cv.notify_all();
+                }
             }
         }
     }
@@ -240,16 +337,26 @@ public:
         if (it != pointer_to_page.end()) {
             int pid = it->second;
             
-            // If the block is currently in RAM, reclaim the capacity
             if (block->is_resident) {
                 current_bytes -= block->memory_footprint_bytes;
             }
             
-            // Erase all traces of the block from the Buffer Pool
-            lru_list.remove(pid);
+            auto lru_it = lru_iters.find(pid);
+            if (lru_it != lru_iters.end()) {
+                lru_list.erase(lru_it->second);
+                lru_iters.erase(lru_it);
+            }
+            
             page_table.erase(pid);
             pointer_to_page.erase(block);
+            
+            // [FIX] Memory freed, wake up waiters!
+            pool_cv.notify_all();
         }
+    }
+
+    void unregister_block(BlockHeader* block) {
+        deregister_block(block);
     }
 };
 
@@ -259,21 +366,18 @@ public:
 struct ScopedPin {
     BlockHeader* block;
 
-    // Constructor: Automatically pins the block when created
     ScopedPin(BlockHeader* b) : block(b) {
         if (block) {
             BufferPool::get_instance()->pin_block(block);
         }
     }
 
-    // Destructor: Automatically unpins the block when it goes out of scope
     ~ScopedPin() {
         if (block) {
             BufferPool::get_instance()->unpin_block(block);
         }
     }
 
-    // Disable copy/move to prevent accidental double-unpins
     ScopedPin(const ScopedPin&) = delete;
     ScopedPin& operator=(const ScopedPin&) = delete;
 };
